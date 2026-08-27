@@ -1,0 +1,41 @@
+# config.toml — configuración del bot de trailing take-profit para pump.fun
+# ---------------------------------------------------------------------------
+
+[general]
+# Dirección (mint) del token de pump.fun a seguir. OBLIGATORIO.
+mint = ""
+
+# false = todo simulado (no gasta SOL real, no requiere API key).
+# true  = opera en real vía la Lightning API de PumpPortal (requiere API key).
+live = false
+
+[trade]
+# Cantidad de SOL a comprar.
+buy_sol = 0.05
+
+# Slippage permitido, en porcentaje.
+slippage = 15
+
+# Priority fee / tip, en SOL. Subilo si las transacciones no entran rápido.
+priority_fee = 0.00001
+
+# Pool/exchange: "pump", "raydium", "pump-amm", "launchlab", "raydium-cpmm", "bonk" o "auto".
+pool = "auto"
+
+[strategy]
+# Subida %% desde el precio de entrada necesaria para "armar" el trailing-stop.
+activation_pct = 10.0
+
+# Una vez armado, retroceso %% desde el máximo alcanzado que dispara la venta.
+trailing_pct = 15.0
+
+# Stop-loss "duro" (%%) que aplica SOLO mientras el trailing todavía no se armó
+# (protege por si el precio nunca sube y se desploma desde el arranque).
+initial_stop_pct = 25.0
+
+[pumpportal]
+# API key de PumpPortal, necesaria únicamente si general.live = true.
+# Se genera en pumpportal.fun y está asociada a una wallet ya fondeada.
+# Si la dejás vacía acá, el bot también busca la variable de entorno
+# PUMPPORTAL_API_KEY (más seguro que dejarla escrita en este archivo).
+api_key = ""
