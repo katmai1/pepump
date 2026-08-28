@@ -1,9 +1,12 @@
 import asyncio
+import logging
 import time
 from typing import AsyncIterator, Optional
 
 from pepump.executor import Position
 from pepump.pump import PumpSwapOnChainClient
+
+logger = logging.getLogger(__name__)
 
 # Cada cuánto tiempo (segundos), mientras seguimos esperando el primer
 # trade real, se repite el recordatorio de diagnóstico con las causas
@@ -50,8 +53,8 @@ class TrailingTakeProfitBot:
              mientras dure la posición,
           3. en paralelo corre la impresión periódica del %% de profit.
         """
-        print(f"Siguiendo el token: {self.mint}")
-        print(f"Suscribiéndose (subscribe_trade) al feed de trades de PumpPortal para {self.mint}...")
+        logger.info(f"Siguiendo el token: {self.mint}")
+        logger.debug(f"Suscribiéndose (subscribe_trade) al feed de trades de PumpPortal para {self.mint}...")
 
         # OJO: connect_trade_stream ya deja el subscribe MANDADO del lado
         # de PumpPortal apenas conecta. Si algo revienta después de esto y
@@ -68,8 +71,8 @@ class TrailingTakeProfitBot:
 
             initial_price = await self._get_initial_price()
             if initial_price is None:
-                print("ERROR: se cortó la conexión con PumpPortal antes de recibir un trade con "
-                      "precio. Verificá la dirección del token y la api_key, y volvé a intentar.")
+                logger.error("Se cortó la conexión con PumpPortal antes de recibir un trade con "
+                             "precio. Verificá la dirección del token y la api_key, y volvé a intentar.")
                 return
 
             self.latest_price = initial_price
@@ -97,7 +100,7 @@ class TrailingTakeProfitBot:
             if self._ws is not None:
                 await self._ws.close()
 
-        print("Bot finalizado.")
+        logger.info("Bot finalizado.")
 
     async def _get_initial_price(self) -> Optional[float]:
         """Consigue el precio de entrada, en este orden:
@@ -117,8 +120,8 @@ class TrailingTakeProfitBot:
         eventos-, así que se usa asyncio.wait_for() sobre cada
         __anext__() para tener un deadline real incluso en silencio total.
         """
-        print("Esperando el primer trade en vivo del feed de PumpPortal (subscribe_trade) "
-              "para fijar el precio de entrada. Esto puede tardar si el token tiene poco volumen.")
+        logger.info("Esperando el primer trade en vivo del feed de PumpPortal (subscribe_trade) "
+                    "para fijar el precio de entrada. Esto puede tardar si el token tiene poco volumen.")
         start = time.monotonic()
         last_reminder = start
         recibio_ack = False
@@ -131,9 +134,9 @@ class TrailingTakeProfitBot:
                 elapsed_since_ack = time.monotonic() - ack_received_at
                 timeout = self.cfg.live_feed_timeout_seconds - elapsed_since_ack
                 if timeout <= 0:
-                    print(f"[Feed en vivo] pasaron {self.cfg.live_feed_timeout_seconds:.0f}s desde el "
-                          f"ack sin ningún trade real -> probablemente este mint ya migró a PumpSwap "
-                          f"y subscribeTokenTrade no lo cubre. Probando fallback on-chain...")
+                    logger.debug(f"[Feed en vivo] pasaron {self.cfg.live_feed_timeout_seconds:.0f}s desde el "
+                                 f"ack sin ningún trade real -> probablemente este mint ya migró a PumpSwap "
+                                 f"y subscribeTokenTrade no lo cubre. Probando fallback on-chain...")
                     return await self._try_onchain_fallback()
 
             try:
@@ -144,17 +147,17 @@ class TrailingTakeProfitBot:
             except asyncio.TimeoutError:
                 continue  # se recalcula el timeout restante y dispara el fallback arriba
             except StopAsyncIteration:
-                print("[Feed en vivo] la conexión se cerró antes de recibir un trade con precio.")
+                logger.warning("[Feed en vivo] la conexión se cerró antes de recibir un trade con precio.")
                 return None
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                print(f"[Feed en vivo] la conexión falló: {e}")
+                logger.error(f"[Feed en vivo] la conexión falló: {e}")
                 return None
 
             price = self.client.extract_price(event)
             if price is not None and price > 0:
-                print(f"Precio inicial (feed en vivo, subscribe_trade): {price:.10f} SOL/token")
+                logger.info(f"Precio inicial (feed en vivo, subscribe_trade): {price:.10f} SOL/token")
                 return price
 
             # Distinguimos el ack de confirmación del subscribe (evento
@@ -166,17 +169,17 @@ class TrailingTakeProfitBot:
             if not recibio_ack and set(event.keys()) == {"message"}:
                 recibio_ack = True
                 ack_received_at = time.monotonic()
-                print(f"[Feed en vivo] confirmación de suscripción recibida ({event['message']!r}). "
-                      f"Esperando hasta {self.cfg.live_feed_timeout_seconds:.0f}s más por un trade "
-                      f"real antes de recurrir al fallback on-chain...")
+                logger.debug(f"[Feed en vivo] confirmación de suscripción recibida ({event['message']!r}). "
+                             f"Esperando hasta {self.cfg.live_feed_timeout_seconds:.0f}s más por un trade "
+                             f"real antes de recurrir al fallback on-chain...")
             else:
                 # Llegó un evento (que no es el ack) pero no se pudo
                 # calcular el precio. Lo avisamos, con las claves del
                 # evento, para poder diagnosticarlo sin quedar en silencio.
                 sin_precio += 1
                 if sin_precio == 1 or sin_precio % 20 == 0:
-                    print(f"[Feed en vivo] llegaron eventos pero no se pudo calcular el precio "
-                          f"(claves del evento: {sorted(event.keys())}). Sigo esperando...")
+                    logger.debug(f"[Feed en vivo] llegaron eventos pero no se pudo calcular el precio "
+                                 f"(claves del evento: {sorted(event.keys())}). Sigo esperando...")
 
             # Recordatorio periódico SOLO mientras no llegó ni el ack —
             # una vez que llega, el timeout de arriba ya se encarga de
@@ -187,8 +190,8 @@ class TrailingTakeProfitBot:
                 if now - last_reminder >= _DIAGNOSTIC_REMINDER_SECONDS:
                     last_reminder = now
                     elapsed = now - start
-                    print(f"[Feed en vivo] {elapsed:.0f}s esperando y todavía ni siquiera llegó "
-                          f"el ack de suscripción. Revisá la conexión de red y que el mint sea correcto.")
+                    logger.warning(f"[Feed en vivo] {elapsed:.0f}s esperando y todavía ni siquiera llegó "
+                                   f"el ack de suscripción. Revisá la conexión de red y que el mint sea correcto.")
 
     async def _try_onchain_fallback(self) -> Optional[float]:
         """Último recurso para el precio de entrada: lee las reservas
@@ -201,10 +204,10 @@ class TrailingTakeProfitBot:
         onchain = PumpSwapOnChainClient(self.cfg.solana_rpc_url)
         price = await onchain.fetch_price_for_migrated_mint(self.mint)
         if price is None:
-            print("[On-chain PumpSwap] Tampoco se pudo obtener precio on-chain para este mint. "
-                  "No hay ninguna fuente de precio disponible; abortando esta entrada.")
+            logger.error("[On-chain PumpSwap] Tampoco se pudo obtener precio on-chain para este mint. "
+                         "No hay ninguna fuente de precio disponible; abortando esta entrada.")
             return None
-        print(f"Precio inicial (fallback on-chain PumpSwap): {price:.10f} SOL/token")
+        logger.info(f"Precio inicial (fallback on-chain PumpSwap): {price:.10f} SOL/token")
         self._using_onchain_fallback = True
         return price
 
@@ -228,7 +231,7 @@ class TrailingTakeProfitBot:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            print(f"[Polling on-chain PumpSwap] interrumpido: {e}")
+            logger.warning(f"[Polling on-chain PumpSwap] interrumpido: {e}")
 
     async def _consume_trade_stream(self) -> None:
         """Sigue escuchando trades en tiempo real por la MISMA conexión
@@ -246,7 +249,7 @@ class TrailingTakeProfitBot:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            print(f"[Feed de trades de PumpPortal] conexión interrumpida: {e}")
+            logger.warning(f"[Feed de trades de PumpPortal] conexión interrumpida: {e}")
 
     async def _status_printer_loop(self) -> None:
         """Imprime el %% de profit actual cada `status_interval_seconds`, sin
@@ -260,17 +263,17 @@ class TrailingTakeProfitBot:
             pnl = pos.pnl_pct(self.latest_price)
             if pos.armed:
                 stop_price = pos.highest_price * (1 - self.cfg.trailing_pct / 100.0)
-                print(f"⏱️  [armado] precio {self.latest_price:.10f} | máximo {pos.highest_price:.10f} "
-                      f"| nivel de venta {stop_price:.10f} | PnL: {pnl:+.2f}%")
+                logger.info(f"⏱️  [armado] precio {self.latest_price:.10f} | máximo {pos.highest_price:.10f} "
+                            f"| nivel de venta {stop_price:.10f} | PnL: {pnl:+.2f}%")
             else:
-                print(f"⏱️  [esperando activación +{self.cfg.activation_pct}%] "
-                      f"precio {self.latest_price:.10f} | entrada {pos.entry_price:.10f} | PnL: {pnl:+.2f}%")
+                logger.info(f"⏱️  [esperando activación +{self.cfg.activation_pct}%] "
+                            f"precio {self.latest_price:.10f} | entrada {pos.entry_price:.10f} | PnL: {pnl:+.2f}%")
 
     def _on_first_price(self, price: float) -> None:
         self.position = self.executor.buy(self.mint, price)
-        print(f"Activación del trailing-stop: +{self.cfg.activation_pct}% "
-              f"| ancho del trailing una vez armado: {self.cfg.trailing_pct}% "
-              f"| stop-loss inicial (antes de armar): -{self.cfg.initial_stop_pct}%")
+        logger.info(f"Activación del trailing-stop: +{self.cfg.activation_pct}% "
+                    f"| ancho del trailing una vez armado: {self.cfg.trailing_pct}% "
+                    f"| stop-loss inicial (antes de armar): -{self.cfg.initial_stop_pct}%")
 
     def _on_price_update(self, price: float) -> None:
         pos = self.position
@@ -283,8 +286,8 @@ class TrailingTakeProfitBot:
             if price >= pos.entry_price * (1 + self.cfg.activation_pct / 100.0):
                 pos.armed = True
                 pos.highest_price = price
-                print(f"✅ Trailing-stop ARMADO. Precio actual {price:.10f} "
-                      f"(PnL {pnl:+.2f}%). Máximo inicial registrado.")
+                logger.info(f"✅ Trailing-stop ARMADO. Precio actual {price:.10f} "
+                            f"(PnL {pnl:+.2f}%). Máximo inicial registrado.")
             elif price <= pos.entry_price * (1 - self.cfg.initial_stop_pct / 100.0):
                 self._try_sell(pos, price, "stop-loss inicial (nunca se activó el trailing)")
             return
@@ -293,8 +296,8 @@ class TrailingTakeProfitBot:
         if price > pos.highest_price:
             pos.highest_price = price
             stop_price = pos.highest_price * (1 - self.cfg.trailing_pct / 100.0)
-            print(f"📈 Nuevo máximo: {price:.10f} (PnL {pnl:+.2f}%) "
-                  f"| nuevo nivel de venta (trailing): {stop_price:.10f}")
+            logger.info(f"📈 Nuevo máximo: {price:.10f} (PnL {pnl:+.2f}%) "
+                        f"| nuevo nivel de venta (trailing): {stop_price:.10f}")
             return
 
         stop_price = pos.highest_price * (1 - self.cfg.trailing_pct / 100.0)
@@ -319,7 +322,7 @@ class TrailingTakeProfitBot:
         try:
             self.executor.sell(pos, price, reason)
         except Exception as e:
-            print(f"⚠️  Venta fallida ({reason}): {e}. La posición SIGUE ABIERTA, "
-                  f"se reintentará con el próximo precio que llegue.")
+            logger.warning(f"⚠️  Venta fallida ({reason}): {e}. La posición SIGUE ABIERTA, "
+                           f"se reintentará con el próximo precio que llegue.")
             return
         self._closed_event.set()

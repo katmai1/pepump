@@ -1,6 +1,7 @@
 import requests
 import websockets
 import json
+import logging
 from typing import AsyncIterator, Optional
 
 from solana.rpc.async_api import AsyncClient
@@ -8,6 +9,8 @@ from solana.rpc.types import MemcmpOpts
 from solders.pubkey import Pubkey  # type: ignore
 from pumpswapamm.pumpswapamm import fetch_pool_state
 from pumpswapamm.fetch_reserves import fetch_pool_base_price
+
+logger = logging.getLogger(__name__)
 
 # Programa de PumpSwap en Solana (constante pública, no cambia).
 PUMPSWAP_PROGRAM_ID = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
@@ -57,10 +60,10 @@ class PumpPortalClient:
         if self.api_key:
             url = f"{url}?api-key={self.api_key}"
         else:
-            print("⚠️  Sin pumpportal.api_key configurada: subscribeTokenTrade NO va a entregar "
-                  "ningún trade (requiere API key + wallet con >= 0.02 SOL, aunque el bot esté en "
-                  "modo SIMULADO). Como este bot usa SOLO PumpPortal para el precio, se va a quedar "
-                  "esperando para siempre. Configurá pumpportal.api_key o PUMPPORTAL_API_KEY.")
+            logger.warning("Sin pumpportal.api_key configurada: subscribeTokenTrade NO va a entregar "
+                           "ningún trade (requiere API key + wallet con >= 0.02 SOL, aunque el bot esté en "
+                           "modo SIMULADO). Como este bot usa SOLO PumpPortal para el precio, se va a quedar "
+                           "esperando para siempre. Configurá pumpportal.api_key o PUMPPORTAL_API_KEY.")
 
         ws = await websockets.connect(url)
         await ws.send(json.dumps({"method": "subscribeTokenTrade", "keys": [mint]}))
@@ -207,33 +210,33 @@ class PumpSwapOnChainClient:
             try:
                 pool_address = await self._find_pool_address(client, mint)
                 if pool_address is None:
-                    print(f"[On-chain PumpSwap] No se encontró ningún pool de PumpSwap para {mint}.")
+                    logger.debug(f"[On-chain PumpSwap] No se encontró ningún pool de PumpSwap para {mint}.")
                     return None
 
                 pool_keys, _pool_type = await fetch_pool_state(pool_address, client)
                 if pool_keys is None:
-                    print("[On-chain PumpSwap] No se pudo leer/parsear la cuenta del pool.")
+                    logger.debug("[On-chain PumpSwap] No se pudo leer/parsear la cuenta del pool.")
                     return None
 
                 if pool_keys.get("quote_mint") != WSOL_MINT:
-                    print(f"[On-chain PumpSwap] El pool de {mint} no está denominado en SOL "
-                          f"(quote_mint={pool_keys.get('quote_mint')}); no lo puedo usar acá.")
+                    logger.debug(f"[On-chain PumpSwap] El pool de {mint} no está denominado en SOL "
+                                 f"(quote_mint={pool_keys.get('quote_mint')}); no lo puedo usar acá.")
                     return None
 
                 result = await fetch_pool_base_price(pool_keys, client)
                 if result is None:
-                    print("[On-chain PumpSwap] No se pudieron leer las reservas del pool.")
+                    logger.debug("[On-chain PumpSwap] No se pudieron leer las reservas del pool.")
                     return None
 
                 price, base_balance, quote_balance = result
                 if not base_balance or float(price) <= 0:
                     return None
 
-                print(f"[On-chain PumpSwap] Pool {pool_address} | reservas: "
-                      f"{base_balance} tokens / {quote_balance} SOL")
+                logger.debug(f"[On-chain PumpSwap] Pool {pool_address} | reservas: "
+                             f"{base_balance} tokens / {quote_balance} SOL")
                 return float(price)
             except Exception as e:
-                print(f"[On-chain PumpSwap] Falló la consulta on-chain para {mint}: {e}")
+                logger.warning(f"[On-chain PumpSwap] Falló la consulta on-chain para {mint}: {e}")
                 return None
 
     async def _find_pool_address(self, client: AsyncClient, mint: str) -> Optional[str]:
