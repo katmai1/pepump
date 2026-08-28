@@ -32,7 +32,7 @@ class AppConfig:
     # el que subscribeTokenTrade no entrega nada (ver pump.py). Mientras
     # el mint sigue en bonding curve, el feed en vivo funciona bien y este
     # timeout no debería llegar a cumplirse casi nunca.
-    live_feed_timeout_seconds: float = 15.0
+    live_feed_timeout_seconds: float = 5.0
     # RPC de Solana usado ÚNICAMENTE para leer, on-chain, las reservas
     # reales del pool de PumpSwap cuando el mint ya migró (ver
     # pumpswapamm en pump.py). Un endpoint público gratuito alcanza para

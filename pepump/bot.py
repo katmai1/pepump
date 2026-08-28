@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import signal
 import time
 from typing import AsyncIterator, Optional
 
@@ -12,6 +13,12 @@ logger = logging.getLogger(__name__)
 # trade real, se repite el recordatorio de diagnóstico con las causas
 # más probables (wallet sin fondos, api_key inválida, token sin volumen).
 _DIAGNOSTIC_REMINDER_SECONDS = 10.0
+
+
+class _ShutdownRequested(Exception):
+    """Señal interna: se pidió apagado (Ctrl+C/SIGTERM) mientras se
+    esperaba otra cosa (un evento del feed, el cierre de la posición).
+    Nunca se propaga fuera de este módulo."""
 
 
 class TrailingTakeProfitBot:
@@ -39,6 +46,24 @@ class TrailingTakeProfitBot:
         # monitoreo de la posición TAMBIÉN necesita el polling on-chain
         # (ver _poll_onchain_price_loop), no solo el precio inicial.
         self._using_onchain_fallback = False
+        # Se activa con Ctrl+C (SIGINT) o SIGTERM (ver run()). NO se usa
+        # el try/except KeyboardInterrupt clásico porque en asyncio esa
+        # señal interrumpe el loop de eventos "por afuera" de la
+        # corrutina en ejecución, no adentro de ella -no hay garantía de
+        # que un try/except puesto en el código de la app la agarre. Con
+        # loop.add_signal_handler() el apagado se coordina de forma
+        # confiable con un asyncio.Event normal.
+        self._shutdown_requested = asyncio.Event()
+
+    def _request_shutdown(self, sig_name: str) -> None:
+        if self._shutdown_requested.is_set():
+            # Segundo Ctrl+C mientras ya se está vendiendo/cerrando: no
+            # hacemos nada especial acá (no forzamos un corte abrupto),
+            # simplemente evitamos loguear el aviso de nuevo.
+            return
+        logger.warning(f"⚠️  {sig_name} recibido. Cerrando ordenadamente "
+                       f"(si hay una posición abierta, se vende al precio actual)...")
+        self._shutdown_requested.set()
 
     async def run(self) -> None:
         """
@@ -52,10 +77,30 @@ class TrailingTakeProfitBot:
           2. sigue escuchando ese mismo feed para reaccionar en tiempo real
              mientras dure la posición,
           3. en paralelo corre la impresión periódica del %% de profit.
+
+        Ctrl+C (SIGINT) o SIGTERM en cualquier momento: si ya hay una
+        posición abierta, se vende al precio más actual posible antes de
+        salir (ver _sell_on_shutdown); si todavía no se compró nada,
+        simplemente corta la espera y termina sin vender nada.
         """
         logger.info(f"Siguiendo el token: {self.mint}")
         logger.debug(f"Suscribiéndose (subscribe_trade) al feed de trades de PumpPortal para {self.mint}...")
 
+        loop = asyncio.get_running_loop()
+        signal_handlers_installed = []
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, self._request_shutdown, sig.name)
+                signal_handlers_installed.append(sig)
+            except (NotImplementedError, RuntimeError):
+                # Windows (ProactorEventLoop) no soporta add_signal_handler.
+                # Ctrl+C ahí cae al comportamiento default de Python
+                # (KeyboardInterrupt sin venta automática al cerrar).
+                logger.debug(f"No se pudo instalar manejador para {sig.name} en este sistema "
+                             f"(¿Windows?); el cierre ordenado con venta automática no va a "
+                             f"funcionar para esta señal.")
+
+        tasks = []
         # OJO: connect_trade_stream ya deja el subscribe MANDADO del lado
         # de PumpPortal apenas conecta. Si algo revienta después de esto y
         # antes de que el finally pueda correr, la conexión queda
@@ -71,8 +116,11 @@ class TrailingTakeProfitBot:
 
             initial_price = await self._get_initial_price()
             if initial_price is None:
-                logger.error("Se cortó la conexión con PumpPortal antes de recibir un trade con "
-                             "precio. Verificá la dirección del token y la api_key, y volvé a intentar.")
+                if self._shutdown_requested.is_set():
+                    logger.info("Cancelado antes de abrir posición; no hay nada que vender.")
+                else:
+                    logger.error("Se cortó la conexión con PumpPortal antes de recibir un trade con "
+                                 "precio. Verificá la dirección del token y la api_key, y volvé a intentar.")
                 return
 
             self.latest_price = initial_price
@@ -91,16 +139,106 @@ class TrailingTakeProfitBot:
                 asyncio.create_task(self._status_printer_loop()),
             ]
 
-            await self._closed_event.wait()
+            await self._wait_for_close_or_shutdown()
 
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
         finally:
+            for sig in signal_handlers_installed:
+                try:
+                    loop.remove_signal_handler(sig)
+                except Exception:
+                    pass
             if self._ws is not None:
                 await self._ws.close()
 
         logger.info("Bot finalizado.")
+
+    async def _wait_for_close_or_shutdown(self) -> None:
+        """Espera a que la posición se cierre sola (TP/SL normal) O a que
+        se pida un apagado (Ctrl+C/SIGTERM). Si gana el apagado y hay una
+        posición abierta, la vende al precio más actual posible antes de
+        continuar."""
+        closed_task = asyncio.ensure_future(self._closed_event.wait())
+        shutdown_task = asyncio.ensure_future(self._shutdown_requested.wait())
+        try:
+            await asyncio.wait(
+                {closed_task, shutdown_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            for t in (closed_task, shutdown_task):
+                if not t.done():
+                    t.cancel()
+
+        if self._closed_event.is_set():
+            return  # se cerró sola (TP/SL), no hace falta hacer nada más
+
+        # Se pidió apagado: si hay posición abierta, vendemos antes de salir.
+        if self.position is not None and not self.position.closed:
+            logger.warning("Vendiendo la posición abierta al precio actual antes de salir...")
+            await self._sell_on_shutdown()
+        else:
+            logger.info("No hay posición abierta; no hay nada que vender.")
+
+    async def _sell_on_shutdown(self) -> None:
+        """Intenta conseguir el precio MÁS actual posible (una consulta
+        on-chain fresca si veníamos usando ese fallback; si no, el último
+        precio que ya venía actualizando el feed en vivo, que está
+        prácticamente en tiempo real) y vende de una la posición
+        abierta."""
+        price = await self._resolve_shutdown_price()
+        if price is None or price <= 0:
+            logger.error("No se pudo determinar ningún precio para vender al cerrar. La posición "
+                         f"queda ABIERTA — revisala manualmente: https://pump.fun/{self.mint}")
+            return
+        try:
+            self.executor.sell(self.position, price, "cierre manual (Ctrl+C/SIGTERM)")
+        except Exception as e:
+            logger.error(f"Falló la venta de cierre manual: {e}. La posición SIGUE ABIERTA — "
+                         f"revisala manualmente: https://pump.fun/{self.mint}")
+
+    async def _resolve_shutdown_price(self) -> Optional[float]:
+        if self._using_onchain_fallback:
+            onchain = PumpSwapOnChainClient(self.cfg.solana_rpc_url)
+            try:
+                price = await onchain.fetch_price_for_migrated_mint(self.mint)
+            except Exception as e:
+                logger.debug(f"[On-chain PumpSwap] Falló la consulta fresca al cerrar: {e}")
+                price = None
+            if price is not None and price > 0:
+                return price
+            logger.debug("[On-chain PumpSwap] No se pudo refrescar el precio al cerrar; "
+                         "uso el último precio conocido.")
+        return self.latest_price
+
+    async def _next_trade_event(self, timeout: Optional[float] = None) -> dict:
+        """__anext__() de self._trade_events, pero compitiendo contra
+        `_shutdown_requested` (y, si se pasa `timeout`, contra un
+        deadline). Lanza _ShutdownRequested si gana el apagado,
+        asyncio.TimeoutError si gana el timeout, o deja pasar cualquier
+        excepción normal del feed (StopAsyncIteration, errores de red,
+        etc.)."""
+        next_task = asyncio.ensure_future(self._trade_events.__anext__())
+        shutdown_task = asyncio.ensure_future(self._shutdown_requested.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                {next_task, shutdown_task}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            pass
+
+        if shutdown_task in done:
+            next_task.cancel()
+            raise _ShutdownRequested()
+
+        shutdown_task.cancel()
+
+        if next_task in done:
+            return next_task.result()  # puede propagar StopAsyncIteration u otra excepción
+
+        next_task.cancel()
+        raise asyncio.TimeoutError()
 
     async def _get_initial_price(self) -> Optional[float]:
         """Consigue el precio de entrada, en este orden:
@@ -114,11 +252,9 @@ class TrailingTakeProfitBot:
              confirmado a mano) y probamos el fallback on-chain
              (_try_onchain_fallback).
 
-        OJO con el timeout: como puede que NO llegue ningún evento más
-        después del ack (ni uno solo), no alcanza con chequear el reloj
-        adentro de un `async for` -eso nunca se ejecutaría si no hay
-        eventos-, así que se usa asyncio.wait_for() sobre cada
-        __anext__() para tener un deadline real incluso en silencio total.
+        En cualquier momento de esta espera, Ctrl+C/SIGTERM corta todo de
+        una y devuelve None (todavía no hay posición abierta, así que no
+        hay nada que vender).
         """
         logger.info("Esperando el primer trade en vivo del feed de PumpPortal (subscribe_trade) "
                     "para fijar el precio de entrada. Esto puede tardar si el token tiene poco volumen.")
@@ -140,10 +276,10 @@ class TrailingTakeProfitBot:
                     return await self._try_onchain_fallback()
 
             try:
-                if timeout is not None:
-                    event = await asyncio.wait_for(self._trade_events.__anext__(), timeout=timeout)
-                else:
-                    event = await self._trade_events.__anext__()
+                event = await self._next_trade_event(timeout=timeout)
+            except _ShutdownRequested:
+                logger.info("Cancelado por el usuario mientras se esperaba el precio de entrada.")
+                return None
             except asyncio.TimeoutError:
                 continue  # se recalcula el timeout restante y dispara el fallback arriba
             except StopAsyncIteration:
