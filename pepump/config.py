@@ -24,6 +24,28 @@ class AppConfig:
     # --- [pumpportal] ----------------------------------------------------- #
     api_key: str = ""  # también se puede definir con la variable de entorno PUMPPORTAL_API_KEY
 
+    # --- [onchain] ---------------------------------------------------------- #
+    # Cuántos segundos esperar el precio por el feed en vivo de PumpPortal
+    # (subscribeTokenTrade) ANTES de recurrir al fallback on-chain de
+    # PumpSwap. Solo aplica si ya llegó el ack de suscripción pero ningún
+    # trade real -> típicamente un mint que ya migró a PumpSwap, caso en
+    # el que subscribeTokenTrade no entrega nada (ver pump.py). Mientras
+    # el mint sigue en bonding curve, el feed en vivo funciona bien y este
+    # timeout no debería llegar a cumplirse casi nunca.
+    live_feed_timeout_seconds: float = 15.0
+    # RPC de Solana usado ÚNICAMENTE para leer, on-chain, las reservas
+    # reales del pool de PumpSwap cuando el mint ya migró (ver
+    # pumpswapamm en pump.py). Un endpoint público gratuito alcanza para
+    # esto (una sola lectura, no trading), pero es lento/rate-limited;
+    # para uso serio conviene un RPC dedicado (Helius, QuickNode, etc.).
+    solana_rpc_url: str = "https://api.mainnet-beta.solana.com"
+    # Si se entró en un mint por el fallback on-chain (porque
+    # subscribeTokenTrade no entregó nada), cada cuántos segundos se
+    # vuelve a consultar el precio on-chain mientras la posición sigue
+    # abierta, para poder evaluar trailing-stop/stop-loss sin depender
+    # del feed en vivo que ya sabemos que no funciona para ese mint.
+    onchain_poll_interval_seconds: float = 5.0
+
 
 def load_config(path: str) -> AppConfig:
     """Lee el .toml (organizado en secciones [general]/[trade]/[strategy]/
@@ -34,7 +56,7 @@ def load_config(path: str) -> AppConfig:
 
     valid_keys = {f.name for f in fields(AppConfig)}
     merged: dict = {}
-    for section_name in ("general", "trade", "strategy", "pumpportal"):
+    for section_name in ("general", "trade", "strategy", "pumpportal", "onchain"):
         section = raw.get(section_name, {})
         unknown = set(section) - valid_keys
         if unknown:

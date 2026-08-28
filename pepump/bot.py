@@ -3,6 +3,7 @@ import time
 from typing import AsyncIterator, Optional
 
 from pepump.executor import Position
+from pepump.pump import PumpSwapOnChainClient
 
 # Cada cuánto tiempo (segundos), mientras seguimos esperando el primer
 # trade real, se repite el recordatorio de diagnóstico con las causas
@@ -28,6 +29,13 @@ class TrailingTakeProfitBot:
         self._closed_event = asyncio.Event()
         self._ws = None
         self._trade_events: Optional[AsyncIterator[dict]] = None
+        # True si tuvimos que resolver el precio de entrada por el
+        # fallback on-chain de PumpSwap (ver _try_onchain_fallback) en
+        # vez del feed en vivo de PumpPortal -> significa que el mint ya
+        # migró y subscribeTokenTrade no entrega nada para él, así que el
+        # monitoreo de la posición TAMBIÉN necesita el polling on-chain
+        # (ver _poll_onchain_price_loop), no solo el precio inicial.
+        self._using_onchain_fallback = False
 
     async def run(self) -> None:
         """
@@ -67,8 +75,16 @@ class TrailingTakeProfitBot:
             self.latest_price = initial_price
             self._on_first_price(initial_price)
 
+            if self._using_onchain_fallback:
+                # subscribeTokenTrade no entrega nada para este mint (ya
+                # migrado) -> el monitoreo de la posición usa polling
+                # on-chain en vez del consumidor del feed en vivo.
+                monitor_task = asyncio.create_task(self._poll_onchain_price_loop())
+            else:
+                monitor_task = asyncio.create_task(self._consume_trade_stream())
+
             tasks = [
-                asyncio.create_task(self._consume_trade_stream()),
+                monitor_task,
                 asyncio.create_task(self._status_printer_loop()),
             ]
 
@@ -84,67 +100,135 @@ class TrailingTakeProfitBot:
         print("Bot finalizado.")
 
     async def _get_initial_price(self) -> Optional[float]:
-        """Consigue el precio de entrada ÚNICAMENTE del feed en vivo de
-        PumpPortal (subscribe_trade), esperando el tiempo que haga falta a
-        que llegue el primer trade del mint con precio calculable — sin
-        timeout, sin on-chain, sin DexScreener. Si la conexión se corta
-        antes de eso (error de red, etc.), devuelve None."""
+        """Consigue el precio de entrada, en este orden:
+          1. Feed en vivo de PumpPortal (subscribe_trade) — sin límite de
+             tiempo MIENTRAS no haya llegado ni el ack de suscripción
+             (eso indicaría un problema de conexión/api_key/wallet, no de
+             mint migrado — ver diagnósticos más abajo).
+          2. Una vez llega el ack, si no aparece NINGÚN trade real dentro
+             de `live_feed_timeout_seconds`, asumimos que el mint ya
+             migró a PumpSwap (subscribeTokenTrade no cubre esos casos,
+             confirmado a mano) y probamos el fallback on-chain
+             (_try_onchain_fallback).
+
+        OJO con el timeout: como puede que NO llegue ningún evento más
+        después del ack (ni uno solo), no alcanza con chequear el reloj
+        adentro de un `async for` -eso nunca se ejecutaría si no hay
+        eventos-, así que se usa asyncio.wait_for() sobre cada
+        __anext__() para tener un deadline real incluso en silencio total.
+        """
         print("Esperando el primer trade en vivo del feed de PumpPortal (subscribe_trade) "
               "para fijar el precio de entrada. Esto puede tardar si el token tiene poco volumen.")
         start = time.monotonic()
         last_reminder = start
         recibio_ack = False
+        ack_received_at: Optional[float] = None
         sin_precio = 0
-        try:
-            async for event in self._trade_events:
-                price = self.client.extract_price(event)
-                if price is not None and price > 0:
-                    print(f"Precio inicial (feed en vivo, subscribe_trade): {price:.10f} SOL/token")
-                    return price
 
-                # Distinguimos el ack de confirmación del subscribe (evento
-                # con ÚNICAMENTE la clave "message", ej.
-                # {"message": "Successfully subscribed to keys."}) de
-                # cualquier otro evento con forma rara. El ack en sí es
-                # normal y no indica ningún problema: solo confirma que la
-                # suscripción fue aceptada. El problema real es si después
-                # de ese ack no llega NINGÚN trade real.
-                if not recibio_ack and set(event.keys()) == {"message"}:
-                    recibio_ack = True
-                    print(f"[Feed en vivo] confirmación de suscripción recibida ({event['message']!r}). "
-                          f"Sigo esperando el primer trade real...")
+        while True:
+            timeout = None
+            if recibio_ack:
+                elapsed_since_ack = time.monotonic() - ack_received_at
+                timeout = self.cfg.live_feed_timeout_seconds - elapsed_since_ack
+                if timeout <= 0:
+                    print(f"[Feed en vivo] pasaron {self.cfg.live_feed_timeout_seconds:.0f}s desde el "
+                          f"ack sin ningún trade real -> probablemente este mint ya migró a PumpSwap "
+                          f"y subscribeTokenTrade no lo cubre. Probando fallback on-chain...")
+                    return await self._try_onchain_fallback()
+
+            try:
+                if timeout is not None:
+                    event = await asyncio.wait_for(self._trade_events.__anext__(), timeout=timeout)
                 else:
-                    # Llegó un evento (que no es el ack) pero no se pudo
-                    # calcular el precio. Lo avisamos, con las claves del
-                    # evento, para poder diagnosticarlo sin quedar en silencio.
-                    sin_precio += 1
-                    if sin_precio == 1 or sin_precio % 20 == 0:
-                        print(f"[Feed en vivo] llegaron eventos pero no se pudo calcular el precio "
-                              f"(claves del evento: {sorted(event.keys())}). Sigo esperando...")
+                    event = await self._trade_events.__anext__()
+            except asyncio.TimeoutError:
+                continue  # se recalcula el timeout restante y dispara el fallback arriba
+            except StopAsyncIteration:
+                print("[Feed en vivo] la conexión se cerró antes de recibir un trade con precio.")
+                return None
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"[Feed en vivo] la conexión falló: {e}")
+                return None
 
-                # Recordatorio periódico de diagnóstico: si ya pasó bastante
-                # tiempo sin recibir NINGÚN trade real (solo el ack, o ni
-                # siquiera eso), lo más probable es wallet sin fondos,
-                # api_key inválida, o un token sin volumen real ahora mismo.
+            price = self.client.extract_price(event)
+            if price is not None and price > 0:
+                print(f"Precio inicial (feed en vivo, subscribe_trade): {price:.10f} SOL/token")
+                return price
+
+            # Distinguimos el ack de confirmación del subscribe (evento
+            # con ÚNICAMENTE la clave "message", ej.
+            # {"message": "Successfully subscribed to keys."}) de
+            # cualquier otro evento con forma rara. El ack en sí es
+            # normal y no indica ningún problema: solo confirma que la
+            # suscripción fue aceptada.
+            if not recibio_ack and set(event.keys()) == {"message"}:
+                recibio_ack = True
+                ack_received_at = time.monotonic()
+                print(f"[Feed en vivo] confirmación de suscripción recibida ({event['message']!r}). "
+                      f"Esperando hasta {self.cfg.live_feed_timeout_seconds:.0f}s más por un trade "
+                      f"real antes de recurrir al fallback on-chain...")
+            else:
+                # Llegó un evento (que no es el ack) pero no se pudo
+                # calcular el precio. Lo avisamos, con las claves del
+                # evento, para poder diagnosticarlo sin quedar en silencio.
+                sin_precio += 1
+                if sin_precio == 1 or sin_precio % 20 == 0:
+                    print(f"[Feed en vivo] llegaron eventos pero no se pudo calcular el precio "
+                          f"(claves del evento: {sorted(event.keys())}). Sigo esperando...")
+
+            # Recordatorio periódico SOLO mientras no llegó ni el ack —
+            # una vez que llega, el timeout de arriba ya se encarga de
+            # decidir cuándo pasar al fallback, así que este recordatorio
+            # sería redundante.
+            if not recibio_ack:
                 now = time.monotonic()
                 if now - last_reminder >= _DIAGNOSTIC_REMINDER_SECONDS:
                     last_reminder = now
                     elapsed = now - start
-                    if recibio_ack:
-                        print(f"[Feed en vivo] {elapsed:.0f}s esperando y todavía ningún trade real "
-                              f"(solo llegó el ack de suscripción). Causas típicas: la wallet asociada "
-                              f"a tu pumpportal.api_key tiene menos de 0.02 SOL, la api_key es inválida "
-                              f"o vieja, o este mint simplemente no tiene volumen en este momento.")
-                    else:
-                        print(f"[Feed en vivo] {elapsed:.0f}s esperando y todavía ni siquiera llegó "
-                              f"el ack de suscripción. Revisá la conexión de red y que el mint sea correcto.")
-            print("[Feed en vivo] la conexión se cerró antes de recibir un trade con precio.")
+                    print(f"[Feed en vivo] {elapsed:.0f}s esperando y todavía ni siquiera llegó "
+                          f"el ack de suscripción. Revisá la conexión de red y que el mint sea correcto.")
+
+    async def _try_onchain_fallback(self) -> Optional[float]:
+        """Último recurso para el precio de entrada: lee las reservas
+        reales del pool de PumpSwap directo de Solana (ver
+        PumpSwapOnChainClient en pump.py). Si funciona, marca
+        `_using_onchain_fallback = True` para que el monitoreo posterior
+        de la posición (ver _poll_onchain_price_loop) también use polling
+        on-chain en vez de esperar al feed en vivo, que ya sabemos que no
+        entrega nada para este mint."""
+        onchain = PumpSwapOnChainClient(self.cfg.solana_rpc_url)
+        price = await onchain.fetch_price_for_migrated_mint(self.mint)
+        if price is None:
+            print("[On-chain PumpSwap] Tampoco se pudo obtener precio on-chain para este mint. "
+                  "No hay ninguna fuente de precio disponible; abortando esta entrada.")
+            return None
+        print(f"Precio inicial (fallback on-chain PumpSwap): {price:.10f} SOL/token")
+        self._using_onchain_fallback = True
+        return price
+
+    async def _poll_onchain_price_loop(self) -> None:
+        """Reemplazo de _consume_trade_stream para cuando la posición se
+        abrió vía el fallback on-chain: como subscribeTokenTrade no
+        entrega nada para este mint, no hay forma de enterarse de nuevos
+        precios por el feed en vivo -así que se consulta on-chain cada
+        `onchain_poll_interval_seconds` mientras la posición siga
+        abierta, y se alimenta al mismo _on_price_update() que usaría el
+        feed en vivo (misma lógica de trailing-stop/stop-loss, solo
+        cambia de dónde sale el precio)."""
+        onchain = PumpSwapOnChainClient(self.cfg.solana_rpc_url)
+        try:
+            while self.position is not None and not self.position.closed:
+                price = await onchain.fetch_price_for_migrated_mint(self.mint)
+                if price is not None and price > 0:
+                    self.latest_price = price
+                    self._on_price_update(price)
+                await asyncio.sleep(self.cfg.onchain_poll_interval_seconds)
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            print(f"[Feed en vivo] la conexión falló: {e}")
-
-        return None
+            print(f"[Polling on-chain PumpSwap] interrumpido: {e}")
 
     async def _consume_trade_stream(self) -> None:
         """Sigue escuchando trades en tiempo real por la MISMA conexión
