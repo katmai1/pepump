@@ -44,10 +44,20 @@ class TrailingTakeProfitBot:
         """
         print(f"Siguiendo el token: {self.mint}")
         print(f"Suscribiéndose (subscribe_trade) al feed de trades de PumpPortal para {self.mint}...")
-        self._ws = await self.client.connect_trade_stream(self.mint)
-        self._trade_events = self.client.iter_trade_events()
 
+        # OJO: connect_trade_stream ya deja el subscribe MANDADO del lado
+        # de PumpPortal apenas conecta. Si algo revienta después de esto y
+        # antes de que el finally pueda correr, la conexión queda
+        # suscripta pero abandonada del lado del servidor (no se le avisa
+        # con un cierre prolijo de WebSocket, solo se corta el TCP cuando
+        # el proceso muere). Por eso TODO lo que dependa de self._ws vive
+        # dentro de este try/finally, sin excepciones: así cualquier
+        # crash -incluso uno inesperado que no previmos- cierra el socket
+        # de forma ordenada en vez de dejarlo zombie.
         try:
+            self._ws = await self.client.connect_trade_stream(self.mint)
+            self._trade_events = self.client.iter_trade_events(self._ws)
+
             initial_price = await self._get_initial_price()
             if initial_price is None:
                 print("ERROR: se cortó la conexión con PumpPortal antes de recibir un trade con "
@@ -68,7 +78,8 @@ class TrailingTakeProfitBot:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
         finally:
-            await self._ws.close()
+            if self._ws is not None:
+                await self._ws.close()
 
         print("Bot finalizado.")
 
@@ -191,8 +202,7 @@ class TrailingTakeProfitBot:
                 print(f"✅ Trailing-stop ARMADO. Precio actual {price:.10f} "
                       f"(PnL {pnl:+.2f}%). Máximo inicial registrado.")
             elif price <= pos.entry_price * (1 - self.cfg.initial_stop_pct / 100.0):
-                self.executor.sell(pos, price, "stop-loss inicial (nunca se activó el trailing)")
-                self._closed_event.set()
+                self._try_sell(pos, price, "stop-loss inicial (nunca se activó el trailing)")
             return
 
         # --- Caso 2: trailing-stop armado, sigue el máximo ----------------- #
@@ -205,8 +215,27 @@ class TrailingTakeProfitBot:
 
         stop_price = pos.highest_price * (1 - self.cfg.trailing_pct / 100.0)
         if price <= stop_price:
-            self.executor.sell(
+            self._try_sell(
                 pos, price,
                 f"retroceso de {self.cfg.trailing_pct}% desde el máximo ({pos.highest_price:.10f})"
             )
-            self._closed_event.set()
+
+    def _try_sell(self, pos: Position, price: float, reason: str) -> None:
+        """Envuelve executor.sell(): si la venta REAL falla (Lightning API
+        devuelve error), executor.sell() ahora propaga la excepción a
+        propósito en vez de marcar la posición como cerrada (ver BUGFIX en
+        executor.py). Acá la atajamos para que ese fallo:
+          - se loguee como lo que es (venta fallida), no como "conexión
+            interrumpida" (que es lo que pasaría si se colara hasta el
+            except genérico de _consume_trade_stream), y
+          - NO trabe el bot para siempre: como la posición sigue abierta
+            (closed=False) y NO seteamos _closed_event, el próximo trade
+            que llegue vuelve a evaluar la condición de salida y reintenta
+            la venta sola, sin intervención manual."""
+        try:
+            self.executor.sell(pos, price, reason)
+        except Exception as e:
+            print(f"⚠️  Venta fallida ({reason}): {e}. La posición SIGUE ABIERTA, "
+                  f"se reintentará con el próximo precio que llegue.")
+            return
+        self._closed_event.set()
