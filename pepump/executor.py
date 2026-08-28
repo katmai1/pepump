@@ -37,19 +37,29 @@ class TradeExecutor:
         self.live = live
         self.cfg = config
 
-    def buy(self, mint: str, price: float) -> Position:
+    async def buy(self, mint: str, price: float) -> Position:
         sol_amount = self.cfg.buy_sol
 
         if self.live:
             try:
-                result = self.client.execute_lightning_trade(
+                result = await self.client.execute_lightning_trade(
                     action="buy", mint=mint, amount=sol_amount, denominated_in_sol=True,
                     slippage=self.cfg.slippage, priority_fee=self.cfg.priority_fee,
                     pool=self.cfg.pool,
+                    solana_rpc_url=self.cfg.solana_rpc_url,
+                    tx_confirm_timeout_seconds=self.cfg.tx_confirm_timeout_seconds,
+                    tx_confirm_poll_interval_seconds=self.cfg.tx_confirm_poll_interval_seconds,
                 )
-                logger.info(f"[REAL] Compra enviada. Respuesta: {result}")
+                logger.info(f"[REAL] Compra CONFIRMADA on-chain. Respuesta: {result}")
             except Exception:
-                logger.exception("[REAL] Error al comprar")
+                # execute_lightning_trade ahora confirma en cadena antes
+                # de devolver: si esto tira, es porque la orden fue
+                # rechazada de una, o la tx confirmó pero FALLÓ on-chain
+                # (p. ej. slippage excedido), o no confirmó a tiempo. En
+                # NINGUNO de esos casos hay que abrir una posición -no se
+                # compró nada de verdad-, así que propagamos el error y
+                # no seguimos de largo.
+                logger.exception("[REAL] Error al comprar (la orden no se confirmó on-chain)")
                 raise
 
         token_amount = sol_amount / price if price > 0 else 0.0
@@ -58,28 +68,34 @@ class TradeExecutor:
                     f"(~{token_amount:,.2f} tokens)")
         return Position(mint=mint, entry_price=price, sol_amount=sol_amount, token_amount=token_amount)
 
-    def sell(self, position: Position, price: float, reason: str) -> None:
+    async def sell(self, position: Position, price: float, reason: str) -> None:
         if self.live:
             try:
-                result = self.client.execute_lightning_trade(
+                result = await self.client.execute_lightning_trade(
                     action="sell", mint=position.mint, amount="100%", denominated_in_sol=False,
                     slippage=self.cfg.slippage, priority_fee=self.cfg.priority_fee,
                     pool=self.cfg.pool,
+                    solana_rpc_url=self.cfg.solana_rpc_url,
+                    tx_confirm_timeout_seconds=self.cfg.tx_confirm_timeout_seconds,
+                    tx_confirm_poll_interval_seconds=self.cfg.tx_confirm_poll_interval_seconds,
                 )
-                logger.info(f"[REAL] Venta enviada. Respuesta: {result}")
+                logger.info(f"[REAL] Venta CONFIRMADA on-chain. Respuesta: {result}")
             except Exception:
                 # BUGFIX: antes esta excepción se logueaba y se seguía de
                 # largo igual: la posición se marcaba `closed = True` y se
                 # imprimía el PnL/proceeds como si la venta hubiese salido
-                # bien, cuando en realidad la Lightning API falló y el
-                # token real seguía en la wallet, sin vender. Con SOL real
-                # eso es peligroso: el bot "cree" que cerró la posición y
-                # deja de vigilarla. Ahora propagamos la excepción y NO
-                # marcamos la posición como cerrada, para que quede claro
-                # que la venta real falló y haya que reintentarla a mano.
+                # bien, cuando en realidad la Lightning API falló (o la tx
+                # confirmó pero FALLÓ on-chain, p. ej. por slippage
+                # excedido) y el token real seguía en la wallet, sin
+                # vender. Con SOL real eso es peligroso: el bot "cree" que
+                # cerró la posición y deja de vigilarla. Ahora propagamos
+                # la excepción y NO marcamos la posición como cerrada,
+                # para que quede claro que la venta real falló y haya que
+                # reintentarla (bot.py reintenta solo con el próximo
+                # precio que llegue — ver _try_sell).
                 logger.exception(
-                    f"[REAL] Error al vender {position.mint}. La posición SIGUE ABIERTA: "
-                    "no se marcó como vendida. Revisá manualmente y reintentá la venta."
+                    f"[REAL] Error al vender {position.mint} (la orden no se confirmó on-chain). "
+                    "La posición SIGUE ABIERTA: no se marcó como vendida."
                 )
                 raise
 

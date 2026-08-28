@@ -124,7 +124,11 @@ class TrailingTakeProfitBot:
                 return
 
             self.latest_price = initial_price
-            self._on_first_price(initial_price)
+            try:
+                await self._on_first_price(initial_price)
+            except Exception as e:
+                logger.error(f"La compra no se confirmó on-chain, no se abrió ninguna posición: {e}")
+                return
 
             if self._using_onchain_fallback:
                 # subscribeTokenTrade no entrega nada para este mint (ya
@@ -193,7 +197,7 @@ class TrailingTakeProfitBot:
                          f"queda ABIERTA — revisala manualmente: https://pump.fun/{self.mint}")
             return
         try:
-            self.executor.sell(self.position, price, "cierre manual (Ctrl+C/SIGTERM)")
+            await self.executor.sell(self.position, price, "cierre manual (Ctrl+C/SIGTERM)")
         except Exception as e:
             logger.error(f"Falló la venta de cierre manual: {e}. La posición SIGUE ABIERTA — "
                          f"revisala manualmente: https://pump.fun/{self.mint}")
@@ -355,37 +359,80 @@ class TrailingTakeProfitBot:
         `onchain_poll_interval_seconds` mientras la posición siga
         abierta, y se alimenta al mismo _on_price_update() que usaría el
         feed en vivo (misma lógica de trailing-stop/stop-loss, solo
-        cambia de dónde sale el precio)."""
+        cambia de dónde sale el precio).
+
+        Un error puntual de RPC (timeout, rate limit, etc.) NO debe matar
+        este loop para siempre -eso dejaría el precio congelado igual que
+        el bug que tenía _consume_trade_stream-, así que cada iteración
+        atrapa sus propios errores y sigue reintentando en el próximo
+        ciclo."""
         onchain = PumpSwapOnChainClient(self.cfg.solana_rpc_url)
-        try:
-            while self.position is not None and not self.position.closed:
+        while self.position is not None and not self.position.closed:
+            try:
                 price = await onchain.fetch_price_for_migrated_mint(self.mint)
                 if price is not None and price > 0:
                     self.latest_price = price
-                    self._on_price_update(price)
-                await asyncio.sleep(self.cfg.onchain_poll_interval_seconds)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.warning(f"[Polling on-chain PumpSwap] interrumpido: {e}")
+                    await self._on_price_update(price)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"[Polling on-chain PumpSwap] error puntual, reintento en el "
+                               f"próximo ciclo: {e}")
+            await asyncio.sleep(self.cfg.onchain_poll_interval_seconds)
 
     async def _consume_trade_stream(self) -> None:
-        """Sigue escuchando trades en tiempo real por la MISMA conexión
-        websocket ya abierta y suscripta desde run() (subscribe_trade), sin
-        reconectar."""
-        try:
-            async for event in self._trade_events:
+        """Sigue escuchando trades en tiempo real por la conexión
+        websocket ya abierta y suscripta desde run() (subscribe_trade).
+
+        Si la conexión se cae (PumpPortal cierra el socket sin avisar,
+        blip de red, etc.), se reconecta y se vuelve a suscribir
+        automáticamente, con backoff exponencial, MIENTRAS la posición
+        siga abierta. Sin esto, una caída de conexión dejaba el precio
+        congelado para siempre: el trailing-stop/stop-loss quedaban
+        ciegos y la única forma de salir era cerrar la posición a mano
+        -exactamente lo que pasó."""
+        backoff = 2.0
+        max_backoff = 30.0
+        while self.position is not None and not self.position.closed:
+            try:
+                async for event in self._trade_events:
+                    if self.position is None or self.position.closed:
+                        return
+                    price = self.client.extract_price(event)
+                    if price is None or price <= 0:
+                        continue
+                    self.latest_price = price
+                    await self._on_price_update(price)
+                    backoff = 2.0  # se recibió un evento bueno: reseteamos el backoff
+                # El async for terminó SOLO (StopAsyncIteration): la
+                # conexión se cerró de forma "limpia" del lado del server.
                 if self.position is None or self.position.closed:
-                    break
-                price = self.client.extract_price(event)
-                if price is None or price <= 0:
-                    continue
-                self.latest_price = price
-                self._on_price_update(price)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.warning(f"[Feed de trades de PumpPortal] conexión interrumpida: {e}")
+                    return
+                logger.warning("[Feed de trades de PumpPortal] la conexión se cerró.")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"[Feed de trades de PumpPortal] conexión interrumpida: {e}")
+
+            if self.position is None or self.position.closed:
+                return
+
+            logger.warning(f"Reconectando al feed de trades de PumpPortal en {backoff:.0f}s "
+                           f"(posición sigue abierta, no puedo perder el precio)...")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
+
+            try:
+                if self._ws is not None:
+                    try:
+                        await self._ws.close()
+                    except Exception:
+                        pass
+                self._ws = await self.client.connect_trade_stream(self.mint)
+                self._trade_events = self.client.iter_trade_events(self._ws)
+                logger.info("Reconectado al feed de trades de PumpPortal.")
+            except Exception as e:
+                logger.warning(f"No se pudo reconectar todavía: {e}. Reintento en {backoff:.0f}s...")
 
     async def _status_printer_loop(self) -> None:
         """Imprime el %% de profit actual cada `status_interval_seconds`, sin
@@ -405,13 +452,13 @@ class TrailingTakeProfitBot:
                 logger.info(f"⏱️  [esperando activación +{self.cfg.activation_pct}%] "
                             f"precio {self.latest_price:.10f} | entrada {pos.entry_price:.10f} | PnL: {pnl:+.2f}%")
 
-    def _on_first_price(self, price: float) -> None:
-        self.position = self.executor.buy(self.mint, price)
+    async def _on_first_price(self, price: float) -> None:
+        self.position = await self.executor.buy(self.mint, price)
         logger.info(f"Activación del trailing-stop: +{self.cfg.activation_pct}% "
                     f"| ancho del trailing una vez armado: {self.cfg.trailing_pct}% "
                     f"| stop-loss inicial (antes de armar): -{self.cfg.initial_stop_pct}%")
 
-    def _on_price_update(self, price: float) -> None:
+    async def _on_price_update(self, price: float) -> None:
         pos = self.position
         if pos is None or pos.closed:
             return
@@ -425,7 +472,7 @@ class TrailingTakeProfitBot:
                 logger.info(f"✅ Trailing-stop ARMADO. Precio actual {price:.10f} "
                             f"(PnL {pnl:+.2f}%). Máximo inicial registrado.")
             elif price <= pos.entry_price * (1 - self.cfg.initial_stop_pct / 100.0):
-                self._try_sell(pos, price, "stop-loss inicial (nunca se activó el trailing)")
+                await self._try_sell(pos, price, "stop-loss inicial (nunca se activó el trailing)")
             return
 
         # --- Caso 2: trailing-stop armado, sigue el máximo ----------------- #
@@ -438,14 +485,15 @@ class TrailingTakeProfitBot:
 
         stop_price = pos.highest_price * (1 - self.cfg.trailing_pct / 100.0)
         if price <= stop_price:
-            self._try_sell(
+            await self._try_sell(
                 pos, price,
                 f"retroceso de {self.cfg.trailing_pct}% desde el máximo ({pos.highest_price:.10f})"
             )
 
-    def _try_sell(self, pos: Position, price: float, reason: str) -> None:
+    async def _try_sell(self, pos: Position, price: float, reason: str) -> None:
         """Envuelve executor.sell(): si la venta REAL falla (Lightning API
-        devuelve error), executor.sell() ahora propaga la excepción a
+        devuelve error, o la tx confirma pero FALLA on-chain -p. ej. por
+        slippage excedido-), executor.sell() ahora propaga la excepción a
         propósito en vez de marcar la posición como cerrada (ver BUGFIX en
         executor.py). Acá la atajamos para que ese fallo:
           - se loguee como lo que es (venta fallida), no como "conexión
@@ -456,7 +504,7 @@ class TrailingTakeProfitBot:
             que llegue vuelve a evaluar la condición de salida y reintenta
             la venta sola, sin intervención manual."""
         try:
-            self.executor.sell(pos, price, reason)
+            await self.executor.sell(pos, price, reason)
         except Exception as e:
             logger.warning(f"⚠️  Venta fallida ({reason}): {e}. La posición SIGUE ABIERTA, "
                            f"se reintentará con el próximo precio que llegue.")

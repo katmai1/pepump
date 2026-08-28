@@ -45,6 +45,14 @@ class AppConfig:
     # abierta, para poder evaluar trailing-stop/stop-loss sin depender
     # del feed en vivo que ya sabemos que no funciona para ese mint.
     onchain_poll_interval_seconds: float = 5.0
+    # Después de mandar una compra/venta REAL (Lightning API), cuántos
+    # segundos esperar a que la transacción confirme on-chain antes de
+    # darla por fallida. Necesario porque PumpPortal puede devolver un
+    # 200 OK con firma de forma "optimista", antes de saber si la tx va
+    # a confirmar o reventar (p. ej. por slippage excedido) — ver
+    # execute_lightning_trade en pump.py.
+    tx_confirm_timeout_seconds: float = 30.0
+    tx_confirm_poll_interval_seconds: float = 2.0
 
 
 def load_config(path: str) -> AppConfig:

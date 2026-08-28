@@ -2,11 +2,14 @@ import requests
 import websockets
 import json
 import logging
+import asyncio
+import time
 from typing import AsyncIterator, Optional
 
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.types import MemcmpOpts
 from solders.pubkey import Pubkey  # type: ignore
+from solders.signature import Signature  # type: ignore
 from pumpswapamm.pumpswapamm import fetch_pool_state
 from pumpswapamm.fetch_reserves import fetch_pool_base_price
 
@@ -134,12 +137,35 @@ class PumpPortalClient:
 
     # ---- Trading real (Lightning Transaction API) ------------------------- #
 
-    def execute_lightning_trade(self, action: str, mint: str, amount, denominated_in_sol: bool,
-                                 slippage: float, priority_fee: float, pool: str) -> dict:
+    async def execute_lightning_trade(self, action: str, mint: str, amount, denominated_in_sol: bool,
+                                       slippage: float, priority_fee: float, pool: str,
+                                       solana_rpc_url: str,
+                                       tx_confirm_timeout_seconds: float = 30.0,
+                                       tx_confirm_poll_interval_seconds: float = 2.0) -> dict:
         """
-        Manda la orden a la Lightning API. PumpPortal arma, firma y envía la
-        transacción del lado de ellos usando la wallet asociada a la API key.
-        Devuelve el JSON de respuesta (incluye la firma de la tx o errores).
+        Manda la orden a la Lightning API y, si consigue una firma, se
+        queda esperando la confirmación REAL on-chain antes de dar la
+        operación por buena. Esto es necesario porque PumpPortal puede
+        devolver una firma con 200 OK de forma "optimista" -antes de que
+        la transacción se confirme en la red- y esa transacción puede
+        reventar después on-chain (típicamente por slippage excedido si
+        el precio se movió entre que se armó la tx y se incluyó en un
+        bloque). Sin este chequeo, el bot trataría un 200 OK con firma
+        como compra/venta exitosa aunque en la práctica no haya pasado
+        nada en la wallet real.
+
+        Lanza RuntimeError en cualquiera de estos casos (todos indican
+        que NO hay que dar la operación por hecha):
+          - HTTP distinto de 200.
+          - 200 OK pero sin firma en el body (PumpPortal rechazó la
+            orden de una: slippage inválido, fondos insuficientes, etc.).
+          - Firma válida pero la transacción FALLÓ on-chain (revert) —
+            acá es donde cae el caso real de "slippage excedido" que
+            pasa DESPUÉS de que PumpPortal ya contestó 200.
+          - Firma válida pero no confirma dentro de
+            `tx_confirm_timeout_seconds` (puede seguir pendiente, pero
+            no lo sabemos con certeza -> mejor tratarlo como fallo y que
+            se revise a mano).
         """
         if not self.api_key:
             raise RuntimeError("Se necesita una API key de PumpPortal para operar con la Lightning API.")
@@ -154,7 +180,11 @@ class PumpPortalClient:
             "pool": pool,
         }
 
-        resp = requests.post(
+        # requests.post es bloqueante; lo mandamos a un thread aparte para
+        # no congelar el loop de asyncio (que sigue necesitando procesar
+        # el feed de precios y demás mientras se manda la orden).
+        resp = await asyncio.to_thread(
+            requests.post,
             f"{self.LIGHTNING_TRADE_URL}?api-key={self.api_key}",
             headers={"Content-Type": "application/json"},
             data=json.dumps(payload),
@@ -162,7 +192,46 @@ class PumpPortalClient:
         )
         if resp.status_code != 200:
             raise RuntimeError(f"Lightning API devolvió {resp.status_code}: {resp.text}")
-        return resp.json()
+
+        data = resp.json()
+        signature = data.get("signature") if isinstance(data, dict) else None
+        if not signature:
+            raise RuntimeError(f"PumpPortal rechazó la orden de {action}: {data}")
+
+        await self._confirm_transaction_onchain(
+            signature, solana_rpc_url, tx_confirm_timeout_seconds, tx_confirm_poll_interval_seconds
+        )
+        return data
+
+    @staticmethod
+    async def _confirm_transaction_onchain(signature: str, rpc_url: str,
+                                            timeout_seconds: float, poll_interval_seconds: float) -> None:
+        """Poll a Solana RPC hasta que la tx confirme (o falle, o venza
+        el timeout). No devuelve nada si confirmó bien; lanza
+        RuntimeError en cualquier otro caso."""
+        sig = Signature.from_string(signature)
+        deadline = time.monotonic() + timeout_seconds
+        async with AsyncClient(rpc_url) as client:
+            while True:
+                resp = await client.get_signature_statuses([sig], search_transaction_history=True)
+                value = resp.value
+                info = value[0] if value else None
+                if info is not None:
+                    if info.err is not None:
+                        raise RuntimeError(
+                            f"La transacción {signature} FALLÓ on-chain (probablemente slippage "
+                            f"excedido u otro error de ejecución): {info.err} — "
+                            f"https://solscan.io/tx/{signature}"
+                        )
+                    if info.confirmation_status is not None:
+                        return  # processed/confirmed/finalized: ya sabemos que NO falló
+
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"La transacción {signature} no confirmó en {timeout_seconds:.1f}s "
+                        f"(puede seguir pendiente) — revisá https://solscan.io/tx/{signature}"
+                    )
+                await asyncio.sleep(poll_interval_seconds)
 
 
 class PumpSwapOnChainClient:
