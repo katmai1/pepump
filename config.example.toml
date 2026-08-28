@@ -5,9 +5,14 @@
 # Dirección (mint) del token de pump.fun a seguir. OBLIGATORIO.
 mint = ""
 
-# false = todo simulado (no gasta SOL real, no requiere API key).
+# false = todo simulado (no gasta SOL real).
 # true  = opera en real vía la Lightning API de PumpPortal (requiere API key).
 live = false
+
+# El bot se suscribe (subscribe_trade) al feed en vivo de PumpPortal para
+# este mint ANTES de comprar, y espera el tiempo que haga falta a que
+# llegue el primer trade real para usar ESE precio como entrada. Es la
+# ÚNICA fuente de precio del bot: no hay on-chain ni DexScreener.
 
 [trade]
 # Cantidad de SOL a comprar.
@@ -34,8 +39,12 @@ trailing_pct = 15.0
 initial_stop_pct = 25.0
 
 [pumpportal]
-# API key de PumpPortal, necesaria únicamente si general.live = true.
-# Se genera en pumpportal.fun y está asociada a una wallet ya fondeada.
+# API key de PumpPortal. Se genera en pumpportal.fun y está asociada a una
+# wallet ya fondeada. ¡OBLIGATORIA siempre, aunque live = false! El bot usa
+# ÚNICAMENTE subscribeTokenTrade para el precio, que es un stream medido
+# (0.01 SOL cada 10.000 eventos) y exige API key + wallet con >= 0.02 SOL
+# para funcionar. Sin key, la conexión no da error pero tampoco entrega
+# trades: el bot se queda esperando para siempre.
 # Si la dejás vacía acá, el bot también busca la variable de entorno
 # PUMPPORTAL_API_KEY (más seguro que dejarla escrita en este archivo).
 api_key = ""

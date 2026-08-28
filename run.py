@@ -18,7 +18,9 @@ Organización del código:
     - TrailingTakeProfitBot: orquesta todo. Escucha el feed de precios del
       PumpPortalClient y aplica la lógica de trailing take-profit, avisando
       al TradeExecutor cuándo comprar y cuándo vender.
-    - AppConfig / load_config: leen todas las opciones desde un .toml.
+    - AppConfig / load_config: una única clase con TODAS las opciones
+      (mint, trade, estrategia, PumpPortal), leídas desde un .toml
+      organizado en secciones solo por legibilidad.
 
 Flujo de la estrategia:
   1. En el primer precio recibido, se compra (simulada o real).
@@ -36,6 +38,13 @@ operar en real hay que poner `live = true` y configurar una API key de
 PumpPortal (`pumpportal.api_key`, o la variable de entorno
 PUMPPORTAL_API_KEY) asociada a una wallet ya fondeada en PumpPortal.
 
+⚠️ El precio SIEMPRE sale del feed en vivo de PumpPortal (subscribeTokenTrade),
+nunca de on-chain ni de DexScreener: no hay otra fuente. Eso significa que
+`pumpportal.api_key` es OBLIGATORIA siempre (aunque live = false), porque
+subscribeTokenTrade es un stream medido (0.01 SOL cada 10.000 eventos) y
+requiere API key + wallet con al menos 0.02 SOL. Sin eso, el bot se queda
+esperando para siempre.
+
 ⚠️ Esto es una herramienta de trading, no un consejo financiero. Las memecoins
 de pump.fun son extremadamente volátiles y de altísimo riesgo. Probá siempre
 primero en modo simulado y con montos chicos.
@@ -51,22 +60,14 @@ Uso:
 
 import argparse
 import asyncio
-import base64
 import json
 import os
-import struct
 import sys
 import time
 from dataclasses import dataclass, field, fields
-from typing import Any, AsyncIterator, Optional
+from typing import AsyncIterator, Optional
 
 import requests
-
-try:
-    from solders.pubkey import Pubkey as _SoldersPubkey
-    _SOLDERS_AVAILABLE = True
-except ImportError:
-    _SOLDERS_AVAILABLE = False
 
 try:
     import websockets
@@ -89,81 +90,58 @@ except ModuleNotFoundError:
 # --------------------------------------------------------------------------- #
 
 @dataclass
-class GeneralConfig:
+class AppConfig:
+    # --- [general] --------------------------------------------------- #
     mint: str = ""
     live: bool = False
     # Cada cuánto tiempo (segundos) se muestra en pantalla el %% de profit actual.
     status_interval_seconds: float = 5.0
-    # Cada cuánto tiempo (segundos) se refresca el precio vía DexScreener,
-    # independientemente de si llegan o no trades nuevos por el websocket de
-    # PumpPortal (útil para tokens de bajo volumen).
-    price_poll_interval_seconds: float = 3.0
-    # RPC de Solana usado SOLO para leer (no firmar nada) el precio directo
-    # desde la cuenta on-chain de la bonding curve de pump.fun: es la fuente
-    # más fiable y rápida posible. Un RPC pago/dedicado responde más rápido
-    # y con menos rate-limit que el público por defecto.
-    rpc_endpoint: str = "https://api.mainnet-beta.solana.com"
 
-
-@dataclass
-class TradeConfig:
+    # --- [trade] ------------------------------------------------------- #
     buy_sol: float = 0.05
     slippage: float = 15.0
     priority_fee: float = 0.00001
     pool: str = "auto"  # "pump", "raydium", "pump-amm", "launchlab", "raydium-cpmm", "bonk", "auto"
 
-
-@dataclass
-class StrategyConfig:
+    # --- [strategy] ------------------------------------------------------ #
     activation_pct: float = 10.0
     trailing_pct: float = 15.0
     initial_stop_pct: float = 25.0
 
-
-@dataclass
-class PumpPortalConfig:
+    # --- [pumpportal] ----------------------------------------------------- #
     api_key: str = ""  # también se puede definir con la variable de entorno PUMPPORTAL_API_KEY
 
 
-@dataclass
-class AppConfig:
-    general: GeneralConfig = field(default_factory=GeneralConfig)
-    trade: TradeConfig = field(default_factory=TradeConfig)
-    strategy: StrategyConfig = field(default_factory=StrategyConfig)
-    pumpportal: PumpPortalConfig = field(default_factory=PumpPortalConfig)
-
-
-def _build_section(cls, raw: dict) -> Any:
-    """Construye una dataclass de config solo con las claves que reconoce,
-    avisando si el .toml trae claves desconocidas (typos, etc)."""
-    valid_keys = {f.name for f in fields(cls)}
-    unknown = set(raw) - valid_keys
-    if unknown:
-        print(f"Aviso: claves desconocidas en el .toml para [{cls.__name__}]: {sorted(unknown)}")
-    return cls(**{k: v for k, v in raw.items() if k in valid_keys})
-
-
 def load_config(path: str) -> AppConfig:
+    """Lee el .toml (organizado en secciones [general]/[trade]/[strategy]/
+    [pumpportal] solo por legibilidad) y arma UNA única AppConfig con todos
+    los campos juntos."""
     with open(path, "rb") as f:
         raw = tomllib.load(f)
 
-    config = AppConfig(
-        general=_build_section(GeneralConfig, raw.get("general", {})),
-        trade=_build_section(TradeConfig, raw.get("trade", {})),
-        strategy=_build_section(StrategyConfig, raw.get("strategy", {})),
-        pumpportal=_build_section(PumpPortalConfig, raw.get("pumpportal", {})),
-    )
+    valid_keys = {f.name for f in fields(AppConfig)}
+    merged: dict = {}
+    for section_name in ("general", "trade", "strategy", "pumpportal"):
+        section = raw.get(section_name, {})
+        unknown = set(section) - valid_keys
+        if unknown:
+            print(f"Aviso: claves desconocidas en el .toml para [{section_name}]: {sorted(unknown)}")
+        merged.update({k: v for k, v in section.items() if k in valid_keys})
 
-    if not config.pumpportal.api_key:
-        config.pumpportal.api_key = os.environ.get("PUMPPORTAL_API_KEY", "")
+    config = AppConfig(**merged)
 
-    if not config.general.mint:
+    if not config.api_key:
+        config.api_key = os.environ.get("PUMPPORTAL_API_KEY", "")
+
+    if not config.mint:
         raise ValueError("Falta 'mint' en la sección [general] del archivo .toml")
 
-    if config.general.live and not config.pumpportal.api_key:
+    if not config.api_key:
         raise ValueError(
-            "general.live = true requiere una API key de PumpPortal "
-            "(pumpportal.api_key en el .toml, o la variable de entorno PUMPPORTAL_API_KEY)"
+            "Falta la API key de PumpPortal (pumpportal.api_key en el .toml, o la variable de "
+            "entorno PUMPPORTAL_API_KEY). Es obligatoria SIEMPRE, aunque general.live = false: "
+            "el bot usa únicamente subscribeTokenTrade para el precio, y ese feed requiere API "
+            "key + wallet con al menos 0.02 SOL para entregar trades."
         )
 
     return config
@@ -183,146 +161,83 @@ class PumpPortalClient:
 
     DATA_WS_URL = "wss://pumpportal.fun/api/data"
     LIGHTNING_TRADE_URL = "https://pumpportal.fun/api/trade"
-    # Fuente de precio auxiliar (no es de PumpPortal): se usa para conseguir
-    # un precio ni bien arranca el bot y para refrescarlo periódicamente,
-    # sin depender de que justo haya un trade nuevo en el feed de PumpPortal.
-    DEXSCREENER_TOKENS_URL = "https://api.dexscreener.com/latest/dex/tokens/{mint}"
 
-    # Programa on-chain de pump.fun (igual en Mainnet y Devnet) y decimales
-    # estándar usados por los tokens creados en la plataforma.
-    PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
-    SOL_DECIMALS = 9
-    TOKEN_DECIMALS = 6
+    # Supply estándar de un token creado en pump.fun (1.000.000.000 tokens),
+    # usado para derivar el precio a partir de `marketCapSol` en los trades
+    # que ya no traen las reservas de la bonding curve (token migrado a
+    # PumpSwap). Ver extract_price.
+    TOTAL_SUPPLY_TOKENS = 1_000_000_000
 
-    def __init__(self, api_key: str = "", rpc_endpoint: str = "https://api.mainnet-beta.solana.com"):
+    def __init__(self, api_key: str = ""):
         self.api_key = api_key
-        self.rpc_endpoint = rpc_endpoint
 
-    # ---- Feed de precios ------------------------------------------------- #
+    # ---- Feed de precios (SOLO PumpPortal, subscribeTokenTrade) ---------- #
 
-    async def stream_token_trades(self, mint: str) -> AsyncIterator[dict]:
+    async def connect_trade_stream(self, mint: str):
         """
-        Se conecta al websocket de datos de PumpPortal, se suscribe a los
-        trades del `mint` indicado, y va entregando cada evento crudo (dict).
+        Abre la conexión al websocket de datos de PumpPortal y hace el
+        subscribe_trade (`subscribeTokenTrade`) al `mint` indicado, dejando
+        la conexión abierta para que se pueda reutilizar tanto para
+        conseguir el precio inicial (antes de comprar) como para el
+        monitoreo posterior, sin reconectar ni volver a suscribirse.
+
+        OJO: `subscribeTokenTrade` es un stream medido de PumpPortal (0.01
+        SOL cada 10.000 eventos) y requiere una API key vinculada a una
+        wallet con al menos 0.02 SOL, sin importar si el bot está en modo
+        SIMULADO o REAL. Sin API key, la conexión y la suscripción NO dan
+        error, pero tampoco entregan ningún trade: el bot se queda
+        esperando para siempre (no hay otra fuente de precio de respaldo).
         """
         url = self.DATA_WS_URL
         if self.api_key:
             url = f"{url}?api-key={self.api_key}"
+        else:
+            print("⚠️  Sin pumpportal.api_key configurada: subscribeTokenTrade NO va a entregar "
+                  "ningún trade (requiere API key + wallet con >= 0.02 SOL, aunque el bot esté en "
+                  "modo SIMULADO). Como este bot usa SOLO PumpPortal para el precio, se va a quedar "
+                  "esperando para siempre. Configurá pumpportal.api_key o PUMPPORTAL_API_KEY.")
 
-        async with websockets.connect(url) as ws:
-            await ws.send(json.dumps({"method": "subscribeTokenTrade", "keys": [mint]}))
-            async for raw_msg in ws:
-                try:
-                    yield json.loads(raw_msg)
-                except json.JSONDecodeError:
-                    continue
+        ws = await websockets.connect(url)
+        await ws.send(json.dumps({"method": "subscribeTokenTrade", "keys": [mint]}))
+        return ws
 
     @staticmethod
-    def extract_price(event: dict) -> Optional[float]:
-        """Precio en SOL/token a partir de las reservas de la bonding curve."""
+    async def iter_trade_events(ws) -> AsyncIterator[dict]:
+        """Va entregando cada evento crudo (dict) que llega por una conexión
+        ya abierta y suscripta (ver connect_trade_stream)."""
+        async for raw_msg in ws:
+            try:
+                yield json.loads(raw_msg)
+            except json.JSONDecodeError:
+                continue
+
+    @classmethod
+    def extract_price(cls, event: dict) -> Optional[float]:
+        """
+        Precio en SOL/token a partir de un evento de subscribeTokenTrade.
+
+        Mientras el token sigue en la bonding curve de pump.fun, el evento
+        trae las reservas virtuales (`vSolInBondingCurve`/
+        `vTokensInBondingCurve`) y el precio sale de ahí, exacto.
+
+        Si el token ya migró a PumpSwap (típico en tokens de bastante
+        volumen), el evento deja de traer esas reservas; en ese caso se usa
+        `marketCapSol` -que sí viene en todos los trades, migrados o no-
+        junto con el supply estándar de pump.fun para derivar el precio.
+        """
         v_sol = event.get("vSolInBondingCurve")
         v_tok = event.get("vTokensInBondingCurve")
-        if v_sol is None or v_tok is None or v_tok == 0:
-            return None
-        return v_sol / v_tok
+        if v_sol is not None and v_tok is not None and v_tok:
+            return v_sol / v_tok
 
-    def fetch_price_onchain(self, mint: str) -> Optional[float]:
-        """
-        Lee DIRECTAMENTE de la blockchain de Solana la cuenta de la bonding
-        curve del token —la misma fuente de verdad que usan pump.fun y
-        PumpPortal internamente— y calcula el precio actual en SOL/token.
-        Es la fuente más fiable y rápida disponible: no depende de que haya
-        ocurrido un trade recientemente, ni de que un indexador externo
-        (DexScreener) ya haya procesado la última operación.
+        market_cap_sol = event.get("marketCapSol")
+        if market_cap_sol is not None:
+            try:
+                return float(market_cap_sol) / cls.TOTAL_SUPPLY_TOKENS
+            except (TypeError, ValueError):
+                return None
 
-        Requiere 'solders' instalado (pip install solders) solo para derivar
-        la dirección de la cuenta (PDA); no firma ni maneja ninguna clave.
-        Si el token ya migró a PumpSwap (bonding curve completa/cerrada),
-        devuelve None (en ese caso conviene usar fetch_price_dexscreener).
-        """
-        if not _SOLDERS_AVAILABLE:
-            return None
-
-        try:
-            mint_pubkey = _SoldersPubkey.from_string(mint)
-            program_pubkey = _SoldersPubkey.from_string(self.PUMP_PROGRAM_ID)
-            bonding_curve_pda, _bump = _SoldersPubkey.find_program_address(
-                [b"bonding-curve", bytes(mint_pubkey)], program_pubkey,
-            )
-        except Exception as e:
-            print(f"[On-chain] No se pudo derivar la cuenta de la bonding curve: {e}")
-            return None
-
-        payload = {
-            "jsonrpc": "2.0", "id": 1, "method": "getAccountInfo",
-            "params": [str(bonding_curve_pda), {"encoding": "base64"}],
-        }
-        try:
-            resp = requests.post(self.rpc_endpoint, json=payload, timeout=10)
-            resp.raise_for_status()
-            result = resp.json().get("result")
-        except Exception as e:
-            print(f"[On-chain] Error consultando el RPC de Solana: {e}")
-            return None
-
-        value = result.get("value") if result else None
-        if not value:
-            return None  # cuenta inexistente, o bonding curve ya migrada/cerrada
-
-        try:
-            raw = base64.b64decode(value["data"][0])
-            # Layout de la cuenta: 8 bytes de discriminador + 5 x u64 (LE) + 1 bool
-            (virtual_token_reserves, virtual_sol_reserves,
-             _real_token_reserves, _real_sol_reserves,
-             _token_total_supply, complete) = struct.unpack_from("<QQQQQ?", raw, 8)
-        except Exception as e:
-            print(f"[On-chain] No se pudo decodificar la cuenta de la bonding curve: {e}")
-            return None
-
-        if complete or virtual_token_reserves <= 0:
-            return None  # ya migró a PumpSwap: acá conviene la fuente DexScreener
-
-        sol_amount = virtual_sol_reserves / (10 ** self.SOL_DECIMALS)
-        token_amount = virtual_token_reserves / (10 ** self.TOKEN_DECIMALS)
-        return sol_amount / token_amount if token_amount > 0 else None
-
-    def fetch_price_dexscreener(self, mint: str) -> Optional[float]:
-        """
-        Consulta el precio actual del token (en SOL) vía la API pública de
-        DexScreener. No requiere API key. Se usa como respaldo/refresco de
-        precio para no depender pura y exclusivamente de que ocurran trades
-        nuevos en el feed de PumpPortal en ese preciso momento (tokens con
-        poco volumen pueden pasar minutos sin ningún trade).
-
-        Nota: tokens recién creados pueden tardar unos segundos en aparecer
-        indexados en DexScreener.
-        """
-        url = self.DEXSCREENER_TOKENS_URL.format(mint=mint)
-        try:
-            resp = requests.get(url, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            print(f"[DexScreener] Error al consultar precio: {e}")
-            return None
-
-        pairs = data.get("pairs") or []
-        if not pairs:
-            return None
-
-        # Preferimos pares cotizados en SOL/WSOL (que es la unidad que usa
-        # todo el resto del bot) y, entre esos, el de mayor liquidez.
-        sol_pairs = [p for p in pairs if (p.get("quoteToken") or {}).get("symbol") in ("SOL", "WSOL")]
-        candidates = sol_pairs or pairs
-
-        def liquidity_usd(p: dict) -> float:
-            return (p.get("liquidity") or {}).get("usd") or 0.0
-
-        best = max(candidates, key=liquidity_usd)
-        try:
-            return float(best["priceNative"])
-        except (KeyError, TypeError, ValueError):
-            return None
+        return None
 
     # ---- Trading real (Lightning Transaction API) ------------------------- #
 
@@ -389,20 +304,20 @@ class TradeExecutor:
     PumpPortalClient para mandar la orden a la Lightning API).
     """
 
-    def __init__(self, client: PumpPortalClient, live: bool, trade_cfg: TradeConfig):
+    def __init__(self, client: PumpPortalClient, live: bool, config: AppConfig):
         self.client = client
         self.live = live
-        self.trade_cfg = trade_cfg
+        self.cfg = config
 
     def buy(self, mint: str, price: float) -> Position:
-        sol_amount = self.trade_cfg.buy_sol
+        sol_amount = self.cfg.buy_sol
 
         if self.live:
             try:
                 result = self.client.execute_lightning_trade(
                     action="buy", mint=mint, amount=sol_amount, denominated_in_sol=True,
-                    slippage=self.trade_cfg.slippage, priority_fee=self.trade_cfg.priority_fee,
-                    pool=self.trade_cfg.pool,
+                    slippage=self.cfg.slippage, priority_fee=self.cfg.priority_fee,
+                    pool=self.cfg.pool,
                 )
                 print(f"[REAL] Compra enviada. Respuesta: {result}")
             except Exception as e:
@@ -420,8 +335,8 @@ class TradeExecutor:
             try:
                 result = self.client.execute_lightning_trade(
                     action="sell", mint=position.mint, amount="100%", denominated_in_sol=False,
-                    slippage=self.trade_cfg.slippage, priority_fee=self.trade_cfg.priority_fee,
-                    pool=self.trade_cfg.pool,
+                    slippage=self.cfg.slippage, priority_fee=self.cfg.priority_fee,
+                    pool=self.cfg.pool,
                 )
                 print(f"[REAL] Venta enviada. Respuesta: {result}")
             except Exception as e:
@@ -446,86 +361,97 @@ class TrailingTakeProfitBot:
     lógica de trailing take-profit / stop-loss inicial.
     """
 
-    def __init__(self, client: PumpPortalClient, executor: TradeExecutor,
-                 mint: str, strategy_cfg: StrategyConfig,
-                 status_interval_seconds: float = 5.0,
-                 price_poll_interval_seconds: float = 3.0):
+    def __init__(self, client: PumpPortalClient, executor: TradeExecutor, config: AppConfig):
         self.client = client
         self.executor = executor
-        self.mint = mint
-        self.cfg = strategy_cfg
-        self.status_interval_seconds = status_interval_seconds
-        self.price_poll_interval_seconds = price_poll_interval_seconds
+        self.mint = config.mint
+        self.cfg = config
+        self.status_interval_seconds = config.status_interval_seconds
         self.position: Optional[Position] = None
         self.latest_price: Optional[float] = None
         self._closed_event = asyncio.Event()
+        self._ws = None
+        self._trade_events: Optional[AsyncIterator[dict]] = None
 
     async def run(self) -> None:
         """
-        Consigue un precio YA (vía DexScreener) y compra de inmediato, sin
-        esperar a que ocurra un trade nuevo del token. A partir de ahí corren
-        tres tareas en paralelo:
-          - el feed de trades de PumpPortal (websocket), para reaccionar lo
-            más rápido posible cuando el token SÍ tiene actividad,
-          - un refresco periódico de precio vía DexScreener, para que el bot
-            siga funcionando aunque el token tenga poco o ningún volumen,
-          - la impresión periódica del %% de profit en pantalla.
+        Se suscribe (subscribe_trade) al mint ANTES de comprar, para tener
+        el feed de precios en vivo corriendo desde el arranque. Con esa
+        misma conexión ya abierta:
+          1. espera el primer trade real del mint por ese feed y compra
+             contra ese precio (ver _get_initial_price) — el precio de
+             entrada SIEMPRE sale del feed en vivo, sin importar cuánto
+             tarde: no hay ninguna otra fuente de precio,
+          2. sigue escuchando ese mismo feed para reaccionar en tiempo real
+             mientras dure la posición,
+          3. en paralelo corre la impresión periódica del %% de profit.
         """
         print(f"Siguiendo el token: {self.mint}")
+        print(f"Suscribiéndose (subscribe_trade) al feed de trades de PumpPortal para {self.mint}...")
+        self._ws = await self.client.connect_trade_stream(self.mint)
+        self._trade_events = self.client.iter_trade_events(self._ws)
 
-        initial_price = await self._get_initial_price()
-        if initial_price is None:
-            print("ERROR: no se pudo obtener un precio inicial del token (ni por DexScreener "
-                  "ni por el feed de PumpPortal). Verificá la dirección del token.")
-            return
+        try:
+            initial_price = await self._get_initial_price()
+            if initial_price is None:
+                print("ERROR: se cortó la conexión con PumpPortal antes de recibir un trade con "
+                      "precio. Verificá la dirección del token y la api_key, y volvé a intentar.")
+                return
 
-        self.latest_price = initial_price
-        self._on_first_price(initial_price)
+            self.latest_price = initial_price
+            self._on_first_price(initial_price)
 
-        tasks = [
-            asyncio.create_task(self._consume_trade_stream()),
-            asyncio.create_task(self._price_poll_loop()),
-            asyncio.create_task(self._status_printer_loop()),
-        ]
+            tasks = [
+                asyncio.create_task(self._consume_trade_stream()),
+                asyncio.create_task(self._status_printer_loop()),
+            ]
 
-        await self._closed_event.wait()
+            await self._closed_event.wait()
 
-        for t in tasks:
-            t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            await self._ws.close()
 
         print("Bot finalizado.")
 
     async def _get_initial_price(self) -> Optional[float]:
-        """Intenta conseguir un precio inicial de inmediato, probando en
-        orden la fuente más fiable primero: 1) on-chain (bonding curve de
-        pump.fun), 2) DexScreener, 3) como último recurso, esperar el
-        primer trade del websocket de PumpPortal."""
-        price = await asyncio.to_thread(self.client.fetch_price_onchain, self.mint)
-        if price:
-            print(f"Precio inicial (on-chain, bonding curve de pump.fun): {price:.10f} SOL/token")
-            return price
+        """Consigue el precio de entrada ÚNICAMENTE del feed en vivo de
+        PumpPortal (subscribe_trade), esperando el tiempo que haga falta a
+        que llegue el primer trade del mint con precio calculable — sin
+        timeout, sin on-chain, sin DexScreener. Si la conexión se corta
+        antes de eso (error de red, etc.), devuelve None."""
+        print("Esperando el primer trade en vivo del feed de PumpPortal (subscribe_trade) "
+              "para fijar el precio de entrada. Esto puede tardar si el token tiene poco volumen.")
+        sin_precio = 0
+        try:
+            async for event in self._trade_events:
+                price = self.client.extract_price(event)
+                if price is not None and price > 0:
+                    print(f"Precio inicial (feed en vivo, subscribe_trade): {price:.10f} SOL/token")
+                    return price
+                # Llegó un trade pero no se pudo calcular el precio (evento
+                # con claves inesperadas). Lo avisamos, con las claves del
+                # evento, para poder diagnosticarlo sin quedar en silencio.
+                sin_precio += 1
+                if sin_precio == 1 or sin_precio % 20 == 0:
+                    print(f"[Feed en vivo] llegaron trades pero no se pudo calcular el precio "
+                          f"(claves del evento: {sorted(event.keys())}). Sigo esperando...")
+            print("[Feed en vivo] la conexión se cerró antes de recibir un trade con precio.")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[Feed en vivo] la conexión falló: {e}")
 
-        price = await asyncio.to_thread(self.client.fetch_price_dexscreener, self.mint)
-        if price:
-            print(f"Precio inicial (DexScreener): {price:.10f} SOL/token")
-            return price
-
-        print("No se pudo obtener el precio ni on-chain ni por DexScreener. "
-              "Esperando el primer trade del feed de PumpPortal...")
-        async for event in self.client.stream_token_trades(self.mint):
-            price = self.client.extract_price(event)
-            if price is not None and price > 0:
-                print(f"Precio inicial (primer trade de PumpPortal): {price:.10f} SOL/token")
-                return price
         return None
 
     async def _consume_trade_stream(self) -> None:
-        """Escucha los trades del token en tiempo real vía websocket, para
-        reaccionar más rápido cuando hay actividad. Es un canal adicional al
-        polling de DexScreener, no el único."""
+        """Sigue escuchando trades en tiempo real por la MISMA conexión
+        websocket ya abierta y suscripta desde run() (subscribe_trade), sin
+        reconectar."""
         try:
-            async for event in self.client.stream_token_trades(self.mint):
+            async for event in self._trade_events:
                 if self.position is None or self.position.closed:
                     break
                 price = self.client.extract_price(event)
@@ -537,24 +463,6 @@ class TrailingTakeProfitBot:
             raise
         except Exception as e:
             print(f"[Feed de trades de PumpPortal] conexión interrumpida: {e}")
-
-    async def _price_poll_loop(self) -> None:
-        """Refresca el precio cada `price_poll_interval_seconds`, probando
-        primero la lectura on-chain (más rápida y fiable) y usando
-        DexScreener como respaldo, para que el bot siga reaccionando aunque
-        el token tenga poco volumen y el websocket de trades esté en
-        silencio. NO imprime nada por sí solo (eso lo hace el status
-        printer, a su propio intervalo) — solo reevalúa la estrategia."""
-        while True:
-            await asyncio.sleep(self.price_poll_interval_seconds)
-            if self.position is None or self.position.closed:
-                return
-            price = await asyncio.to_thread(self.client.fetch_price_onchain, self.mint)
-            if not price:
-                price = await asyncio.to_thread(self.client.fetch_price_dexscreener, self.mint)
-            if price and price > 0:
-                self.latest_price = price
-                self._on_price_update(price)
 
     async def _status_printer_loop(self) -> None:
         """Imprime el %% de profit actual cada `status_interval_seconds`, sin
@@ -637,22 +545,14 @@ def main():
         print(f"ERROR de configuración: {e}")
         sys.exit(1)
 
-    if config.general.live:
+    if config.live:
         print("⚠️  MODO REAL ACTIVADO (general.live = true en el .toml). Vas a operar con SOL real.")
         print("    Presioná Ctrl+C ahora si no es lo que querés.")
         time.sleep(3)
 
-    if not _SOLDERS_AVAILABLE:
-        print("Aviso: 'solders' no está instalado (pip install solders). El bot va a funcionar igual, "
-              "pero sin la lectura on-chain del precio (la más rápida y fiable); usará DexScreener.")
-
-    client = PumpPortalClient(api_key=config.pumpportal.api_key, rpc_endpoint=config.general.rpc_endpoint)
-    executor = TradeExecutor(client=client, live=config.general.live, trade_cfg=config.trade)
-    bot = TrailingTakeProfitBot(
-        client=client, executor=executor, mint=config.general.mint, strategy_cfg=config.strategy,
-        status_interval_seconds=config.general.status_interval_seconds,
-        price_poll_interval_seconds=config.general.price_poll_interval_seconds,
-    )
+    client = PumpPortalClient(api_key=config.api_key)
+    executor = TradeExecutor(client=client, live=config.live, config=config)
+    bot = TrailingTakeProfitBot(client=client, executor=executor, config=config)
 
     try:
         asyncio.run(bot.run())
