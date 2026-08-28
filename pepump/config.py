@@ -43,6 +43,14 @@ def load_config(path: str) -> AppConfig:
 
     config = AppConfig(**merged)
 
+    # Defensivo: un espacio, tab o salto de línea colado al copiar el mint
+    # (o la api_key) al .toml no rompe el parseo del TOML en sí, pero hace
+    # que el subscribeTokenTrade se acepte igual (PumpPortal no valida que
+    # el mint exista) y después nunca matchee ningún trade real -> el bot
+    # se queda esperando para siempre en silencio. Lo limpiamos acá.
+    config.mint = config.mint.strip()
+    config.api_key = config.api_key.strip()
+
     if not config.mint:
         raise ValueError("Falta 'mint' en la sección [general] del archivo .toml")
 

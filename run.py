@@ -60,6 +60,7 @@ Uso:
 
 import argparse
 import asyncio
+import logging
 import sys
 import time
 
@@ -67,31 +68,39 @@ from pepump.config import load_config
 from pepump.pump import PumpPortalClient
 from pepump.executor import TradeExecutor
 from pepump.bot import TrailingTakeProfitBot
+from pepump.logging_config import setup_logging
+
+logger = logging.getLogger()
+
 
 # Opciones
 def parse_args():
     p = argparse.ArgumentParser(description="Bot de trailing take-profit para pump.fun (Lightning API de PumpPortal)")
-    
+
     p.add_argument("-c", "--config", default="config.toml", help="Ruta al archivo .toml de configuración (default: config.toml)")
-    
+    p.add_argument("-v", "--verbose", action="store_true", help="Logging en nivel DEBUG en vez de INFO")
+
     return p.parse_args()
 
 # main
 def main():
     args = parse_args()
+    setup_logging(level=logging.DEBUG if args.verbose else logging.INFO)
 
     try:
         config = load_config(args.config)
     except FileNotFoundError:
-        print(f"ERROR: no se encontró el archivo de configuración '{args.config}'.")
+        logger.error(f"No se encontró el archivo de configuración '{args.config}'.")
         sys.exit(1)
     except ValueError as e:
-        print(f"ERROR de configuración: {e}")
+        # tomllib.TOMLDecodeError también hereda de ValueError, así que un
+        # .toml mal formado cae acá también (probado: da un mensaje claro).
+        logger.error(f"ERROR de configuración: {e}")
         sys.exit(1)
-
+   
     if config.live:
-        print("⚠️  MODO REAL ACTIVADO (general.live = true en el .toml). Vas a operar con SOL real.")
-        print("    Presioná Ctrl+C ahora para detenerlo.")
+        logger.warning("⚠️  MODO REAL ACTIVADO (general.live = true en el .toml). Vas a operar con SOL real.")
+        logger.warning("    Presioná Ctrl+C ahora para detenerlo.")
         time.sleep(3)
 
     client = PumpPortalClient(api_key=config.api_key)
@@ -101,7 +110,7 @@ def main():
     try:
         asyncio.run(bot.run())
     except KeyboardInterrupt:
-        print("\nInterrumpido por el usuario.")
+        logger.info("Interrumpido por el usuario.")
 
 
 if __name__ == "__main__":

@@ -1,7 +1,13 @@
 import asyncio
+import time
 from typing import AsyncIterator, Optional
 
 from pepump.executor import Position
+
+# Cada cuánto tiempo (segundos), mientras seguimos esperando el primer
+# trade real, se repite el recordatorio de diagnóstico con las causas
+# más probables (wallet sin fondos, api_key inválida, token sin volumen).
+_DIAGNOSTIC_REMINDER_SECONDS = 10.0
 
 
 class TrailingTakeProfitBot:
@@ -39,7 +45,7 @@ class TrailingTakeProfitBot:
         print(f"Siguiendo el token: {self.mint}")
         print(f"Suscribiéndose (subscribe_trade) al feed de trades de PumpPortal para {self.mint}...")
         self._ws = await self.client.connect_trade_stream(self.mint)
-        self._trade_events = self.client.iter_trade_events(self._ws)
+        self._trade_events = self.client.iter_trade_events()
 
         try:
             initial_price = await self._get_initial_price()
@@ -74,6 +80,9 @@ class TrailingTakeProfitBot:
         antes de eso (error de red, etc.), devuelve None."""
         print("Esperando el primer trade en vivo del feed de PumpPortal (subscribe_trade) "
               "para fijar el precio de entrada. Esto puede tardar si el token tiene poco volumen.")
+        start = time.monotonic()
+        last_reminder = start
+        recibio_ack = False
         sin_precio = 0
         try:
             async for event in self._trade_events:
@@ -81,13 +90,43 @@ class TrailingTakeProfitBot:
                 if price is not None and price > 0:
                     print(f"Precio inicial (feed en vivo, subscribe_trade): {price:.10f} SOL/token")
                     return price
-                # Llegó un trade pero no se pudo calcular el precio (evento
-                # con claves inesperadas). Lo avisamos, con las claves del
-                # evento, para poder diagnosticarlo sin quedar en silencio.
-                sin_precio += 1
-                if sin_precio == 1 or sin_precio % 20 == 0:
-                    print(f"[Feed en vivo] llegaron trades pero no se pudo calcular el precio "
-                          f"(claves del evento: {sorted(event.keys())}). Sigo esperando...")
+
+                # Distinguimos el ack de confirmación del subscribe (evento
+                # con ÚNICAMENTE la clave "message", ej.
+                # {"message": "Successfully subscribed to keys."}) de
+                # cualquier otro evento con forma rara. El ack en sí es
+                # normal y no indica ningún problema: solo confirma que la
+                # suscripción fue aceptada. El problema real es si después
+                # de ese ack no llega NINGÚN trade real.
+                if not recibio_ack and set(event.keys()) == {"message"}:
+                    recibio_ack = True
+                    print(f"[Feed en vivo] confirmación de suscripción recibida ({event['message']!r}). "
+                          f"Sigo esperando el primer trade real...")
+                else:
+                    # Llegó un evento (que no es el ack) pero no se pudo
+                    # calcular el precio. Lo avisamos, con las claves del
+                    # evento, para poder diagnosticarlo sin quedar en silencio.
+                    sin_precio += 1
+                    if sin_precio == 1 or sin_precio % 20 == 0:
+                        print(f"[Feed en vivo] llegaron eventos pero no se pudo calcular el precio "
+                              f"(claves del evento: {sorted(event.keys())}). Sigo esperando...")
+
+                # Recordatorio periódico de diagnóstico: si ya pasó bastante
+                # tiempo sin recibir NINGÚN trade real (solo el ack, o ni
+                # siquiera eso), lo más probable es wallet sin fondos,
+                # api_key inválida, o un token sin volumen real ahora mismo.
+                now = time.monotonic()
+                if now - last_reminder >= _DIAGNOSTIC_REMINDER_SECONDS:
+                    last_reminder = now
+                    elapsed = now - start
+                    if recibio_ack:
+                        print(f"[Feed en vivo] {elapsed:.0f}s esperando y todavía ningún trade real "
+                              f"(solo llegó el ack de suscripción). Causas típicas: la wallet asociada "
+                              f"a tu pumpportal.api_key tiene menos de 0.02 SOL, la api_key es inválida "
+                              f"o vieja, o este mint simplemente no tiene volumen en este momento.")
+                    else:
+                        print(f"[Feed en vivo] {elapsed:.0f}s esperando y todavía ni siquiera llegó "
+                              f"el ack de suscripción. Revisá la conexión de red y que el mint sea correcto.")
             print("[Feed en vivo] la conexión se cerró antes de recibir un trade con precio.")
         except asyncio.CancelledError:
             raise

@@ -51,7 +51,15 @@ class PumpPortalClient:
                   "esperando para siempre. Configurá pumpportal.api_key o PUMPPORTAL_API_KEY.")
 
         ws = await websockets.connect(url)
-        await ws.send(json.dumps({"method": "subscribeTokenTrade", "keys": [mint]}))
+        payload = {"method": "subscribeTokenTrade", "keys": [mint]}
+        # Diagnóstico: si el mint tiene un carácter invisible (espacio,
+        # salto de línea, etc. colado al copiarlo al .toml), el server
+        # confirma el subscribe igual (no valida que el mint exista) pero
+        # después nunca matchea ningún trade real -> se queda esperando
+        # para siempre aunque el token sí esté tradeando activamente. Con
+        # repr() se ve cualquier carácter oculto que print(mint) no muestra.
+        print(f"[Debug] Suscribiendo con mint={mint!r} (len={len(mint)}) | payload enviado: {json.dumps(payload)}")
+        await ws.send(json.dumps(payload))
         return ws
 
     @staticmethod
@@ -123,4 +131,3 @@ class PumpPortalClient:
         if resp.status_code != 200:
             raise RuntimeError(f"Lightning API devolvió {resp.status_code}: {resp.text}")
         return resp.json()
-

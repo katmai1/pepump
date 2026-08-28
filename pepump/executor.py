@@ -1,4 +1,7 @@
+import logging
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -44,15 +47,15 @@ class TradeExecutor:
                     slippage=self.cfg.slippage, priority_fee=self.cfg.priority_fee,
                     pool=self.cfg.pool,
                 )
-                print(f"[REAL] Compra enviada. Respuesta: {result}")
-            except Exception as e:
-                print(f"[REAL] Error al comprar: {e}")
+                logger.info(f"[REAL] Compra enviada. Respuesta: {result}")
+            except Exception:
+                logger.exception("[REAL] Error al comprar")
                 raise
 
         token_amount = sol_amount / price if price > 0 else 0.0
         etiqueta = "REAL" if self.live else "SIMULADO"
-        print(f"[{etiqueta}] COMPRA de {sol_amount} SOL en {mint} a precio {price:.10f} SOL/token "
-              f"(~{token_amount:,.2f} tokens)")
+        logger.info(f"[{etiqueta}] COMPRA de {sol_amount} SOL en {mint} a precio {price:.10f} SOL/token "
+                    f"(~{token_amount:,.2f} tokens)")
         return Position(mint=mint, entry_price=price, sol_amount=sol_amount, token_amount=token_amount)
 
     def sell(self, position: Position, price: float, reason: str) -> None:
@@ -63,15 +66,28 @@ class TradeExecutor:
                     slippage=self.cfg.slippage, priority_fee=self.cfg.priority_fee,
                     pool=self.cfg.pool,
                 )
-                print(f"[REAL] Venta enviada. Respuesta: {result}")
-            except Exception as e:
-                print(f"[REAL] Error al vender: {e}")
+                logger.info(f"[REAL] Venta enviada. Respuesta: {result}")
+            except Exception:
+                # BUGFIX: antes esta excepción se logueaba y se seguía de
+                # largo igual: la posición se marcaba `closed = True` y se
+                # imprimía el PnL/proceeds como si la venta hubiese salido
+                # bien, cuando en realidad la Lightning API falló y el
+                # token real seguía en la wallet, sin vender. Con SOL real
+                # eso es peligroso: el bot "cree" que cerró la posición y
+                # deja de vigilarla. Ahora propagamos la excepción y NO
+                # marcamos la posición como cerrada, para que quede claro
+                # que la venta real falló y haya que reintentarla a mano.
+                logger.exception(
+                    f"[REAL] Error al vender {position.mint}. La posición SIGUE ABIERTA: "
+                    "no se marcó como vendida. Revisá manualmente y reintentá la venta."
+                )
+                raise
 
         pnl = position.pnl_pct(price)
         proceeds = position.token_amount * price
         etiqueta = "REAL" if self.live else "SIMULADO"
-        print(f"[{etiqueta}] VENTA de {position.mint} a precio {price:.10f} SOL/token "
-              f"| motivo: {reason} | PnL: {pnl:+.2f}% | SOL recibidos (aprox): {proceeds:.6f}")
+        logger.info(f"[{etiqueta}] VENTA de {position.mint} a precio {price:.10f} SOL/token "
+                    f"| motivo: {reason} | PnL: {pnl:+.2f}% | SOL recibidos (aprox): {proceeds:.6f}")
         position.closed = True
 
 
