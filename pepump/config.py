@@ -21,6 +21,15 @@ class AppConfig:
     activation_pct: float = 10.0
     trailing_pct: float = 15.0
     initial_stop_pct: float = 25.0
+    # Baja %% desde el precio de referencia (el primer precio que llega al
+    # arrancar) que se espera ANTES de comprar. 0 (default) = comprar de
+    # una al precio de referencia, exactamente como antes. Si es > 0
+    # (ej. 5), el bot NO compra en la referencia: sigue mirando el precio
+    # y recién entra cuando toca `referencia * (1 - entry_dip_pct/100)` o
+    # menos (ver _wait_for_dip_entry en bot.py). Si el precio nunca baja
+    # tanto, el bot se queda esperando indefinidamente -cancelá con
+    # Ctrl+C/SIGTERM si hace falta, no hay timeout para esto.
+    entry_dip_pct: float = 0.0
 
     # --- [pumpportal] ----------------------------------------------------- #
     api_key: str = ""  # también se puede definir con la variable de entorno PUMPPORTAL_API_KEY

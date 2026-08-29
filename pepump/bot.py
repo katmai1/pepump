@@ -301,7 +301,33 @@ class TrailingTakeProfitBot:
         raise asyncio.TimeoutError()
 
     async def _get_initial_price(self) -> Optional[float]:
-        """Consigue el precio de entrada, en este orden:
+        """Punto de entrada para conseguir el precio de compra real.
+
+        1. Consigue un precio de REFERENCIA con la lógica de siempre
+           (_get_reference_price): primer trade del feed en vivo, o
+           fallback on-chain si el mint ya migró.
+        2. Si `entry_dip_pct` es 0 (default), esa referencia ES el precio
+           de entrada -comportamiento idéntico al de antes, sin cambios.
+        3. Si `entry_dip_pct` > 0, la referencia NO se usa para comprar:
+           se calcula el precio objetivo (referencia * (1 - dip%)) y se
+           sigue mirando el precio (_wait_for_dip_entry) hasta que lo
+           toque o baje de ahí, y ESE es el precio real de entrada.
+        """
+        reference_price = await self._get_reference_price()
+        if reference_price is None:
+            return None
+
+        if self.cfg.entry_dip_pct <= 0:
+            return reference_price
+
+        target_price = reference_price * (1 - self.cfg.entry_dip_pct / 100.0)
+        logger.info(f"Precio de referencia: {reference_price:.10f} SOL/token. Esperando una baja "
+                    f"de {self.cfg.entry_dip_pct}% -> entra si el precio toca {target_price:.10f} "
+                    f"SOL/token o menos (sin timeout, cancelá con Ctrl+C si hace falta)...")
+        return await self._wait_for_dip_entry(reference_price, target_price)
+
+    async def _get_reference_price(self) -> Optional[float]:
+        """Consigue el precio de REFERENCIA, en este orden:
           1. Feed en vivo de PumpPortal (subscribe_trade) — sin límite de
              tiempo MIENTRAS no haya llegado ni el ack de suscripción
              (eso indicaría un problema de conexión/api_key/wallet, no de
@@ -353,7 +379,7 @@ class TrailingTakeProfitBot:
 
             price = self.client.extract_price(event)
             if price is not None and price > 0:
-                logger.info(f"Precio inicial (feed en vivo, subscribe_trade): {price:.10f} SOL/token")
+                logger.info(f"Precio de referencia (feed en vivo, subscribe_trade): {price:.10f} SOL/token")
                 return price
 
             # Distinguimos el ack de confirmación del subscribe (evento
@@ -403,9 +429,97 @@ class TrailingTakeProfitBot:
             logger.error("[On-chain PumpSwap] Tampoco se pudo obtener precio on-chain para este mint. "
                          "No hay ninguna fuente de precio disponible; abortando esta entrada.")
             return None
-        logger.info(f"Precio inicial (fallback on-chain PumpSwap): {price:.10f} SOL/token")
+        logger.info(f"Precio de referencia (fallback on-chain PumpSwap): {price:.10f} SOL/token")
         self._using_onchain_fallback = True
         return price
+
+    async def _wait_for_dip_entry(self, reference_price: float, target_price: float) -> Optional[float]:
+        """Sólo se llama cuando `entry_dip_pct` > 0 (ver _get_initial_price).
+
+        Ya tenemos un precio de REFERENCIA (recién resuelto por
+        _get_reference_price) pero todavía NO compramos con él. Acá
+        seguimos mirando el precio -por el mismo canal que produjo esa
+        referencia: el feed en vivo ya suscripto, o polling on-chain si
+        el mint ya migró (_using_onchain_fallback)- hasta que toque
+        `target_price` o baje de ahí, y ESE es el precio real de compra.
+
+        No hay timeout: si el precio nunca baja lo suficiente, esto
+        espera para siempre (igual que _get_reference_price esperando el
+        ack). Ctrl+C/SIGTERM corta la espera en cualquier momento y
+        devuelve None -todavía no hay posición abierta, no hay nada que
+        vender.
+
+        Actualiza self.latest_price en el camino (aunque todavía no haya
+        posición, así el status printer/lo que consulte ese campo no se
+        queda con el valor viejo de la referencia)."""
+        self.latest_price = reference_price
+
+        if self._using_onchain_fallback:
+            onchain = PumpSwapOnChainClient(self.cfg.solana_rpc_url)
+            while True:
+                if self._shutdown_requested.is_set():
+                    logger.info("Cancelado por el usuario mientras se esperaba la baja de entrada.")
+                    return None
+                try:
+                    price = await onchain.fetch_price_for_migrated_mint(self.mint)
+                except Exception as e:
+                    logger.warning(f"[On-chain PumpSwap] error puntual esperando la baja de entrada, "
+                                   f"reintento en el próximo ciclo: {e}")
+                    price = None
+                if price is not None and price > 0:
+                    self.latest_price = price
+                    if price <= target_price:
+                        logger.info(f"Precio de entrada (baja de {self.cfg.entry_dip_pct}% desde "
+                                    f"{reference_price:.10f}, fallback on-chain): {price:.10f} SOL/token")
+                        return price
+                try:
+                    await asyncio.wait_for(
+                        self._shutdown_requested.wait(),
+                        timeout=self.cfg.onchain_poll_interval_seconds,
+                    )
+                    logger.info("Cancelado por el usuario mientras se esperaba la baja de entrada.")
+                    return None
+                except asyncio.TimeoutError:
+                    continue  # se cumplió el intervalo de polling sin pedido de shutdown; seguimos
+
+        # Feed en vivo: reusamos la misma conexión/suscripción ya abierta.
+        # Si se corta, reconectamos igual que hace _consume_trade_stream,
+        # porque todavía no hay posición abierta que ese loop pueda cubrir.
+        while True:
+            try:
+                event = await self._next_trade_event()
+            except _ShutdownRequested:
+                logger.info("Cancelado por el usuario mientras se esperaba la baja de entrada.")
+                return None
+            except asyncio.CancelledError:
+                raise
+            except (StopAsyncIteration, Exception) as e:
+                is_clean_close = isinstance(e, StopAsyncIteration)
+                logger.warning(f"[Feed en vivo] {'la conexión se cerró' if is_clean_close else f'conexión interrumpida ({e})'} "
+                               f"mientras se esperaba la baja de entrada; reconectando...")
+                try:
+                    if self._ws is not None:
+                        try:
+                            await self._ws.close()
+                        except Exception:
+                            pass
+                    self._ws = await self.client.connect_trade_stream(self.mint)
+                    self._trade_events = self.client.iter_trade_events(self._ws)
+                    logger.info("Reconectado al feed de trades de PumpPortal.")
+                    continue
+                except Exception as e2:
+                    logger.error(f"No se pudo reconectar al feed de trades de PumpPortal mientras se "
+                                 f"esperaba la baja de entrada: {e2}")
+                    return None
+
+            price = self.client.extract_price(event)
+            if price is None or price <= 0:
+                continue
+            self.latest_price = price
+            if price <= target_price:
+                logger.info(f"Precio de entrada (baja de {self.cfg.entry_dip_pct}% desde "
+                            f"{reference_price:.10f}, feed en vivo): {price:.10f} SOL/token")
+                return price
 
     async def _poll_onchain_price_loop(self) -> None:
         """Reemplazo de _consume_trade_stream para cuando la posición se

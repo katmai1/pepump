@@ -35,6 +35,15 @@ trailing_pct = 15.0
 # (protege por si el precio nunca sube y se desploma desde el arranque).
 initial_stop_pct = 25.0
 
+# Baja %% que se espera ANTES de comprar, medida desde el precio de
+# referencia (el primer precio que llega al arrancar el bot).
+# 0 (default)  = compra de una al precio de referencia (comportamiento normal).
+# > 0 (ej. 5)  = NO compra en la referencia; espera a que el precio baje ese
+#                %% desde ahí (referencia * (1 - entry_dip_pct/100)) y recién
+#                ahí entra. Sin timeout: si el precio nunca baja tanto, el
+#                bot queda esperando indefinidamente (cancelá con Ctrl+C).
+entry_dip_pct = 0.0
+
 [pumpportal]
 # API key de PumpPortal. Se genera en pumpportal.fun y está asociada a una
 # wallet ya fondeada. ¡OBLIGATORIA siempre, aunque live = false! El bot usa
