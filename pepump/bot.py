@@ -443,16 +443,24 @@ class TrailingTakeProfitBot:
         el mint ya migró (_using_onchain_fallback)- hasta que toque
         `target_price` o baje de ahí, y ESE es el precio real de compra.
 
-        No hay timeout: si el precio nunca baja lo suficiente, esto
-        espera para siempre (igual que _get_reference_price esperando el
-        ack). Ctrl+C/SIGTERM corta la espera en cualquier momento y
-        devuelve None -todavía no hay posición abierta, no hay nada que
-        vender.
+        Cada `status_interval_seconds` (mismo intervalo que usa el
+        status printer una vez armada la posición) loguea el progreso:
+        precio actual, objetivo, y cuánto falta bajar -para no quedar en
+        silencio mientras se espera, sea porque el intervalo se cumplió
+        aunque no haya llegado ningún trade nuevo (feed en vivo) o
+        porque simplemente le toca su ciclo (polling on-chain).
+
+        No hay timeout para la espera en sí: si el precio nunca baja lo
+        suficiente, esto espera para siempre (igual que
+        _get_reference_price esperando el ack). Ctrl+C/SIGTERM corta la
+        espera en cualquier momento y devuelve None -todavía no hay
+        posición abierta, no hay nada que vender.
 
         Actualiza self.latest_price en el camino (aunque todavía no haya
         posición, así el status printer/lo que consulte ese campo no se
         queda con el valor viejo de la referencia)."""
         self.latest_price = reference_price
+        last_log = time.monotonic()
 
         if self._using_onchain_fallback:
             onchain = PumpSwapOnChainClient(self.cfg.solana_rpc_url)
@@ -472,6 +480,9 @@ class TrailingTakeProfitBot:
                         logger.info(f"Precio de entrada (baja de {self.cfg.entry_dip_pct}% desde "
                                     f"{reference_price:.10f}, fallback on-chain): {price:.10f} SOL/token")
                         return price
+                    if time.monotonic() - last_log >= self.cfg.status_interval_seconds:
+                        last_log = time.monotonic()
+                        self._log_dip_wait_progress(target_price)
                 try:
                     await asyncio.wait_for(
                         self._shutdown_requested.wait(),
@@ -485,41 +496,89 @@ class TrailingTakeProfitBot:
         # Feed en vivo: reusamos la misma conexión/suscripción ya abierta.
         # Si se corta, reconectamos igual que hace _consume_trade_stream,
         # porque todavía no hay posición abierta que ese loop pueda cubrir.
-        while True:
-            try:
-                event = await self._next_trade_event()
-            except _ShutdownRequested:
-                logger.info("Cancelado por el usuario mientras se esperaba la baja de entrada.")
-                return None
-            except asyncio.CancelledError:
-                raise
-            except (StopAsyncIteration, Exception) as e:
-                is_clean_close = isinstance(e, StopAsyncIteration)
-                logger.warning(f"[Feed en vivo] {'la conexión se cerró' if is_clean_close else f'conexión interrumpida ({e})'} "
-                               f"mientras se esperaba la baja de entrada; reconectando...")
+        #
+        # OJO: el log periódico de progreso corre en una tarea de fondo
+        # aparte (_dip_progress_logger), NO metiendo un timeout en
+        # _next_trade_event() para "despertarnos" cada tanto. Meterle un
+        # timeout ahí cancelaría el __anext__() del generador
+        # iter_trade_events en pleno vuelo -y cancelar un async generator
+        # a mitad de un await lo deja CERRADO para siempre a nivel de
+        # Python (no es que se corte la conexión real: el propio
+        # generador queda inutilizable aunque el websocket siga
+        # perfectamente abierto), lo que disparaba una reconexión real
+        # innecesaria cada `status_interval_seconds`. Con la tarea de
+        # fondo (que solo lee self.latest_price, igual que
+        # _status_printer_loop) evitamos tocar el stream de eventos.
+        progress_task = asyncio.create_task(self._dip_progress_logger(target_price))
+        try:
+            while True:
                 try:
-                    if self._ws is not None:
-                        try:
-                            await self._ws.close()
-                        except Exception:
-                            pass
-                    self._ws = await self.client.connect_trade_stream(self.mint)
-                    self._trade_events = self.client.iter_trade_events(self._ws)
-                    logger.info("Reconectado al feed de trades de PumpPortal.")
-                    continue
-                except Exception as e2:
-                    logger.error(f"No se pudo reconectar al feed de trades de PumpPortal mientras se "
-                                 f"esperaba la baja de entrada: {e2}")
+                    event = await self._next_trade_event()
+                except _ShutdownRequested:
+                    logger.info("Cancelado por el usuario mientras se esperaba la baja de entrada.")
                     return None
+                except asyncio.CancelledError:
+                    raise
+                except (StopAsyncIteration, Exception) as e:
+                    is_clean_close = isinstance(e, StopAsyncIteration)
+                    logger.warning(f"[Feed en vivo] {'la conexión se cerró' if is_clean_close else f'conexión interrumpida ({e})'} "
+                                   f"mientras se esperaba la baja de entrada; reconectando...")
+                    try:
+                        if self._ws is not None:
+                            try:
+                                await self._ws.close()
+                            except Exception:
+                                pass
+                        self._ws = await self.client.connect_trade_stream(self.mint)
+                        self._trade_events = self.client.iter_trade_events(self._ws)
+                        logger.info("Reconectado al feed de trades de PumpPortal.")
+                        continue
+                    except Exception as e2:
+                        logger.error(f"No se pudo reconectar al feed de trades de PumpPortal mientras se "
+                                     f"esperaba la baja de entrada: {e2}")
+                        return None
 
-            price = self.client.extract_price(event)
-            if price is None or price <= 0:
-                continue
-            self.latest_price = price
-            if price <= target_price:
-                logger.info(f"Precio de entrada (baja de {self.cfg.entry_dip_pct}% desde "
-                            f"{reference_price:.10f}, feed en vivo): {price:.10f} SOL/token")
-                return price
+                price = self.client.extract_price(event)
+                if price is None or price <= 0:
+                    continue
+                self.latest_price = price
+                if price <= target_price:
+                    logger.info(f"Precio de entrada (baja de {self.cfg.entry_dip_pct}% desde "
+                                f"{reference_price:.10f}, feed en vivo): {price:.10f} SOL/token")
+                    return price
+        finally:
+            progress_task.cancel()
+            try:
+                await progress_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _dip_progress_logger(self, target_price: float) -> None:
+        """Tarea de fondo (ver _wait_for_dip_entry, rama feed en vivo):
+        cada `status_interval_seconds` loguea cuánto falta para llegar
+        al precio de entrada, leyendo self.latest_price -sin tocar para
+        nada el stream de eventos ni el generador que lo entrega (ver el
+        comentario en _wait_for_dip_entry sobre por qué eso es
+        importante). Se cancela desde _wait_for_dip_entry apenas termina
+        de esperar, sea porque compró, la cancelaron, o falló."""
+        while True:
+            await asyncio.sleep(self.cfg.status_interval_seconds)
+            self._log_dip_wait_progress(target_price)
+
+    def _log_dip_wait_progress(self, target_price: float) -> None:
+        """Log periódico (ver _wait_for_dip_entry) de cuánto falta para
+        llegar al precio de entrada: precio actual, objetivo, y el %%
+        que todavía falta bajar DESDE el precio actual (no desde la
+        referencia original) para tocar el objetivo."""
+        if self.latest_price is None or self.latest_price <= 0:
+            return
+        falta_pct = (self.latest_price - target_price) / self.latest_price * 100.0
+        if falta_pct <= 0:
+            # No debería pasar (ya se habría disparado la compra), pero
+            # por las dudas no mostramos un "falta bajar" negativo.
+            return
+        logger.info(f"⏳ Esperando la baja de entrada | precio actual {self.latest_price:.10f} "
+                    f"| objetivo {target_price:.10f} | falta bajar {falta_pct:.2f}% más")
 
     async def _poll_onchain_price_loop(self) -> None:
         """Reemplazo de _consume_trade_stream para cuando la posición se
