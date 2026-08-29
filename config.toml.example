@@ -54,3 +54,25 @@ entry_dip_pct = 0.0
 # Si la dejás vacía acá, el bot también busca la variable de entorno
 # PUMPPORTAL_API_KEY (más seguro que dejarla escrita en este archivo).
 api_key = ""
+
+[onchain]
+# Si pasan estos segundos sin ningún trade nuevo por subscribeTokenTrade
+# CON LA POSICIÓN YA ABIERTA, el bot sospecha que el mint migró de la
+# bonding curve de pump.fun a PumpSwap a mitad de camino (el socket sigue
+# abierto pero deja de mandar trades para ese mint, sin ningún error) y
+# hace una consulta on-chain puntual para confirmarlo. Si hay un pool con
+# precio válido, pasa a polling on-chain (ver onchain_poll_interval_seconds
+# más abajo) para no perderse el trailing-stop/stop-loss. Si no, sigue
+# esperando el feed en vivo (probablemente solo poco volumen momentáneo).
+stall_timeout_seconds = 20.0
+
+# Cada cuántos segundos se consulta el precio on-chain de PumpSwap mientras
+# el bot está en modo fallback (mint migrado, ya sea desde la entrada o a
+# mitad de la posición vía stall_timeout_seconds de arriba).
+onchain_poll_interval_seconds = 5.0
+
+# RPC de Solana usado únicamente para leer, on-chain, las reservas del pool
+# de PumpSwap cuando el mint ya migró. Un endpoint público gratuito alcanza
+# para esto, pero es lento/rate-limited; para uso serio conviene uno propio
+# (Helius, QuickNode, etc.).
+solana_rpc_url = "https://api.mainnet-beta.solana.com"

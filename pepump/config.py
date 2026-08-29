@@ -55,6 +55,20 @@ class AppConfig:
     # abierta, para poder evaluar trailing-stop/stop-loss sin depender
     # del feed en vivo que ya sabemos que no funciona para ese mint.
     onchain_poll_interval_seconds: float = 5.0
+    # Igual que live_feed_timeout_seconds pero para una posición YA
+    # ABIERTA: si pasan estos segundos sin ningún trade nuevo por
+    # subscribeTokenTrade, puede ser que el mint haya migrado a PumpSwap
+    # A MITAD de la posición (el socket sigue abierto y no tira ningún
+    # error -simplemente deja de mandar trades para ese mint- así que el
+    # precio quedaba congelado para siempre sin aviso). Cuando se cumple
+    # este timeout, se hace UNA consulta on-chain puntual para confirmar;
+    # si hay un pool de PumpSwap con precio válido, el bot pasa a polling
+    # on-chain (onchain_poll_interval_seconds) para el resto de la
+    # posición. Si no, se asume que es solo una pausa de volumen y se
+    # sigue esperando el feed en vivo normalmente. Un valor más alto que
+    # live_feed_timeout_seconds evita falsos positivos en tokens con
+    # volumen intermitente pero todavía en bonding curve.
+    stall_timeout_seconds: float = 20.0
     # Después de mandar una compra/venta REAL (Lightning API), cuántos
     # segundos esperar a que la transacción confirme on-chain antes de
     # darla por fallida. Necesario porque PumpPortal puede devolver un

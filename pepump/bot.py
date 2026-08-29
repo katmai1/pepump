@@ -619,22 +619,50 @@ class TrailingTakeProfitBot:
         siga abierta. Sin esto, una caída de conexión dejaba el precio
         congelado para siempre: el trailing-stop/stop-loss quedaban
         ciegos y la única forma de salir era cerrar la posición a mano
-        -exactamente lo que pasó."""
+        -exactamente lo que pasó.
+
+        BUGFIX (migración a mitad de posición): una caída de CONEXIÓN no
+        es el único caso que dejaba el precio congelado. Si el mint
+        migra de la bonding curve de pump.fun a PumpSwap DESPUÉS de
+        haber comprado (con el feed en vivo funcionando bien en el
+        momento de la entrada), subscribeTokenTrade simplemente deja de
+        mandar trades para ese mint de forma silenciosa: el socket sigue
+        abierto, no hay error ni cierre, así que ni el `except Exception`
+        de acá abajo ni el StopAsyncIteration se enteraban -el precio
+        quedaba pegado en el último valor para siempre y el status
+        printer lo repetía sin parar, como si nada (exactamente el
+        síntoma reportado: precio congelado en 0.0000032441 sin ningún
+        aviso de "conexión interrumpida"). Por eso ahora cada espera de
+        trade tiene un timeout (`stall_timeout_seconds`); si se cumple,
+        _handle_feed_stall() confirma con una consulta on-chain puntual
+        -igual que se hace para el precio de ENTRADA en
+        _get_reference_price- y, si hay un pool de PumpSwap con precio
+        válido, pasa a polling on-chain para el resto de la posición en
+        vez de seguir esperando trades que ya no van a llegar."""
         backoff = 2.0
         max_backoff = 30.0
         while self.position is not None and not self.position.closed:
             try:
-                async for event in self._trade_events:
+                while True:
                     if self.position is None or self.position.closed:
                         return
+                    try:
+                        event = await self._next_trade_event(timeout=self.cfg.stall_timeout_seconds)
+                    except asyncio.TimeoutError:
+                        if await self._handle_feed_stall():
+                            return  # migró: _handle_feed_stall ya corrió el polling on-chain hasta el cierre
+                        continue  # solo poco volumen: seguimos esperando el feed en vivo
                     price = self.client.extract_price(event)
                     if price is None or price <= 0:
                         continue
                     self.latest_price = price
                     await self._on_price_update(price)
                     backoff = 2.0  # se recibió un evento bueno: reseteamos el backoff
-                # El async for terminó SOLO (StopAsyncIteration): la
-                # conexión se cerró de forma "limpia" del lado del server.
+                # (inalcanzable: el while True interno solo se sale por return)
+            except _ShutdownRequested:
+                return
+            except StopAsyncIteration:
+                # La conexión se cerró de forma "limpia" del lado del server.
                 if self.position is None or self.position.closed:
                     return
                 logger.warning("[Feed de trades de PumpPortal] la conexión se cerró.")
@@ -662,6 +690,45 @@ class TrailingTakeProfitBot:
                 logger.info("Reconectado al feed de trades de PumpPortal.")
             except Exception as e:
                 logger.warning(f"No se pudo reconectar todavía: {e}. Reintento en {backoff:.0f}s...")
+
+    async def _handle_feed_stall(self) -> bool:
+        """Se llama cuando pasaron `stall_timeout_seconds` sin ningún
+        trade nuevo del feed en vivo, con la posición ya abierta.
+        Confirma con UNA consulta on-chain puntual si el mint ya migró
+        a PumpSwap:
+
+          - Si hay un pool con precio válido: es una migración real (no
+            solo una pausa de volumen). Aplica ese precio de una, marca
+            `_using_onchain_fallback = True` y corre el polling on-chain
+            (_poll_onchain_price_loop) hasta que la posición se cierre
+            -> devuelve True (el llamador debe dejar de esperar el feed
+            en vivo, que ya sabemos que no va a entregar nada más para
+            este mint).
+          - Si no hay pool (o falla la consulta): probablemente es solo
+            un token con poco volumen momentáneo -> devuelve False y el
+            llamador sigue esperando el feed en vivo normalmente."""
+        if self.position is None or self.position.closed:
+            return True
+        onchain = PumpSwapOnChainClient(self.cfg.solana_rpc_url)
+        price = await onchain.fetch_price_for_migrated_mint(self.mint)
+        if price is None or price <= 0:
+            logger.debug(f"[Feed de trades de PumpPortal] sin trades nuevos hace "
+                         f"{self.cfg.stall_timeout_seconds:.0f}s, pero no se encontró (todavía) un pool "
+                         f"de PumpSwap con precio válido -> probablemente solo poco volumen, sigo "
+                         f"esperando el feed en vivo.")
+            return False
+        logger.warning(f"[Feed de trades de PumpPortal] sin trades nuevos hace "
+                       f"{self.cfg.stall_timeout_seconds:.0f}s y se confirmó un pool de PumpSwap con "
+                       f"precio válido -> el mint migró a mitad de la posición (subscribeTokenTrade no "
+                       f"lo va a cubrir más). Paso a polling on-chain cada "
+                       f"{self.cfg.onchain_poll_interval_seconds:.0f}s para no perder el precio.")
+        self._using_onchain_fallback = True
+        self.latest_price = price
+        await self._on_price_update(price)
+        if self.position is None or self.position.closed:
+            return True
+        await self._poll_onchain_price_loop()
+        return True
 
     async def _status_printer_loop(self) -> None:
         """Imprime el %% de profit actual cada `status_interval_seconds`, sin
