@@ -66,7 +66,7 @@ class PumpPortalClient:
             logger.warning("Sin pumpportal.api_key configurada: subscribeTokenTrade NO va a entregar "
                            "ningún trade (requiere API key + wallet con >= 0.02 SOL, aunque el bot esté en "
                            "modo SIMULADO). Como este bot usa SOLO PumpPortal para el precio, se va a quedar "
-                           "esperando para siempre. Configurá pumpportal.api_key o PUMPPORTAL_API_KEY.")
+                           "esperando para siempre.")
 
         ws = await websockets.connect(url)
         await ws.send(json.dumps({"method": "subscribeTokenTrade", "keys": [mint]}))

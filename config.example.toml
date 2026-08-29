@@ -2,9 +2,6 @@
 # ---------------------------------------------------------------------------
 
 [general]
-# Dirección (mint) del token de pump.fun a seguir. OBLIGATORIO.
-mint = ""
-
 # false = todo simulado (no gasta SOL real).
 # true  = opera en real vía la Lightning API de PumpPortal (requiere API key).
 live = false

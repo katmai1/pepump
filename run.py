@@ -77,18 +77,21 @@ logger = logging.getLogger()
 def parse_args():
     p = argparse.ArgumentParser(description="Bot de trailing take-profit para pump.fun (Lightning API de PumpPortal)")
 
+    p.add_argument("-m", "--mint", type=str, required=True, help="Mint con el que se va a operar")
     p.add_argument("-c", "--config", default="config.toml", help="Ruta al archivo .toml de configuración (default: config.toml)")
     p.add_argument("-v", "--verbose", action="store_true", help="Logging en nivel DEBUG en vez de INFO")
 
     return p.parse_args()
 
-# main
-def main():
+
+# logica inicial
+if __name__ == "__main__":
     args = parse_args()
     setup_logging(level=logging.DEBUG if args.verbose else logging.INFO)
 
     try:
         config = load_config(args.config)
+        config.mint = args.mint
     except FileNotFoundError:
         logger.error(f"No se encontró el archivo de configuración '{args.config}'.")
         sys.exit(1)
@@ -100,7 +103,7 @@ def main():
    
     if config.live:
         logger.warning("⚠️  MODO REAL ACTIVADO (general.live = true en el .toml). Vas a operar con SOL real.")
-        logger.warning("    Presioná Ctrl+C ahora para detenerlo.")
+        logger.warning("    Presiona Ctrl+C ahora para detenerlo.")
         time.sleep(3)
 
     client = PumpPortalClient(api_key=config.api_key)
@@ -111,7 +114,3 @@ def main():
         asyncio.run(bot.run())
     except KeyboardInterrupt:
         logger.info("Interrumpido por el usuario.")
-
-
-if __name__ == "__main__":
-    main()
