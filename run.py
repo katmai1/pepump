@@ -83,12 +83,22 @@ def parse_args():
 
     return p.parse_args()
 
-
+def show_header(live):
+    print("="*50)
+    print(f"\t PePump | Modo {"REAL" if live else "SIMULADO"}")
+    if live:
+        logger.warning("⚠️  MODO REAL ACTIVADO (general.live = true en el .toml). Vas a operar con SOL real.")
+        logger.warning("    Presiona Ctrl+C ahora para detenerlo.")
+        time.sleep(3)
+    print("="*50)
+    
+    
 # logica inicial
 if __name__ == "__main__":
     args = parse_args()
     setup_logging(level=logging.DEBUG if args.verbose else logging.INFO)
 
+    
     try:
         config = load_config(args.config)
         # Un espacio/tab/salto de línea colado al copiar el mint no rompe
@@ -105,11 +115,8 @@ if __name__ == "__main__":
         logger.error(f"ERROR de configuración: {e}")
         sys.exit(1)
    
-    if config.live:
-        logger.warning("⚠️  MODO REAL ACTIVADO (general.live = true en el .toml). Vas a operar con SOL real.")
-        logger.warning("    Presiona Ctrl+C ahora para detenerlo.")
-        time.sleep(3)
-
+    show_header(config.live)
+    
     client = PumpPortalClient(api_key=config.api_key)
     executor = TradeExecutor(client=client, live=config.live, config=config)
     bot = TrailingTakeProfitBot(client=client, executor=executor, config=config)
