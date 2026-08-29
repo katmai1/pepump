@@ -91,7 +91,11 @@ if __name__ == "__main__":
 
     try:
         config = load_config(args.config)
-        config.mint = args.mint
+        # Un espacio/tab/salto de línea colado al copiar el mint no rompe
+        # el parseo de argparse, pero hace que subscribeTokenTrade nunca
+        # matchee ningún trade real -> el bot se queda esperando para
+        # siempre sin ningún error visible. Lo limpiamos acá.
+        config.mint = args.mint.strip()
     except FileNotFoundError:
         logger.error(f"No se encontró el archivo de configuración '{args.config}'.")
         sys.exit(1)

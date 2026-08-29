@@ -54,6 +54,18 @@ class TrailingTakeProfitBot:
         # loop.add_signal_handler() el apagado se coordina de forma
         # confiable con un asyncio.Event normal.
         self._shutdown_requested = asyncio.Event()
+        # BUGFIX (doble venta): serializa CUALQUIER intento de venta de la
+        # posición (ya sea por trailing-stop/stop-loss vía _try_sell, o por
+        # cierre manual vía _sell_on_shutdown). No alcanza con solo
+        # reordenar la cancelación de tareas en run() para evitar la
+        # carrera: execute_lightning_trade manda el POST real dentro de un
+        # asyncio.to_thread, y cancelar la tarea que está esperando ese
+        # await NO mata el hilo -el pedido HTTP ya en vuelo puede seguir
+        # llegando al server igual. Con este lock, si dos caminos intentan
+        # vender casi al mismo tiempo, el segundo espera, ve `pos.closed`
+        # ya en True (o el executor.sell tira porque no queda nada que
+        # vender) y no dispara un segundo pedido real.
+        self._sell_lock = asyncio.Lock()
 
     def _request_shutdown(self, sig_name: str) -> None:
         if self._shutdown_requested.is_set():
@@ -111,7 +123,21 @@ class TrailingTakeProfitBot:
         # crash -incluso uno inesperado que no previmos- cierra el socket
         # de forma ordenada en vez de dejarlo zombie.
         try:
-            self._ws = await self.client.connect_trade_stream(self.mint)
+            # BUGFIX: antes, si connect_trade_stream fallaba (red caída,
+            # DNS, api_key rechazada al nivel de handshake, etc.), la
+            # excepción se escapaba sin capturar hasta afuera de run() ->
+            # run.py solo atrapa KeyboardInterrupt, así que el bot moría
+            # con un traceback crudo en vez de un mensaje claro. Ahora se
+            # loguea el error y se sale ordenadamente (todavía no hay
+            # posición abierta, así que no hay nada que vender).
+            try:
+                self._ws = await self.client.connect_trade_stream(self.mint)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"No se pudo conectar/suscribir al feed de trades de PumpPortal "
+                             f"({self.client.DATA_WS_URL}): {e}")
+                return
             self._trade_events = self.client.iter_trade_events(self._ws)
 
             initial_price = await self._get_initial_price()
@@ -143,11 +169,28 @@ class TrailingTakeProfitBot:
                 asyncio.create_task(self._status_printer_loop()),
             ]
 
-            await self._wait_for_close_or_shutdown()
+            # BUGFIX (carrera de doble venta): antes, _wait_for_close_or_shutdown
+            # vendía DIRECTAMENTE al ganar el shutdown, mientras monitor_task
+            # (_consume_trade_stream / _poll_onchain_price_loop) seguía vivo
+            # y podía disparar su propio _try_sell si llegaba un precio que
+            # cruzara el trailing-stop en esa misma ventana -> dos llamadas a
+            # executor.sell() en simultáneo para la misma posición hacia la
+            # Lightning API. Ahora _wait_for_close_or_shutdown SOLO espera y
+            # devuelve si hace falta vender; monitor_task y el status printer
+            # se cancelan acá ANTES de vender, así que cuando corre
+            # _sell_on_shutdown ya no hay nada más que pueda pisarle la venta.
+            need_shutdown_sell = await self._wait_for_close_or_shutdown()
 
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+
+            if need_shutdown_sell:
+                if self.position is not None and not self.position.closed:
+                    logger.warning("Vendiendo la posición abierta al precio actual antes de salir...")
+                    await self._sell_on_shutdown()
+                else:
+                    logger.info("No hay posición abierta; no hay nada que vender.")
         finally:
             for sig in signal_handlers_installed:
                 try:
@@ -159,11 +202,20 @@ class TrailingTakeProfitBot:
 
         logger.info("Bot finalizado.")
 
-    async def _wait_for_close_or_shutdown(self) -> None:
+    async def _wait_for_close_or_shutdown(self) -> bool:
         """Espera a que la posición se cierre sola (TP/SL normal) O a que
-        se pida un apagado (Ctrl+C/SIGTERM). Si gana el apagado y hay una
-        posición abierta, la vende al precio más actual posible antes de
-        continuar."""
+        se pida un apagado (Ctrl+C/SIGTERM).
+
+        A propósito NO vende acá adentro (ver BUGFIX en run()): solo
+        espera y devuelve si hace falta que run() dispare la venta de
+        cierre, para que run() pueda cancelar primero monitor_task/
+        status_printer_loop y evitar que ese monitor dispare su propia
+        venta en simultáneo con la de shutdown.
+
+        Devuelve True si hay que vender por shutdown (se pidió apagado y
+        la posición no se cerró sola en esa misma carrera), False si la
+        posición ya se cerró sola (TP/SL) y no hace falta hacer nada más.
+        """
         closed_task = asyncio.ensure_future(self._closed_event.wait())
         shutdown_task = asyncio.ensure_future(self._shutdown_requested.wait())
         try:
@@ -176,31 +228,35 @@ class TrailingTakeProfitBot:
                     t.cancel()
 
         if self._closed_event.is_set():
-            return  # se cerró sola (TP/SL), no hace falta hacer nada más
+            return False  # se cerró sola (TP/SL), no hace falta hacer nada más
 
-        # Se pidió apagado: si hay posición abierta, vendemos antes de salir.
-        if self.position is not None and not self.position.closed:
-            logger.warning("Vendiendo la posición abierta al precio actual antes de salir...")
-            await self._sell_on_shutdown()
-        else:
-            logger.info("No hay posición abierta; no hay nada que vender.")
+        return self._shutdown_requested.is_set()
 
     async def _sell_on_shutdown(self) -> None:
         """Intenta conseguir el precio MÁS actual posible (una consulta
         on-chain fresca si veníamos usando ese fallback; si no, el último
         precio que ya venía actualizando el feed en vivo, que está
         prácticamente en tiempo real) y vende de una la posición
-        abierta."""
-        price = await self._resolve_shutdown_price()
-        if price is None or price <= 0:
-            logger.error("No se pudo determinar ningún precio para vender al cerrar. La posición "
-                         f"queda ABIERTA — revisala manualmente: https://pump.fun/{self.mint}")
-            return
-        try:
-            await self.executor.sell(self.position, price, "cierre manual (Ctrl+C/SIGTERM)")
-        except Exception as e:
-            logger.error(f"Falló la venta de cierre manual: {e}. La posición SIGUE ABIERTA — "
-                         f"revisala manualmente: https://pump.fun/{self.mint}")
+        abierta.
+
+        Usa _sell_lock (ver __init__) para no pisarse con un _try_sell
+        del monitor que haya quedado en vuelo. Revalida `position.closed`
+        DESPUÉS de conseguir el lock: si _try_sell ya vendió mientras
+        esperábamos acá, no hace falta (ni corresponde) vender de nuevo."""
+        async with self._sell_lock:
+            if self.position is None or self.position.closed:
+                logger.info("No hay posición abierta; no hay nada que vender.")
+                return
+            price = await self._resolve_shutdown_price()
+            if price is None or price <= 0:
+                logger.error("No se pudo determinar ningún precio para vender al cerrar. La posición "
+                             f"queda ABIERTA — revisala manualmente: https://pump.fun/{self.mint}")
+                return
+            try:
+                await self.executor.sell(self.position, price, "cierre manual (Ctrl+C/SIGTERM)")
+            except Exception as e:
+                logger.error(f"Falló la venta de cierre manual: {e}. La posición SIGUE ABIERTA — "
+                             f"revisala manualmente: https://pump.fun/{self.mint}")
 
     async def _resolve_shutdown_price(self) -> Optional[float]:
         if self._using_onchain_fallback:
@@ -503,10 +559,16 @@ class TrailingTakeProfitBot:
             (closed=False) y NO seteamos _closed_event, el próximo trade
             que llegue vuelve a evaluar la condición de salida y reintenta
             la venta sola, sin intervención manual."""
-        try:
-            await self.executor.sell(pos, price, reason)
-        except Exception as e:
-            logger.warning(f"⚠️  Venta fallida ({reason}): {e}. La posición SIGUE ABIERTA, "
-                           f"se reintentará con el próximo precio que llegue.")
-            return
+        async with self._sell_lock:
+            # Revalidamos DESPUÉS de conseguir el lock: si _sell_on_shutdown
+            # (u otra llamada) ya vendió mientras esperábamos acá, esto ya
+            # no corresponde -evita el segundo pedido real a la Lightning API.
+            if pos.closed:
+                return
+            try:
+                await self.executor.sell(pos, price, reason)
+            except Exception as e:
+                logger.warning(f"⚠️  Venta fallida ({reason}): {e}. La posición SIGUE ABIERTA, "
+                               f"se reintentará con el próximo precio que llegue.")
+                return
         self._closed_event.set()

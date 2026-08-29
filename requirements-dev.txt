@@ -1,0 +1,8 @@
+# Dependencias de runtime (ver README) + las necesarias para correr los tests.
+websockets
+requests
+solana
+solders
+pumpswapamm
+pytest
+pytest-asyncio

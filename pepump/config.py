@@ -1,4 +1,5 @@
 from dataclasses import dataclass, fields
+import os
 import tomllib
 
 
@@ -79,6 +80,16 @@ def load_config(path: str) -> AppConfig:
     # el mint exista) y después nunca matchee ningún trade real -> el bot
     # se queda esperando para siempre en silencio. Lo limpiamos acá.
     #config.mint = config.mint.strip()
+
+    # BUGFIX: el .toml de ejemplo y los mensajes de error de acá abajo
+    # siempre dijeron que la api_key también se podía definir con la
+    # variable de entorno PUMPPORTAL_API_KEY (para no tener que escribirla
+    # en el archivo), pero nunca se leía realmente -> quien confiara en
+    # esa opción se encontraba con "Falta la API key" igual. Si el .toml
+    # no trae una key, ahora sí se consulta la variable de entorno como
+    # fallback antes de fallar.
+    if not config.api_key:
+        config.api_key = os.environ.get("PUMPPORTAL_API_KEY", "")
     config.api_key = config.api_key.strip()
 
     # if not config.mint:
