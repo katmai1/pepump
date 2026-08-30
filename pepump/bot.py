@@ -39,6 +39,12 @@ class TrailingTakeProfitBot:
         self._closed_event = asyncio.Event()
         self._ws = None
         self._trade_events: Optional[AsyncIterator[dict]] = None
+        # BUGFIX (generador cerrado por timeout): ver _next_trade_event.
+        # Tarea pendiente de `self._trade_events.__anext__()` que puede
+        # sobrevivir a un timeout sin cancelarse, para poder seguir
+        # esperando el MISMO evento en la próxima llamada en vez de
+        # cortar el generador async subyacente.
+        self._pending_next_event_task: Optional[asyncio.Task] = None
         # True si tuvimos que resolver el precio de entrada por el
         # fallback on-chain de PumpSwap (ver _try_onchain_fallback) en
         # vez del feed en vivo de PumpPortal -> significa que el mint ya
@@ -197,6 +203,9 @@ class TrailingTakeProfitBot:
                     loop.remove_signal_handler(sig)
                 except Exception:
                     pass
+            if self._pending_next_event_task is not None:
+                self._pending_next_event_task.cancel()
+                self._pending_next_event_task = None
             if self._ws is not None:
                 await self._ws.close()
 
@@ -278,8 +287,31 @@ class TrailingTakeProfitBot:
         deadline). Lanza _ShutdownRequested si gana el apagado,
         asyncio.TimeoutError si gana el timeout, o deja pasar cualquier
         excepción normal del feed (StopAsyncIteration, errores de red,
-        etc.)."""
-        next_task = asyncio.ensure_future(self._trade_events.__anext__())
+        etc.).
+
+        BUGFIX: antes, cuando ganaba el timeout, se cancelaba
+        directamente la tarea que envolvía `self._trade_events.__anext__()`.
+        Cancelar esa tarea tira un CancelledError DENTRO del generador
+        async en su punto de espera (ej. el `await websocket.recv()`
+        interno de iter_trade_events) -y como nada lo atrapa ahí adentro,
+        el generador queda CERRADO para siempre: cualquier __anext__()
+        posterior sobre el mismo generador devuelve StopAsyncIteration
+        de una, aunque la conexión siga perfectamente viva. Esto rompía
+        en silencio cualquier código que esperara poder seguir
+        escuchando el mismo feed después de un timeout (ver
+        _get_reference_price reintentando tras confirmar 'sin pool', y
+        _consume_trade_stream retomando el feed tras un stall sin
+        migración real).
+
+        Ahora, si gana el timeout, NO se cancela la tarea: se guarda en
+        self._pending_next_event_task para reutilizarla en la próxima
+        llamada -mismo generador, mismo __anext__() en vuelo, sin
+        cortar nada-. Recién se cancela de verdad si gana el shutdown
+        (ahí sí termina todo)."""
+        if self._pending_next_event_task is None or self._pending_next_event_task.done():
+            next_task = asyncio.ensure_future(self._trade_events.__anext__())
+        else:
+            next_task = self._pending_next_event_task
         shutdown_task = asyncio.ensure_future(self._shutdown_requested.wait())
         try:
             done, _pending = await asyncio.wait(
@@ -290,14 +322,18 @@ class TrailingTakeProfitBot:
 
         if shutdown_task in done:
             next_task.cancel()
+            self._pending_next_event_task = None
             raise _ShutdownRequested()
 
         shutdown_task.cancel()
 
         if next_task in done:
+            self._pending_next_event_task = None
             return next_task.result()  # puede propagar StopAsyncIteration u otra excepción
 
-        next_task.cancel()
+        # Ganó el timeout: dejamos next_task VIVA (sin cancelar) para
+        # retomarla en la próxima llamada en vez de cerrar el generador.
+        self._pending_next_event_task = next_task
         raise asyncio.TimeoutError()
 
     async def _get_initial_price(self) -> Optional[float]:
@@ -356,10 +392,28 @@ class TrailingTakeProfitBot:
                 elapsed_since_ack = time.monotonic() - ack_received_at
                 timeout = self.cfg.live_feed_timeout_seconds - elapsed_since_ack
                 if timeout <= 0:
+                    if time.monotonic() - start >= self.cfg.entry_wait_timeout_seconds:
+                        logger.error(f"[Feed en vivo] pasaron {self.cfg.entry_wait_timeout_seconds:.0f}s "
+                                     f"en total esperando el precio de entrada, sin ningún trade real y "
+                                     f"sin encontrar un pool de PumpSwap. Abortando esta entrada.")
+                        return None
+
                     logger.debug(f"[Feed en vivo] pasaron {self.cfg.live_feed_timeout_seconds:.0f}s desde el "
                                  f"ack sin ningún trade real -> probablemente este mint ya migró a PumpSwap "
                                  f"y subscribeTokenTrade no lo cubre. Probando fallback on-chain...")
-                    return await self._try_onchain_fallback()
+                    price, pool_confirmed_absent = await self._try_onchain_fallback()
+                    if price is not None:
+                        return price
+                    if pool_confirmed_absent:
+                        logger.info(f"[On-chain PumpSwap] Confirmado: todavía no hay pool de PumpSwap "
+                                     f"para este mint -sigue en bonding curve, probablemente solo poco "
+                                     f"volumen-. Sigo esperando el feed en vivo (hasta "
+                                     f"{self.cfg.entry_wait_timeout_seconds:.0f}s en total)...")
+                        ack_received_at = time.monotonic()  # reinicia la ventana antes del próximo intento
+                        continue
+                    logger.error("[On-chain PumpSwap] Tampoco se pudo obtener precio on-chain para este "
+                                 "mint. No hay ninguna fuente de precio disponible; abortando esta entrada.")
+                    return None
 
             try:
                 event = await self._next_trade_event(timeout=timeout)
@@ -415,23 +469,28 @@ class TrailingTakeProfitBot:
                     logger.warning(f"[Feed en vivo] {elapsed:.0f}s esperando y todavía ni siquiera llegó "
                                    f"el ack de suscripción. Revisá la conexión de red y que el mint sea correcto.")
 
-    async def _try_onchain_fallback(self) -> Optional[float]:
-        """Último recurso para el precio de entrada: lee las reservas
-        reales del pool de PumpSwap directo de Solana (ver
-        PumpSwapOnChainClient en pump.py). Si funciona, marca
-        `_using_onchain_fallback = True` para que el monitoreo posterior
-        de la posición (ver _poll_onchain_price_loop) también use polling
-        on-chain en vez de esperar al feed en vivo, que ya sabemos que no
-        entrega nada para este mint."""
+    async def _try_onchain_fallback(self) -> tuple[Optional[float], bool]:
+        """Consulta puntual al pool de PumpSwap directo de Solana (ver
+        PumpSwapOnChainClient en pump.py). Devuelve (price,
+        pool_confirmed_absent):
+          - price no-None: encontró un pool con precio válido -mint
+            migrado de verdad-. Marca `_using_onchain_fallback = True`
+            para que el monitoreo posterior de la posición (ver
+            _poll_onchain_price_loop) también use polling on-chain.
+          - price None, pool_confirmed_absent True: confirmado que NO
+            hay pool -mint todavía en bonding curve-. El llamador
+            (_get_reference_price) decide si sigue esperando el feed
+            en vivo.
+          - price None, pool_confirmed_absent False: se encontró un
+            pool pero no se pudo leer el precio, o la consulta on-chain
+            en sí falló -no hay ninguna confirmación útil-. El llamador
+            debe abortar, no reintentar el feed en vivo a ciegas."""
         onchain = PumpSwapOnChainClient(self.cfg.solana_rpc_url)
-        price = await onchain.fetch_price_for_migrated_mint(self.mint)
-        if price is None:
-            logger.error("[On-chain PumpSwap] Tampoco se pudo obtener precio on-chain para este mint. "
-                         "No hay ninguna fuente de precio disponible; abortando esta entrada.")
-            return None
-        logger.info(f"Precio de referencia (fallback on-chain PumpSwap): {price:.10f} SOL/token")
-        self._using_onchain_fallback = True
-        return price
+        price, pool_confirmed_absent = await onchain.fetch_price_or_confirm_absent(self.mint)
+        if price is not None:
+            logger.info(f"Precio de referencia (fallback on-chain PumpSwap): {price:.10f} SOL/token")
+            self._using_onchain_fallback = True
+        return price, pool_confirmed_absent
 
     async def _wait_for_dip_entry(self, reference_price: float, target_price: float) -> Optional[float]:
         """Sólo se llama cuando `entry_dip_pct` > 0 (ver _get_initial_price).
@@ -531,6 +590,12 @@ class TrailingTakeProfitBot:
                                 pass
                         self._ws = await self.client.connect_trade_stream(self.mint)
                         self._trade_events = self.client.iter_trade_events(self._ws)
+                        # El generador viejo quedó abandonado de verdad acá
+                        # (nueva conexión, no un timeout) -cualquier tarea
+                        # pendiente de su __anext__() ya no sirve.
+                        if self._pending_next_event_task is not None:
+                            self._pending_next_event_task.cancel()
+                            self._pending_next_event_task = None
                         logger.info("Reconectado al feed de trades de PumpPortal.")
                         continue
                     except Exception as e2:
@@ -687,6 +752,10 @@ class TrailingTakeProfitBot:
                         pass
                 self._ws = await self.client.connect_trade_stream(self.mint)
                 self._trade_events = self.client.iter_trade_events(self._ws)
+                # Idem: generador viejo abandonado de verdad, no por timeout.
+                if self._pending_next_event_task is not None:
+                    self._pending_next_event_task.cancel()
+                    self._pending_next_event_task = None
                 logger.info("Reconectado al feed de trades de PumpPortal.")
             except Exception as e:
                 logger.warning(f"No se pudo reconectar todavía: {e}. Reintento en {backoff:.0f}s...")

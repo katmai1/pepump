@@ -10,6 +10,12 @@ class AppConfig:
     live: bool = False
     # Cada cuánto tiempo (segundos) se muestra en pantalla el %% de profit actual.
     status_interval_seconds: float = 5.0
+    # Ruta al .csv donde se va agregando (append) una fila por cada orden
+    # CERRADA (venta confirmada, real o simulada) -ver executor.py/history.py.
+    # Si la ruta no existe todavía, se crea (junto con carpetas intermedias)
+    # al cerrar la primera orden; si ya existe, se sigue agregando abajo sin
+    # tocar lo que ya había. "" desactiva el historial.
+    trade_history_csv: str = "trade_history.csv"
 
     # --- [trade] ------------------------------------------------------- #
     buy_sol: float = 0.05

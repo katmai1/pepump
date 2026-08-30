@@ -21,6 +21,127 @@ PUMPSWAP_PROGRAM_ID = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
 # encontramos está denominado en SOL antes de usar su precio.
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 
+# Códigos de error "custom" del programa spl-token (spl_token::error::TokenError),
+# estables y públicos. Como `pool = "auto"` puede terminar rutando la compra/venta
+# por distintos programas (bonding curve de pump.fun, PumpSwap, Raydium, etc.), no
+# tiene sentido mantener una tabla por-programa -pero casi cualquier ruta termina
+# haciendo un CPI a spl-token para mover el WSOL o el token, así que estos códigos
+# son los que más se ven en la práctica cuando revienta una compra/venta real.
+_SPL_TOKEN_CUSTOM_ERRORS = {
+    0: "NotRentExempt (la cuenta quedaría por debajo del mínimo exento de rent)",
+    1: "InsufficientFunds (fondos insuficientes para cubrir la transferencia — "
+       "revisa el balance de SOL/WSOL o del token en la wallet)",
+    2: "InvalidMint",
+    3: "MintMismatch (el mint de la cuenta no coincide con el esperado)",
+    4: "OwnerMismatch (la cuenta no pertenece al owner esperado)",
+    5: "FixedSupply",
+    6: "AlreadyInUse",
+    7: "InvalidNumberOfProvidedSigners",
+    8: "InvalidNumberOfRequiredSigners",
+    9: "UninitializedState",
+    10: "NativeNotSupported",
+    11: "NonNativeHasBalance",
+    12: "InvalidInstruction",
+    13: "InvalidState",
+    14: "Overflow",
+    15: "AuthorityTypeNotSupported",
+    16: "MintCannotFreeze",
+    17: "AccountFrozen",
+    18: "MintDecimalsMismatch",
+    19: "NonNativeNotSupported",
+}
+
+# Versión corta (una línea, sin la explicación entre paréntesis) de la
+# tabla de arriba, para el mensaje de error PRINCIPAL -la explicación
+# larga queda solo en el log de debug, no hace falta repetirla siempre.
+_SPL_TOKEN_CUSTOM_ERRORS_SHORT = {
+    code: msg.split(" (", 1)[0] for code, msg in _SPL_TOKEN_CUSTOM_ERRORS.items()
+}
+
+
+def _extract_instruction_error(err) -> Optional[tuple]:
+    """Si `err` (el `.err` de getSignatureStatuses) es un
+    TransactionErrorInstructionError con un código Custom(N), devuelve
+    (índice_de_instrucción, código). None si no matchea esa forma (otro
+    tipo de error, versión distinta de solders, etc.) -nunca tira
+    excepción, esto es solo para dar un mensaje más claro, no crítico."""
+    try:
+        from solders.transaction_status import (
+            TransactionErrorInstructionError,
+            InstructionErrorCustom,
+        )
+        if isinstance(err, TransactionErrorInstructionError):
+            inner = err.err
+            if isinstance(inner, InstructionErrorCustom):
+                return err.index, inner.code
+    except Exception:
+        pass
+    return None
+
+
+async def _fetch_relevant_program_logs(signature: str, rpc_url: str) -> list[str]:
+    """Pide la transacción completa (getTransaction) para sacar sus
+    logMessages -que casi siempre incluyen la razón real y en texto
+    plano de por qué revirtió un programa (ej. un AnchorError con
+    "Error Message: ..." o el motivo exacto de spl-token)- y devuelve
+    solo las líneas que parecen relevantes (mencionan error/fallo).
+    Devuelve lista vacía si no se puede obtener nada (no debe hacer
+    fallar la confirmación por esto, es solo información extra)."""
+    try:
+        sig = Signature.from_string(signature)
+        async with AsyncClient(rpc_url) as client:
+            resp = await client.get_transaction(
+                sig, encoding="json", max_supported_transaction_version=0
+            )
+        if resp.value is None or resp.value.transaction is None:
+            return []
+        meta = resp.value.transaction.meta
+        logs = meta.log_messages if meta is not None else None
+        if not logs:
+            return []
+        keywords = ("error", "Error", "fail", "Fail", "insufficient", "Insufficient",
+                    "slippage", "Slippage", "revert", "exceed", "Exceed")
+        relevant = [line for line in logs if any(k in line for k in keywords)]
+        return relevant[-5:] if relevant else []
+    except Exception as e:
+        logger.debug(f"[Confirmación on-chain] no se pudieron leer los logs de {signature} "
+                     f"para un mensaje de error más claro: {e}")
+        return []
+
+
+async def _describe_onchain_error(signature: str, rpc_url: str, err) -> tuple[str, str]:
+    """Devuelve (razón_corta, detalle_técnico):
+      - razón_corta: UNA frase legible para meter directo en el mensaje
+        de error principal (ej. ": fondos insuficientes en la wallet
+        (spl-token InsufficientFunds, instrucción #3)"). Vacía si no se
+        pudo determinar nada mejor que el error crudo.
+      - detalle_técnico: el error crudo de solders + los logs relevantes
+        de la transacción, para loguear aparte a nivel DEBUG -no hace
+        falta ensuciar el mensaje principal con esto, pero conviene
+        tenerlo a mano con -v para casos raros/no reconocidos."""
+    decoded = _extract_instruction_error(err)
+    logs = await _fetch_relevant_program_logs(signature, rpc_url)
+
+    debug_lines = [f"error crudo: {err}"]
+    if logs:
+        debug_lines.append("logs relevantes del programa:\n  " + "\n  ".join(logs))
+    detail = "\n  ".join(debug_lines)
+
+    if decoded is not None:
+        ix_index, code = decoded
+        short = _SPL_TOKEN_CUSTOM_ERRORS_SHORT.get(code)
+        if short:
+            return f": {short} (spl-token, instrucción #{ix_index})", detail
+
+    if logs:
+        # Sin código de spl-token conocido, pero SÍ hay algún log
+        # relevante (típicamente el motivo real que imprime el propio
+        # programa que revirtió, ej. un AnchorError con "Error Message:
+        # ...") -usamos la línea más específica (la última) como razón.
+        return f": {logs[-1].strip()}", detail
+
+    return ": revirtió con un error no reconocido (corré con -v para ver más detalle, o abrí el link de Solscan)", detail
+
 
 class PumpPortalClient:
     """
@@ -218,9 +339,11 @@ class PumpPortalClient:
                 info = value[0] if value else None
                 if info is not None:
                     if info.err is not None:
+                        short_reason, debug_detail = await _describe_onchain_error(signature, rpc_url, info.err)
+                        logger.debug(f"[Confirmación on-chain] detalle técnico de la falla de "
+                                     f"{signature}:\n  {debug_detail}")
                         raise RuntimeError(
-                            f"La transacción {signature} FALLÓ on-chain (probablemente slippage "
-                            f"excedido u otro error de ejecución): {info.err} — "
+                            f"La transacción {signature} FALLÓ on-chain{short_reason}. "
                             f"https://solscan.io/tx/{signature}"
                         )
                     if info.confirmation_status is not None:
@@ -275,38 +398,54 @@ class PumpSwapOnChainClient:
         lectura (red, RPC caído, etc.) — nunca tira excepción hacia
         arriba, para que el bot pueda seguir esperando el feed en vivo
         en vez de caerse por un problema de este fallback secundario."""
+        price, _pool_confirmed_absent = await self.fetch_price_or_confirm_absent(mint)
+        return price
+
+    async def fetch_price_or_confirm_absent(self, mint: str) -> tuple[Optional[float], bool]:
+        """Igual que `fetch_price_for_migrated_mint`, pero además devuelve
+        `pool_confirmed_absent`: True ÚNICAMENTE cuando el
+        getProgramAccounts para este mint respondió sin tirar excepción
+        y no encontró ningún pool -es decir, una confirmación limpia de
+        que el mint TODAVÍA NO migró a PumpSwap (sigue en bonding
+        curve). En cualquier otro caso (se encontró un pool pero no se
+        pudo leer/parsear, no está denominado en SOL, o la consulta
+        on-chain en sí falló) devuelve False, porque ahí no hay ninguna
+        confirmación real de que el mint no haya migrado -puede ser un
+        problema genuino de RPC, no un mint sin pool- así que el
+        llamador no debería asumir que conviene reintentar el feed en
+        vivo."""
         async with AsyncClient(self.rpc_url) as client:
             try:
                 pool_address = await self._find_pool_address(client, mint)
                 if pool_address is None:
                     logger.debug(f"[On-chain PumpSwap] No se encontró ningún pool de PumpSwap para {mint}.")
-                    return None
+                    return None, True
 
                 pool_keys, _pool_type = await fetch_pool_state(pool_address, client)
                 if pool_keys is None:
                     logger.debug("[On-chain PumpSwap] No se pudo leer/parsear la cuenta del pool.")
-                    return None
+                    return None, False
 
                 if pool_keys.get("quote_mint") != WSOL_MINT:
                     logger.debug(f"[On-chain PumpSwap] El pool de {mint} no está denominado en SOL "
                                  f"(quote_mint={pool_keys.get('quote_mint')}); no lo puedo usar acá.")
-                    return None
+                    return None, False
 
                 result = await fetch_pool_base_price(pool_keys, client)
                 if result is None:
                     logger.debug("[On-chain PumpSwap] No se pudieron leer las reservas del pool.")
-                    return None
+                    return None, False
 
                 price, base_balance, quote_balance = result
                 if not base_balance or float(price) <= 0:
-                    return None
+                    return None, False
 
                 logger.debug(f"[On-chain PumpSwap] Pool {pool_address} | reservas: "
                              f"{base_balance} tokens / {quote_balance} SOL")
-                return float(price)
+                return float(price), False
             except Exception as e:
                 logger.warning(f"[On-chain PumpSwap] Falló la consulta on-chain para {mint}: {e}")
-                return None
+                return None, False
 
     async def _find_pool_address(self, client: AsyncClient, mint: str) -> Optional[str]:
         """getProgramAccounts sobre el programa de PumpSwap, filtrando por

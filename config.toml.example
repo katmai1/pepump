@@ -11,6 +11,12 @@ live = false
 # llegue el primer trade real para usar ESE precio como entrada. Es la
 # ÚNICA fuente de precio del bot: no hay on-chain ni DexScreener.
 
+# Ruta al .csv donde se va agregando una fila por cada orden CERRADA
+# (venta confirmada, real o simulada): mint, precio de entrada/salida,
+# PnL %%, SOL recibidos, duración de la posición y motivo del cierre.
+# Se crea solo si no existe. "" desactiva el historial.
+trade_history_csv = "trade_history.csv"
+
 [trade]
 # Cantidad de SOL a comprar.
 buy_sol = 0.05
