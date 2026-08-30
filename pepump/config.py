@@ -49,6 +49,14 @@ class AppConfig:
     # el mint sigue en bonding curve, el feed en vivo funciona bien y este
     # timeout no debería llegar a cumplirse casi nunca.
     live_feed_timeout_seconds: float = 5.0
+    # Tiempo TOTAL (segundos) que el bot está dispuesto a esperar el precio
+    # de entrada antes de abortar del todo (ver _get_reference_price en
+    # bot.py). Cubre toda la espera DESPUÉS de recibir el ack de
+    # suscripción: ciclos de live_feed_timeout_seconds + intentos de
+    # fallback on-chain, uno tras otro, hasta que se cumpla este total.
+    # Si se cumple sin haber conseguido precio (ni por el feed en vivo ni
+    # on-chain), se aborta la entrada y el bot no compra nada.
+    entry_wait_timeout_seconds: float = 60.0
     # RPC de Solana usado ÚNICAMENTE para leer, on-chain, las reservas
     # reales del pool de PumpSwap cuando el mint ya migró (ver
     # pumpswapamm en pump.py). Un endpoint público gratuito alcanza para

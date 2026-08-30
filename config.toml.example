@@ -82,3 +82,9 @@ onchain_poll_interval_seconds = 5.0
 # para esto, pero es lento/rate-limited; para uso serio conviene uno propio
 # (Helius, QuickNode, etc.).
 solana_rpc_url = "https://api.mainnet-beta.solana.com"
+
+# Tiempo TOTAL, en segundos, que el bot espera el precio de entrada antes
+# de abortar la entrada del todo (no compra nada). Cubre la espera después
+# del ack de suscripción: ciclos de live_feed_timeout_seconds + intentos de
+# fallback on-chain, uno tras otro, hasta cumplir este total.
+entry_wait_timeout_seconds = 60.0
