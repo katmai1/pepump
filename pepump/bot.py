@@ -262,7 +262,8 @@ class TrailingTakeProfitBot:
                              f"queda ABIERTA — revisala manualmente: https://pump.fun/{self.mint}")
                 return
             try:
-                await self.executor.sell(self.position, price, "cierre manual (Ctrl+C/SIGTERM)")
+                await self.executor.sell(self.position, price, "cierre manual (Ctrl+C/SIGTERM)",
+                                          pool_override=self._current_pool_override())
             except Exception as e:
                 logger.error(f"Falló la venta de cierre manual: {e}. La posición SIGUE ABIERTA — "
                              f"revisala manualmente: https://pump.fun/{self.mint}")
@@ -817,8 +818,23 @@ class TrailingTakeProfitBot:
                 logger.info(f"⏱️  [esperando activación +{self.cfg.activation_pct}%] "
                             f"precio {self.latest_price:.10f} | entrada {pos.entry_price:.10f} | PnL: {pnl:+.2f}%")
 
+    def _current_pool_override(self) -> Optional[str]:
+        """Si ya confirmamos -sea al entrar (_try_onchain_fallback) o a
+        mitad de posición (_check_for_migration/_using_onchain_fallback)-
+        que este mint migró de la bonding curve a PumpSwap, hay que
+        decírselo explícito a la Lightning API con pool="pump-amm" en vez
+        de confiar en self.cfg.pool="auto".
+
+        Motivo: pool="auto" le pide a PumpPortal que resuelva solo por
+        dónde rutear la orden, y esa resolución puede quedar pisada con
+        la bonding curve vieja para un mint recién migrado. Ahí la orden
+        revierte on-chain con el error 6005 (BondingCurveComplete) del
+        programa Pump, porque esa curva ya no existe para este mint -
+        aunque nosotros ya confirmamos el pool de PumpSwap on-chain."""
+        return "pump-amm" if self._using_onchain_fallback else None
+
     async def _on_first_price(self, price: float) -> None:
-        self.position = await self.executor.buy(self.mint, price)
+        self.position = await self.executor.buy(self.mint, price, pool_override=self._current_pool_override())
         logger.info(f"Activación del trailing-stop: +{self.cfg.activation_pct}% "
                     f"| ancho del trailing una vez armado: {self.cfg.trailing_pct}% "
                     f"| stop-loss inicial (antes de armar): -{self.cfg.initial_stop_pct}%")
@@ -875,7 +891,7 @@ class TrailingTakeProfitBot:
             if pos.closed:
                 return
             try:
-                await self.executor.sell(pos, price, reason)
+                await self.executor.sell(pos, price, reason, pool_override=self._current_pool_override())
             except Exception as e:
                 logger.warning(f"⚠️  Venta fallida ({reason}): {e}. La posición SIGUE ABIERTA, "
                                f"se reintentará con el próximo precio que llegue.")

@@ -46,7 +46,7 @@ class TradeExecutor:
         self.live = live
         self.cfg = config
 
-    async def buy(self, mint: str, price: float) -> Position:
+    async def buy(self, mint: str, price: float, pool_override: str = None) -> Position:
         sol_amount = self.cfg.buy_sol
 
         if self.live:
@@ -54,7 +54,7 @@ class TradeExecutor:
                 result = await self.client.execute_lightning_trade(
                     action="buy", mint=mint, amount=sol_amount, denominated_in_sol=True,
                     slippage=self.cfg.slippage, priority_fee=self.cfg.priority_fee,
-                    pool=self.cfg.pool,
+                    pool=pool_override or self.cfg.pool,
                     solana_rpc_url=self.cfg.solana_rpc_url,
                     tx_confirm_timeout_seconds=self.cfg.tx_confirm_timeout_seconds,
                     tx_confirm_poll_interval_seconds=self.cfg.tx_confirm_poll_interval_seconds,
@@ -77,13 +77,13 @@ class TradeExecutor:
                     f"(~{token_amount:,.2f} tokens)")
         return Position(mint=mint, entry_price=price, sol_amount=sol_amount, token_amount=token_amount)
 
-    async def sell(self, position: Position, price: float, reason: str) -> None:
+    async def sell(self, position: Position, price: float, reason: str, pool_override: str = None) -> None:
         if self.live:
             try:
                 result = await self.client.execute_lightning_trade(
                     action="sell", mint=position.mint, amount="100%", denominated_in_sol=False,
                     slippage=self.cfg.slippage, priority_fee=self.cfg.priority_fee,
-                    pool=self.cfg.pool,
+                    pool=pool_override or self.cfg.pool,
                     solana_rpc_url=self.cfg.solana_rpc_url,
                     tx_confirm_timeout_seconds=self.cfg.tx_confirm_timeout_seconds,
                     tx_confirm_poll_interval_seconds=self.cfg.tx_confirm_poll_interval_seconds,

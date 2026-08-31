@@ -98,13 +98,19 @@ class SpyExecutor:
         self.fail_exc = fail_exc or RuntimeError("Lightning API rechazó la orden (fake)")
         self.sell_calls = 0
         self.buy_calls = 0
+        # Últimos pool_override recibidos (para que los tests puedan
+        # verificar que bot.py fuerza pool="pump-amm" cuando corresponde).
+        self.last_buy_pool_override = None
+        self.last_sell_pool_override = None
 
-    async def buy(self, mint: str, price: float) -> Position:
+    async def buy(self, mint: str, price: float, pool_override: str = None) -> Position:
         self.buy_calls += 1
+        self.last_buy_pool_override = pool_override
         return Position(mint=mint, entry_price=price, sol_amount=0.05, token_amount=0.05 / price)
 
-    async def sell(self, position: Position, price: float, reason: str) -> None:
+    async def sell(self, position: Position, price: float, reason: str, pool_override: str = None) -> None:
         self.sell_calls += 1
+        self.last_sell_pool_override = pool_override
         if self.sell_delay:
             await asyncio.sleep(self.sell_delay)
         if self.sell_calls <= self.fail_sell_times:
