@@ -143,6 +143,78 @@ async def _describe_onchain_error(signature: str, rpc_url: str, err) -> tuple[st
     return ": revirtió con un error no reconocido (corré con -v para ver más detalle, o abrí el link de Solscan)", detail
 
 
+async def _fetch_actual_fill(signature: str, rpc_url: str, mint: str) -> Optional[dict]:
+    """Lee la transacción YA CONFIRMADA (ver _confirm_transaction_onchain,
+    que se llama SIEMPRE antes que esto) y calcula, a partir de los
+    balances reales pre/post en la wallet, cuánto SOL neto se movió y
+    cuántos tokens del `mint` se movieron REALMENTE -no una estimación
+    del precio de referencia de antes de mandar la orden.
+
+    La wallet se identifica como el PRIMER account_key de la
+    transacción: en Solana, el fee payer/firmante principal siempre va
+    en el índice 0 del mensaje, y las órdenes de la Lightning API de
+    PumpPortal las firma y paga siempre la wallet asociada a la
+    api_key -así que ese índice 0 es, siempre, nuestra propia wallet.
+
+    Devuelve None si por lo que sea no se puede leer/parsear la tx (el
+    llamador debe caer entonces al precio/monto ESTIMADO en vez de
+    fallar la operación por esto: la compra/venta YA CONFIRMÓ on-chain
+    -eso ya lo garantizó _confirm_transaction_onchain-, esto es solo
+    para reportar números reales, no para decidir si salió bien).
+
+    Devuelve {"sol_delta": float, "token_delta": float}:
+      - sol_delta: SOL netos ganados (positivo) o gastados (negativo)
+        por la wallet en esta tx, en SOL (no lamports) e incluyendo
+        TODOS los fees (red + priority fee + lo que haya cobrado el
+        programa) -es el movimiento real de saldo, no un cálculo.
+      - token_delta: tokens del `mint` ganados (positivo) o gastados
+        (negativo) por la wallet, en unidades de token (no raw/atomic).
+    """
+    try:
+        sig = Signature.from_string(signature)
+        async with AsyncClient(rpc_url) as client:
+            resp = await client.get_transaction(
+                sig, encoding="json", max_supported_transaction_version=0
+            )
+        if resp.value is None or resp.value.transaction is None:
+            return None
+
+        meta = resp.value.transaction.meta
+        if meta is None or not meta.pre_balances or not meta.post_balances:
+            return None
+
+        account_keys = resp.value.transaction.transaction.message.account_keys
+        if not account_keys:
+            return None
+        wallet = str(account_keys[0])
+
+        sol_delta = (meta.post_balances[0] - meta.pre_balances[0]) / 1_000_000_000.0
+
+        def _token_amount_for_wallet(balances) -> Optional[float]:
+            if not balances:
+                return None
+            for b in balances:
+                if b.mint == mint and b.owner == wallet:
+                    ui_amount = b.ui_token_amount.ui_amount
+                    return float(ui_amount) if ui_amount is not None else 0.0
+            return None
+
+        pre_tokens = _token_amount_for_wallet(meta.pre_token_balances)
+        post_tokens = _token_amount_for_wallet(meta.post_token_balances)
+        # Si el mint no aparece en ninguno de los dos lados es que no
+        # pudimos identificar el movimiento de tokens (rareza en el
+        # formato de respuesta del RPC) -no asumimos 0 en ese caso.
+        if pre_tokens is None and post_tokens is None:
+            return None
+        token_delta = (post_tokens or 0.0) - (pre_tokens or 0.0)
+
+        return {"sol_delta": sol_delta, "token_delta": token_delta}
+    except Exception as e:
+        logger.warning(f"No se pudieron leer los datos reales de fill de {signature} "
+                        f"(se va a usar el estimado como respaldo): {e}")
+        return None
+
+
 class PumpPortalClient:
     """
     Encapsula toda la comunicación de red con PumpPortal. No conoce nada
@@ -322,6 +394,23 @@ class PumpPortalClient:
         await self._confirm_transaction_onchain(
             signature, solana_rpc_url, tx_confirm_timeout_seconds, tx_confirm_poll_interval_seconds
         )
+
+        # La tx YA confirmó on-chain (lo de arriba no tira si no). Ahora
+        # leemos los datos REALES de fill (SOL y tokens que realmente se
+        # movieron en la wallet) para no depender del precio de
+        # referencia estimado -ver executor.py, que usa esto para armar
+        # el Position con números reales en vez de estimados. Si por lo
+        # que sea esto falla (RPC caído, formato inesperado, etc.), no
+        # hacemos fallar la operación -ya sabemos que confirmó bien-,
+        # simplemente no viene el fill real y el llamador cae al
+        # estimado como respaldo.
+        fill = await _fetch_actual_fill(signature, solana_rpc_url, mint)
+        if fill is not None:
+            data["actual_sol_delta"] = fill["sol_delta"]
+            data["actual_token_delta"] = fill["token_delta"]
+        else:
+            logger.warning(f"[REAL] No se pudieron leer los datos reales de fill de la tx "
+                            f"{signature}; se van a usar los valores estimados para esta operación.")
         return data
 
     @staticmethod

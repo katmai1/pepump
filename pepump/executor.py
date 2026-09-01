@@ -13,10 +13,18 @@ class Position:
     mint: str
     entry_price: float                 # precio en SOL por token, al comprar
     sol_amount: float                  # SOL invertidos
-    token_amount: float                # tokens obtenidos (estimado)
+    token_amount: float                # tokens obtenidos
     highest_price: float = field(init=False)
     armed: bool = False                # ¿ya se activó el trailing stop?
     closed: bool = False
+    # True si entry_price/sol_amount/token_amount salen de los balances
+    # REALES pre/post de la transacción de compra confirmada (ver
+    # TradeExecutor.buy) en vez de ser una estimación a partir del
+    # precio de referencia. Solo puede ser True en modo REAL, y solo si
+    # se pudo leer la tx (ver pump.py:_fetch_actual_fill) -si esa
+    # lectura falla, se cae al estimado y esto queda en False aunque la
+    # compra haya sido real.
+    entry_is_real_fill: bool = False
     # time.time() del momento en que se abrió la posición (Position se crea
     # recién al comprar -ver TradeExecutor.buy-, así que esto es "ahora"
     # salvo que se pise explícitamente, como hacen los tests). Sirve para
@@ -47,7 +55,13 @@ class TradeExecutor:
         self.cfg = config
 
     async def buy(self, mint: str, price: float, pool_override: str = None) -> Position:
+        # Valores ESTIMADOS a partir del precio de referencia -se usan
+        # tal cual en modo SIMULADO, y como respaldo en modo REAL si no
+        # se pudieron leer los datos reales de fill (ver más abajo).
         sol_amount = self.cfg.buy_sol
+        entry_price = price
+        token_amount = sol_amount / price if price > 0 else 0.0
+        real_fill = False
 
         if self.live:
             try:
@@ -71,13 +85,46 @@ class TradeExecutor:
                 logger.exception("[REAL] Error al comprar (la orden no se confirmó on-chain)")
                 raise
 
-        token_amount = sol_amount / price if price > 0 else 0.0
+            # La compra CONFIRMÓ on-chain. execute_lightning_trade ahora
+            # devuelve, además de la respuesta cruda de la Lightning
+            # API, los datos REALES de fill (leídos de los balances
+            # pre/post de la propia transacción) en "actual_sol_delta" /
+            # "actual_token_delta" -ver pump.py:_fetch_actual_fill. Si
+            # están, reemplazan la estimación con los números reales de
+            # lo que efectivamente pasó en la wallet (incluye fees).
+            actual_sol_delta = result.get("actual_sol_delta") if isinstance(result, dict) else None
+            actual_token_delta = result.get("actual_token_delta") if isinstance(result, dict) else None
+            if actual_sol_delta is not None and actual_token_delta is not None and actual_token_delta > 0:
+                real_sol_spent = abs(actual_sol_delta)  # gastamos SOL -> sol_delta viene negativo
+                real_token_amount = actual_token_delta
+                sol_amount = real_sol_spent
+                token_amount = real_token_amount
+                entry_price = real_sol_spent / real_token_amount
+                real_fill = True
+                logger.info(f"[REAL] Datos REALES de la compra (de la tx confirmada, incluyen fees): "
+                            f"gastaste {real_sol_spent:.9f} SOL y recibiste {real_token_amount:,.6f} "
+                            f"tokens -> precio efectivo real: {entry_price:.10f} SOL/token.")
+            else:
+                logger.warning(f"[REAL] No se pudieron confirmar los datos reales de la compra; "
+                                f"se usa el ESTIMADO (precio de referencia {price:.10f} SOL/token, "
+                                f"~{token_amount:,.2f} tokens) para la posición.")
+
         etiqueta = "REAL" if self.live else "SIMULADO"
-        logger.info(f"[{etiqueta}] COMPRA de {sol_amount} SOL en {mint} a precio {price:.10f} SOL/token "
-                    f"(~{token_amount:,.2f} tokens)")
-        return Position(mint=mint, entry_price=price, sol_amount=sol_amount, token_amount=token_amount)
+        sufijo = " [datos reales]" if real_fill else (" [estimado]" if self.live else "")
+        logger.info(f"[{etiqueta}] COMPRA de {sol_amount:.9f} SOL en {mint} a precio "
+                    f"{entry_price:.10f} SOL/token (~{token_amount:,.2f} tokens){sufijo}")
+        return Position(mint=mint, entry_price=entry_price, sol_amount=sol_amount,
+                         token_amount=token_amount, entry_is_real_fill=real_fill)
 
     async def sell(self, position: Position, price: float, reason: str, pool_override: str = None) -> None:
+        # Valores ESTIMADOS a partir del precio de referencia -se usan
+        # tal cual en modo SIMULADO, y como respaldo en modo REAL si no
+        # se pudieron leer los datos reales de fill (ver más abajo).
+        exit_price = price
+        token_amount_sold = position.token_amount
+        proceeds = token_amount_sold * price
+        real_fill = False
+
         if self.live:
             try:
                 result = await self.client.execute_lightning_trade(
@@ -108,11 +155,41 @@ class TradeExecutor:
                 )
                 raise
 
-        pnl = position.pnl_pct(price)
-        proceeds = position.token_amount * price
+            # La venta CONFIRMÓ on-chain. Igual que en buy(), reemplazamos
+            # la estimación con los datos REALES de fill si se pudieron
+            # leer -ver pump.py:_fetch_actual_fill.
+            actual_sol_delta = result.get("actual_sol_delta") if isinstance(result, dict) else None
+            actual_token_delta = result.get("actual_token_delta") if isinstance(result, dict) else None
+            if actual_sol_delta is not None and actual_token_delta is not None and actual_sol_delta > 0:
+                real_sol_received = actual_sol_delta  # recibimos SOL -> sol_delta viene positivo
+                real_token_amount_sold = abs(actual_token_delta)  # vendimos tokens -> viene negativo
+                proceeds = real_sol_received
+                token_amount_sold = real_token_amount_sold
+                exit_price = real_sol_received / real_token_amount_sold if real_token_amount_sold > 0 else price
+                real_fill = True
+                logger.info(f"[REAL] Datos REALES de la venta (de la tx confirmada, ya netos de fees): "
+                            f"vendiste {real_token_amount_sold:,.6f} tokens y recibiste "
+                            f"{real_sol_received:.9f} SOL -> precio efectivo real: {exit_price:.10f} "
+                            f"SOL/token.")
+            else:
+                logger.warning(f"[REAL] No se pudieron confirmar los datos reales de la venta; "
+                                f"se usa el ESTIMADO (precio de referencia y token_amount de la "
+                                f"posición) para el PnL.")
+
+        # PnL calculado en SOL real gastado vs. SOL real recibido -no
+        # como ratio de precios-, para que en modo REAL con datos reales
+        # (real_fill=True) refleje EXACTAMENTE lo que pasó en la wallet
+        # (compra y venta ya vienen netas de fees en ese caso). En modo
+        # SIMULADO o si no hay datos reales, position.sol_amount y
+        # proceeds son ambos estimados a partir de precios, y da el
+        # mismo resultado que el cálculo anterior basado en precios.
+        pnl_sol = proceeds - position.sol_amount
+        pnl_pct = (pnl_sol / position.sol_amount * 100.0) if position.sol_amount > 0 else 0.0
         etiqueta = "REAL" if self.live else "SIMULADO"
-        logger.info(f"[{etiqueta}] VENTA de {position.mint} a precio {price:.10f} SOL/token "
-                    f"| motivo: {reason} | PnL: {pnl:+.2f}% | SOL recibidos (aprox): {proceeds:.6f}")
+        sufijo = " [datos reales]" if real_fill else (" [estimado]" if self.live else "")
+        logger.info(f"[{etiqueta}] VENTA de {position.mint} a precio {exit_price:.10f} SOL/token "
+                    f"| motivo: {reason} | PnL: {pnl_pct:+.2f}% ({pnl_sol:+.9f} SOL) "
+                    f"| SOL recibidos: {proceeds:.9f}{sufijo}")
         position.closed = True
 
         # Historial de órdenes cerradas: se registra DESPUÉS de marcar
@@ -127,11 +204,11 @@ class TradeExecutor:
             "mint": position.mint,
             "mode": etiqueta,
             "entry_price": f"{position.entry_price:.10f}",
-            "exit_price": f"{price:.10f}",
+            "exit_price": f"{exit_price:.10f}",
             "sol_amount": f"{position.sol_amount:.9f}",
-            "token_amount": f"{position.token_amount:.6f}",
+            "token_amount": f"{token_amount_sold:.6f}",
             "proceeds_sol": f"{proceeds:.9f}",
-            "pnl_pct": f"{pnl:.4f}",
+            "pnl_pct": f"{pnl_pct:.4f}",
             "duration_seconds": f"{max(time.time() - position.opened_at, 0.0):.1f}",
             "reason": reason,
         })

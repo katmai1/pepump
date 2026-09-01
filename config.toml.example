@@ -57,7 +57,7 @@ entry_dip_pct = 0.0
 # (0.01 SOL cada 10.000 eventos) y exige API key + wallet con >= 0.02 SOL
 # para funcionar. Sin key, la conexión no da error pero tampoco entrega
 # trades: el bot se queda esperando para siempre.
-# Si la dejás vacía acá, el bot también busca la variable de entorno
+# Si la dejas vacía, el bot también busca la variable de entorno
 # PUMPPORTAL_API_KEY (más seguro que dejarla escrita en este archivo).
 api_key = ""
 
