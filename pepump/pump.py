@@ -7,6 +7,7 @@ import time
 from typing import AsyncIterator, Optional
 
 from solana.rpc.async_api import AsyncClient
+from solana.rpc.commitment import Confirmed
 from solana.rpc.types import MemcmpOpts
 from solders.pubkey import Pubkey  # type: ignore
 from solders.signature import Signature  # type: ignore
@@ -143,7 +144,8 @@ async def _describe_onchain_error(signature: str, rpc_url: str, err) -> tuple[st
     return ": revirtió con un error no reconocido (corré con -v para ver más detalle, o abrí el link de Solscan)", detail
 
 
-async def _fetch_actual_fill(signature: str, rpc_url: str, mint: str) -> Optional[dict]:
+async def _fetch_actual_fill(signature: str, rpc_url: str, mint: str,
+                              max_attempts: int = 3, retry_delay_seconds: float = 0.75) -> Optional[dict]:
     """Lee la transacción YA CONFIRMADA (ver _confirm_transaction_onchain,
     que se llama SIEMPRE antes que esto) y calcula, a partir de los
     balances reales pre/post en la wallet, cuánto SOL neto se movió y
@@ -169,50 +171,78 @@ async def _fetch_actual_fill(signature: str, rpc_url: str, mint: str) -> Optiona
         programa) -es el movimiento real de saldo, no un cálculo.
       - token_delta: tokens del `mint` ganados (positivo) o gastados
         (negativo) por la wallet, en unidades de token (no raw/atomic).
+
+    `max_attempts`/`retry_delay_seconds`: get_transaction puede no
+    encontrar todavía la tx (resp.value/transaction en None) aunque
+    _confirm_transaction_onchain ya la haya dado por confirmada -hay un
+    desfasaje real entre "el status ya dice confirmed/finalized" y "ya
+    está indexada y consultable vía getTransaction" en el nodo RPC, sea
+    el mismo nodo u otro. Reintentamos un par de veces con una espera
+    corta antes de rendirnos y caer al estimado. Los demás casos de
+    "no se puede leer" (falta meta, faltan balances, el mint no aparece
+    en ningún lado) son estructurales -no un tema de timing- así que no
+    tiene sentido reintentarlos, pero de todos modos no cuesta nada
+    dejar que también consuman intentos si por lo que sea cambian entre
+    llamadas.
     """
     try:
         sig = Signature.from_string(signature)
-        async with AsyncClient(rpc_url) as client:
-            resp = await client.get_transaction(
-                sig, encoding="json", max_supported_transaction_version=0
-            )
-        if resp.value is None or resp.value.transaction is None:
-            return None
-
-        meta = resp.value.transaction.meta
-        if meta is None or not meta.pre_balances or not meta.post_balances:
-            return None
-
-        account_keys = resp.value.transaction.transaction.message.account_keys
-        if not account_keys:
-            return None
-        wallet = str(account_keys[0])
-
-        sol_delta = (meta.post_balances[0] - meta.pre_balances[0]) / 1_000_000_000.0
-
-        def _token_amount_for_wallet(balances) -> Optional[float]:
-            if not balances:
-                return None
-            for b in balances:
-                if b.mint == mint and b.owner == wallet:
-                    ui_amount = b.ui_token_amount.ui_amount
-                    return float(ui_amount) if ui_amount is not None else 0.0
-            return None
-
-        pre_tokens = _token_amount_for_wallet(meta.pre_token_balances)
-        post_tokens = _token_amount_for_wallet(meta.post_token_balances)
-        # Si el mint no aparece en ninguno de los dos lados es que no
-        # pudimos identificar el movimiento de tokens (rareza en el
-        # formato de respuesta del RPC) -no asumimos 0 en ese caso.
-        if pre_tokens is None and post_tokens is None:
-            return None
-        token_delta = (post_tokens or 0.0) - (pre_tokens or 0.0)
-
-        return {"sol_delta": sol_delta, "token_delta": token_delta}
     except Exception as e:
         logger.warning(f"No se pudieron leer los datos reales de fill de {signature} "
-                        f"(se va a usar el estimado como respaldo): {e}")
+                        f"(firma inválida, se va a usar el estimado como respaldo): {e}")
         return None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            async with AsyncClient(rpc_url) as client:
+                resp = await client.get_transaction(
+                    sig, encoding="json", commitment=Confirmed,
+                    max_supported_transaction_version=0,
+                )
+            if resp.value is None or resp.value.transaction is None:
+                if attempt < max_attempts:
+                    await asyncio.sleep(retry_delay_seconds)
+                    continue
+                return None
+
+            meta = resp.value.transaction.meta
+            if meta is None or not meta.pre_balances or not meta.post_balances:
+                return None
+
+            account_keys = resp.value.transaction.transaction.message.account_keys
+            if not account_keys:
+                return None
+            wallet = str(account_keys[0])
+
+            sol_delta = (meta.post_balances[0] - meta.pre_balances[0]) / 1_000_000_000.0
+
+            def _token_amount_for_wallet(balances) -> Optional[float]:
+                if not balances:
+                    return None
+                for b in balances:
+                    if b.mint == mint and b.owner == wallet:
+                        ui_amount = b.ui_token_amount.ui_amount
+                        return float(ui_amount) if ui_amount is not None else 0.0
+                return None
+
+            pre_tokens = _token_amount_for_wallet(meta.pre_token_balances)
+            post_tokens = _token_amount_for_wallet(meta.post_token_balances)
+            # Si el mint no aparece en ninguno de los dos lados es que no
+            # pudimos identificar el movimiento de tokens (rareza en el
+            # formato de respuesta del RPC) -no asumimos 0 en ese caso.
+            if pre_tokens is None and post_tokens is None:
+                return None
+            token_delta = (post_tokens or 0.0) - (pre_tokens or 0.0)
+
+            return {"sol_delta": sol_delta, "token_delta": token_delta}
+        except Exception as e:
+            if attempt < max_attempts:
+                await asyncio.sleep(retry_delay_seconds)
+                continue
+            logger.warning(f"No se pudieron leer los datos reales de fill de {signature} "
+                            f"(se va a usar el estimado como respaldo, tras {max_attempts} intentos): {e}")
+            return None
+    return None  # inalcanzable (el loop siempre retorna o sigue), queda por claridad
 
 
 class PumpPortalClient:

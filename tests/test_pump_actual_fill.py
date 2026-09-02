@@ -16,6 +16,15 @@ from solders.signature import Signature
 
 from pepump import pump as pump_module
 
+
+@pytest.fixture(autouse=True)
+def _no_real_sleep(monkeypatch):
+    """Los tests de reintento ejercitan asyncio.sleep entre intentos;
+    lo pisamos para que no frenen la suite de verdad."""
+    async def _fake_sleep(seconds):
+        return None
+    monkeypatch.setattr(pump_module.asyncio, "sleep", _fake_sleep)
+
 # Firma con formato válido (Signature.from_string no debe explotar),
 # no corresponde a ninguna tx real -no hace falta, get_transaction está
 # mockeado.
@@ -78,19 +87,27 @@ class FakeAsyncClient:
     usa _fetch_actual_fill, devolviendo la respuesta fija que se le
     pase."""
 
-    def __init__(self, resp=None, exc=None):
-        self._resp = resp
-        self._exc = exc
-
     async def __aenter__(self):
         return self
 
     async def __aexit__(self, *exc_info):
         return False
 
-    async def get_transaction(self, sig, encoding=None, max_supported_transaction_version=None):
+    def __init__(self, resp=None, exc=None, fail_times=0):
+        self._resp = resp
+        self._exc = exc
+        # Cuántas veces devolver "todavía no encontrada" (resp.value=None)
+        # antes de servir self._resp -simula la tx no indexada aún.
+        self._fail_times = fail_times
+        self.calls = 0
+
+    async def get_transaction(self, sig, encoding=None, commitment=None,
+                               max_supported_transaction_version=None):
+        self.calls += 1
         if self._exc:
             raise self._exc
+        if self.calls <= self._fail_times:
+            return FakeGetTransactionResp(None)
         return self._resp
 
 
@@ -178,3 +195,61 @@ def test_fetch_actual_fill_none_si_mint_no_aparece_en_ningun_lado(monkeypatch):
     fill = asyncio.run(pump_module._fetch_actual_fill(FAKE_SIGNATURE, "http://fake-rpc", MINT))
 
     assert fill is None
+
+
+def test_fetch_actual_fill_reintenta_si_la_tx_todavia_no_esta_indexada(monkeypatch):
+    """Caso real reportado: get_transaction devuelve resp.value=None las
+    primeras veces (la tx confirmó pero el nodo RPC todavía no puede
+    servirla) y recién en el último intento aparece -_fetch_actual_fill
+    debe reintentar y devolver los datos reales, no rendirse de una."""
+    resp = _make_resp(sol_delta_lamports=-50_500_000, pre_tokens=0.0, post_tokens=1_234.5)
+    fake_client = FakeAsyncClient(resp=resp, fail_times=2)
+    monkeypatch.setattr(pump_module, "AsyncClient", lambda url: fake_client)
+
+    fill = asyncio.run(pump_module._fetch_actual_fill(
+        FAKE_SIGNATURE, "http://fake-rpc", MINT, max_attempts=3, retry_delay_seconds=0
+    ))
+
+    assert fill is not None
+    assert fill["token_delta"] == pytest.approx(1234.5)
+    assert fake_client.calls == 3
+
+
+def test_fetch_actual_fill_none_si_la_tx_nunca_aparece_tras_los_reintentos(monkeypatch):
+    """Si se agotan los intentos y la tx sigue sin poder leerse, cae
+    limpiamente a None (el llamador usa el estimado) en vez de colgarse
+    reintentando para siempre."""
+    fake_client = FakeAsyncClient(resp=None, fail_times=99)  # nunca "aparece"
+    monkeypatch.setattr(pump_module, "AsyncClient", lambda url: fake_client)
+
+    fill = asyncio.run(pump_module._fetch_actual_fill(
+        FAKE_SIGNATURE, "http://fake-rpc", MINT, max_attempts=3, retry_delay_seconds=0
+    ))
+
+    assert fill is None
+    assert fake_client.calls == 3
+
+
+def test_fetch_actual_fill_pasa_commitment_confirmed(monkeypatch):
+    """get_transaction debe pedirse explícitamente con commitment=Confirmed
+    -no depender del default del cliente (finalized), que tarda más y
+    empeora el desfasaje con _confirm_transaction_onchain."""
+    from solana.rpc.commitment import Confirmed
+
+    resp = _make_resp(sol_delta_lamports=-50_500_000, pre_tokens=0.0, post_tokens=1_234.5)
+    seen_commitments = []
+
+    class RecordingFakeAsyncClient(FakeAsyncClient):
+        async def get_transaction(self, sig, encoding=None, commitment=None,
+                                   max_supported_transaction_version=None):
+            seen_commitments.append(commitment)
+            return await super().get_transaction(
+                sig, encoding=encoding, commitment=commitment,
+                max_supported_transaction_version=max_supported_transaction_version,
+            )
+
+    monkeypatch.setattr(pump_module, "AsyncClient", lambda url: RecordingFakeAsyncClient(resp=resp))
+
+    asyncio.run(pump_module._fetch_actual_fill(FAKE_SIGNATURE, "http://fake-rpc", MINT))
+
+    assert seen_commitments == [Confirmed]
