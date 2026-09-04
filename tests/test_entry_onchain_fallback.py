@@ -38,6 +38,22 @@ class FakeOnChainClient:
         return result
 
 
+class FakeCurveOnChainClient:
+    """Reemplaza PumpCurveOnChainClient. Devuelve (price, complete,
+    exists) de una lista fija, uno por llamada (se queda en el último
+    una vez agotada la lista)."""
+
+    def __init__(self, rpc_url, results):
+        self.rpc_url = rpc_url
+        self._results = list(results)
+        self.calls = 0
+
+    async def fetch_price_or_status(self, mint: str):
+        result = self._results[min(self.calls, len(self._results) - 1)]
+        self.calls += 1
+        return result
+
+
 async def _ack_then_hang():
     """Simula: llega el ack de suscripción y después el feed se queda
     en silencio para siempre (mint sin volumen o ya migrado)."""
@@ -72,11 +88,16 @@ def test_sin_pool_confirmado_sigue_esperando_y_compra_con_trade_tardio(monkeypat
 
     fake_onchain = FakeOnChainClient(cfg.solana_rpc_url, [(None, True)])  # siempre "sin pool"
     monkeypatch.setattr(bot_module, "PumpSwapOnChainClient", lambda rpc_url: fake_onchain)
+    # La bonding curve TAMPOCO da nada legible acá (curva sin datos, o
+    # timeout de RPC) -así que el bot debe seguir esperando el feed en
+    # vivo igual que antes de agregar el fallback de bonding curve.
+    fake_curve = FakeCurveOnChainClient(cfg.solana_rpc_url, [(None, False, False)])
+    monkeypatch.setattr(bot_module, "PumpCurveOnChainClient", lambda rpc_url: fake_curve)
 
     price = asyncio.run(asyncio.wait_for(bot._get_reference_price(), timeout=5))
 
     assert price == 1.23
-    assert bot._using_onchain_fallback is False
+    assert bot._onchain_source is None
     assert fake_onchain.calls >= 2  # reintentó el fallback más de una vez antes de que llegara el trade
 
 
@@ -95,11 +116,13 @@ def test_sin_pool_confirmado_aborta_al_superar_entry_wait_timeout(monkeypatch):
 
     fake_onchain = FakeOnChainClient(cfg.solana_rpc_url, [(None, True)])
     monkeypatch.setattr(bot_module, "PumpSwapOnChainClient", lambda rpc_url: fake_onchain)
+    fake_curve = FakeCurveOnChainClient(cfg.solana_rpc_url, [(None, False, False)])
+    monkeypatch.setattr(bot_module, "PumpCurveOnChainClient", lambda rpc_url: fake_curve)
 
     price = asyncio.run(asyncio.wait_for(bot._get_reference_price(), timeout=5))
 
     assert price is None
-    assert bot._using_onchain_fallback is False
+    assert bot._onchain_source is None
     assert fake_onchain.calls >= 2  # reintentó varias veces antes de rendirse
 
 
@@ -119,18 +142,21 @@ def test_pool_encontrado_pero_sin_precio_aborta_sin_reintentar_feed(monkeypatch)
 
     fake_onchain = FakeOnChainClient(cfg.solana_rpc_url, [(None, False)])  # pool roto / consulta fallida
     monkeypatch.setattr(bot_module, "PumpSwapOnChainClient", lambda rpc_url: fake_onchain)
+    fake_curve = FakeCurveOnChainClient(cfg.solana_rpc_url, [(None, False, False)])
+    monkeypatch.setattr(bot_module, "PumpCurveOnChainClient", lambda rpc_url: fake_curve)
 
     price = asyncio.run(asyncio.wait_for(bot._get_reference_price(), timeout=5))
 
     assert price is None
-    assert bot._using_onchain_fallback is False
+    assert bot._onchain_source is None
     assert fake_onchain.calls == 1  # ni un solo reintento
+    assert fake_curve.calls == 0  # pool_confirmed_absent=False -> ni se prueba la bonding curve
 
 
 def test_pool_encontrado_con_precio_usa_fallback_onchain(monkeypatch):
     """Caso de migración real: el fallback encuentra un pool con precio
     válido -ahí sí corresponde usar ese precio y marcar
-    _using_onchain_fallback (comportamiento sin cambios)."""
+    _onchain_source = "pumpswap" (comportamiento sin cambios)."""
     client = FakeTradeStreamClient()
     executor = SpyExecutor()
     cfg = make_config(live_feed_timeout_seconds=0.03, entry_wait_timeout_seconds=5.0)
@@ -143,5 +169,30 @@ def test_pool_encontrado_con_precio_usa_fallback_onchain(monkeypatch):
     price = asyncio.run(asyncio.wait_for(bot._get_reference_price(), timeout=5))
 
     assert price == 0.0042
-    assert bot._using_onchain_fallback is True
+    assert bot._onchain_source == "pumpswap"
     assert fake_onchain.calls == 1
+
+
+def test_sin_pool_pero_bonding_curve_activa_usa_precio_de_bonding_curve(monkeypatch):
+    """Caso NUEVO: no hay pool de PumpSwap (mint sigue en bonding curve)
+    pero subscribeTokenTrade no está entregando trades reales. En vez de
+    solo confirmar 'sin pool' y volver a esperar a ciegas el mismo feed
+    que no está funcionando, el bot debe leer el precio DIRECTO de la
+    cuenta de la bonding curve on-chain y usarlo como referencia,
+    marcando _onchain_source = 'bondingcurve'."""
+    client = FakeTradeStreamClient()
+    executor = SpyExecutor()
+    cfg = make_config(live_feed_timeout_seconds=0.03, entry_wait_timeout_seconds=5.0)
+    bot = TrailingTakeProfitBot(client=client, executor=executor, config=cfg)
+    bot._trade_events = _ack_then_hang()
+
+    fake_onchain = FakeOnChainClient(cfg.solana_rpc_url, [(None, True)])  # sin pool -> sigue en bonding curve
+    monkeypatch.setattr(bot_module, "PumpSwapOnChainClient", lambda rpc_url: fake_onchain)
+    fake_curve = FakeCurveOnChainClient(cfg.solana_rpc_url, [(0.0000000279, False, True)])
+    monkeypatch.setattr(bot_module, "PumpCurveOnChainClient", lambda rpc_url: fake_curve)
+
+    price = asyncio.run(asyncio.wait_for(bot._get_reference_price(), timeout=5))
+
+    assert price == pytest.approx(0.0000000279)
+    assert bot._onchain_source == "bondingcurve"
+    assert fake_curve.calls == 1

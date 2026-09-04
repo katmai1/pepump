@@ -5,7 +5,7 @@ import time
 from typing import AsyncIterator, Optional
 
 from pepump.executor import Position
-from pepump.pump import PumpSwapOnChainClient
+from pepump.pump import PumpSwapOnChainClient, PumpCurveOnChainClient
 
 logger = logging.getLogger(__name__)
 
@@ -45,13 +45,23 @@ class TrailingTakeProfitBot:
         # esperando el MISMO evento en la próxima llamada en vez de
         # cortar el generador async subyacente.
         self._pending_next_event_task: Optional[asyncio.Task] = None
-        # True si tuvimos que resolver el precio de entrada por el
-        # fallback on-chain de PumpSwap (ver _try_onchain_fallback) en
-        # vez del feed en vivo de PumpPortal -> significa que el mint ya
-        # migró y subscribeTokenTrade no entrega nada para él, así que el
-        # monitoreo de la posición TAMBIÉN necesita el polling on-chain
-        # (ver _poll_onchain_price_loop), no solo el precio inicial.
-        self._using_onchain_fallback = False
+        # Si tuvimos que resolver el precio (de entrada, o durante el
+        # monitoreo de una posición ya abierta) por un fallback on-chain
+        # en vez del feed en vivo de PumpPortal -> qué fallback está
+        # activo ahora mismo, para que el resto del código sepa con qué
+        # cliente/lógica seguir consultando (ver _onchain_fetch_price,
+        # _poll_onchain_price_loop, _wait_for_dip_entry,
+        # _resolve_shutdown_price):
+        #   None           -> no se usó ningún fallback, todo por el feed en vivo.
+        #   "bondingcurve" -> el mint sigue en bonding curve pero
+        #                     subscribeTokenTrade no entregó nada (ack
+        #                     recibido, sin trades reales); se lee el
+        #                     precio directo de la cuenta de la bonding
+        #                     curve on-chain (ver PumpCurveOnChainClient).
+        #   "pumpswap"     -> el mint ya migró a PumpSwap; se lee el
+        #                     precio directo del pool on-chain (ver
+        #                     PumpSwapOnChainClient).
+        self._onchain_source: Optional[str] = None
         # Se activa con Ctrl+C (SIGINT) o SIGTERM (ver run()). NO se usa
         # el try/except KeyboardInterrupt clásico porque en asyncio esa
         # señal interrumpe el loop de eventos "por afuera" de la
@@ -162,10 +172,11 @@ class TrailingTakeProfitBot:
                 logger.error(f"La compra no se confirmó on-chain, no se abrió ninguna posición: {e}")
                 return
 
-            if self._using_onchain_fallback:
-                # subscribeTokenTrade no entrega nada para este mint (ya
-                # migrado) -> el monitoreo de la posición usa polling
-                # on-chain en vez del consumidor del feed en vivo.
+            if self._onchain_source is not None:
+                # subscribeTokenTrade no está entregando nada útil para
+                # este mint (ya migrado, o bonding curve pero el feed no
+                # entrega precios) -> el monitoreo de la posición usa
+                # polling on-chain en vez del consumidor del feed en vivo.
                 monitor_task = asyncio.create_task(self._poll_onchain_price_loop())
             else:
                 monitor_task = asyncio.create_task(self._consume_trade_stream())
@@ -269,18 +280,44 @@ class TrailingTakeProfitBot:
                              f"revisala manualmente: https://pump.fun/{self.mint}")
 
     async def _resolve_shutdown_price(self) -> Optional[float]:
-        if self._using_onchain_fallback:
-            onchain = PumpSwapOnChainClient(self.cfg.solana_rpc_url)
+        if self._onchain_source is not None:
             try:
-                price = await onchain.fetch_price_for_migrated_mint(self.mint)
+                price = await self._onchain_fetch_price()
             except Exception as e:
-                logger.debug(f"[On-chain PumpSwap] Falló la consulta fresca al cerrar: {e}")
+                logger.debug(f"[On-chain] Falló la consulta fresca al cerrar: {e}")
                 price = None
             if price is not None and price > 0:
                 return price
-            logger.debug("[On-chain PumpSwap] No se pudo refrescar el precio al cerrar; "
+            logger.debug("[On-chain] No se pudo refrescar el precio al cerrar; "
                          "uso el último precio conocido.")
         return self.latest_price
+
+    async def _onchain_fetch_price(self) -> Optional[float]:
+        """Consulta puntual al fallback on-chain ACTUALMENTE activo
+        (self._onchain_source), usada para refrescar/pollear el precio
+        de una posición ya resuelta por ese fallback (ver
+        _poll_onchain_price_loop, _resolve_shutdown_price,
+        _wait_for_dip_entry).
+
+        Si el fallback activo es la bonding curve y ésta ya completó
+        (migró mientras estábamos pollando), pasa automáticamente al
+        fallback de PumpSwap para ESTA MISMA consulta y deja
+        `self._onchain_source` en "pumpswap" para las próximas -mismo
+        espíritu que _handle_feed_stall detectando una migración a
+        mitad de posición, pero acá para el caso en que ya veníamos
+        on-chain por bonding curve."""
+        if self._onchain_source == "bondingcurve":
+            curve = PumpCurveOnChainClient(self.cfg.solana_rpc_url)
+            price, complete, exists = await curve.fetch_price_or_status(self.mint)
+            if exists and complete:
+                logger.info("[On-chain bonding curve] La curva completó (migró) mientras se hacía "
+                            "polling -> paso al fallback de PumpSwap.")
+                self._onchain_source = "pumpswap"
+                swap = PumpSwapOnChainClient(self.cfg.solana_rpc_url)
+                return await swap.fetch_price_for_migrated_mint(self.mint)
+            return price
+        onchain = PumpSwapOnChainClient(self.cfg.solana_rpc_url)
+        return await onchain.fetch_price_for_migrated_mint(self.mint)
 
     async def _next_trade_event(self, timeout: Optional[float] = None) -> dict:
         """__anext__() de self._trade_events, pero compitiendo contra
@@ -471,26 +508,57 @@ class TrailingTakeProfitBot:
                                    f"el ack de suscripción. Revisá la conexión de red y que el mint sea correcto.")
 
     async def _try_onchain_fallback(self) -> tuple[Optional[float], bool]:
-        """Consulta puntual al pool de PumpSwap directo de Solana (ver
-        PumpSwapOnChainClient en pump.py). Devuelve (price,
-        pool_confirmed_absent):
-          - price no-None: encontró un pool con precio válido -mint
-            migrado de verdad-. Marca `_using_onchain_fallback = True`
-            para que el monitoreo posterior de la posición (ver
-            _poll_onchain_price_loop) también use polling on-chain.
-          - price None, pool_confirmed_absent True: confirmado que NO
-            hay pool -mint todavía en bonding curve-. El llamador
-            (_get_reference_price) decide si sigue esperando el feed
-            en vivo.
-          - price None, pool_confirmed_absent False: se encontró un
-            pool pero no se pudo leer el precio, o la consulta on-chain
-            en sí falló -no hay ninguna confirmación útil-. El llamador
-            debe abortar, no reintentar el feed en vivo a ciegas."""
+        """Consulta puntual a los fallbacks on-chain, en dos pasos:
+
+        1. PumpSwap (ver PumpSwapOnChainClient): si aparece un pool con
+           precio válido, el mint ya migró de verdad -se usa ese precio.
+
+        2. Si PumpSwap confirma que NO hay pool (`pool_confirmed_absent`
+           -el mint sigue en bonding curve), en vez de simplemente
+           volver a esperar a ciegas el feed en vivo -que es
+           precisamente el que no está entregando nada-, leemos el
+           precio DIRECTO de la cuenta de la bonding curve on-chain (ver
+           PumpCurveOnChainClient). Si responde con un precio válido
+           (curva todavía no completada), lo usamos como referencia y
+           quedamos en modo polling on-chain por bonding curve para el
+           resto de la posición.
+
+        Devuelve (price, pool_confirmed_absent):
+          - price no-None: se resolvió por alguno de los dos fallbacks
+            -`self._onchain_source` queda seteado ("pumpswap" o
+            "bondingcurve") para que el monitoreo posterior de la
+            posición (ver _poll_onchain_price_loop) sepa con cuál seguir.
+          - price None, pool_confirmed_absent True: NI el pool de
+            PumpSwap NI la bonding curve dieron un precio utilizable
+            (curva sin datos legibles, o ya completada pero el pool de
+            PumpSwap todavía no está indexado). El llamador
+            (_get_reference_price) decide si sigue esperando el feed en
+            vivo un ciclo más.
+          - price None, pool_confirmed_absent False: la consulta de
+            PumpSwap en sí no dio ninguna confirmación útil (se
+            encontró un pool pero no se pudo leer, o falló la query) -
+            no hay nada más que probar acá, el llamador debe abortar en
+            vez de reintentar a ciegas."""
         onchain = PumpSwapOnChainClient(self.cfg.solana_rpc_url)
         price, pool_confirmed_absent = await onchain.fetch_price_or_confirm_absent(self.mint)
         if price is not None:
             logger.info(f"Precio de referencia (fallback on-chain PumpSwap): {price:.10f} SOL/token")
-            self._using_onchain_fallback = True
+            self._onchain_source = "pumpswap"
+            return price, pool_confirmed_absent
+
+        if pool_confirmed_absent:
+            curve = PumpCurveOnChainClient(self.cfg.solana_rpc_url)
+            curve_price, complete, exists = await curve.fetch_price_or_status(self.mint)
+            if curve_price is not None and not complete:
+                logger.info(f"Precio de referencia (fallback on-chain bonding curve): "
+                            f"{curve_price:.10f} SOL/token")
+                self._onchain_source = "bondingcurve"
+                return curve_price, pool_confirmed_absent
+            if exists and complete:
+                logger.debug("[On-chain bonding curve] La curva ya completó (migrando a PumpSwap) "
+                             "pero el pool de PumpSwap todavía no aparece indexado. Reintento en el "
+                             "próximo ciclo.")
+
         return price, pool_confirmed_absent
 
     async def _wait_for_dip_entry(self, reference_price: float, target_price: float) -> Optional[float]:
@@ -500,8 +568,9 @@ class TrailingTakeProfitBot:
         _get_reference_price) pero todavía NO compramos con él. Acá
         seguimos mirando el precio -por el mismo canal que produjo esa
         referencia: el feed en vivo ya suscripto, o polling on-chain si
-        el mint ya migró (_using_onchain_fallback)- hasta que toque
-        `target_price` o baje de ahí, y ESE es el precio real de compra.
+        se resolvió por algún fallback (self._onchain_source)- hasta que
+        toque `target_price` o baje de ahí, y ESE es el precio real de
+        compra.
 
         Cada `status_interval_seconds` (mismo intervalo que usa el
         status printer una vez armada la posición) loguea el progreso:
@@ -522,16 +591,15 @@ class TrailingTakeProfitBot:
         self.latest_price = reference_price
         last_log = time.monotonic()
 
-        if self._using_onchain_fallback:
-            onchain = PumpSwapOnChainClient(self.cfg.solana_rpc_url)
+        if self._onchain_source is not None:
             while True:
                 if self._shutdown_requested.is_set():
                     logger.info("Cancelado por el usuario mientras se esperaba la baja de entrada.")
                     return None
                 try:
-                    price = await onchain.fetch_price_for_migrated_mint(self.mint)
+                    price = await self._onchain_fetch_price()
                 except Exception as e:
-                    logger.warning(f"[On-chain PumpSwap] error puntual esperando la baja de entrada, "
+                    logger.warning(f"[On-chain] error puntual esperando la baja de entrada, "
                                    f"reintento en el próximo ciclo: {e}")
                     price = None
                 if price is not None and price > 0:
@@ -648,30 +716,34 @@ class TrailingTakeProfitBot:
 
     async def _poll_onchain_price_loop(self) -> None:
         """Reemplazo de _consume_trade_stream para cuando la posición se
-        abrió vía el fallback on-chain: como subscribeTokenTrade no
-        entrega nada para este mint, no hay forma de enterarse de nuevos
-        precios por el feed en vivo -así que se consulta on-chain cada
+        abrió (o se detectó una migración a mitad de posición, ver
+        _handle_feed_stall) vía algún fallback on-chain: como
+        subscribeTokenTrade no está entregando nada útil para este
+        mint, no hay forma de enterarse de nuevos precios por el feed en
+        vivo -así que se consulta on-chain cada
         `onchain_poll_interval_seconds` mientras la posición siga
-        abierta, y se alimenta al mismo _on_price_update() que usaría el
-        feed en vivo (misma lógica de trailing-stop/stop-loss, solo
-        cambia de dónde sale el precio).
+        abierta (bonding curve o PumpSwap, según `self._onchain_source`
+        -ver _onchain_fetch_price, que también se encarga de pasar de
+        "bondingcurve" a "pumpswap" solo si la curva completa a mitad
+        de este loop), y se alimenta al mismo _on_price_update() que
+        usaría el feed en vivo (misma lógica de trailing-stop/stop-loss,
+        solo cambia de dónde sale el precio).
 
         Un error puntual de RPC (timeout, rate limit, etc.) NO debe matar
         este loop para siempre -eso dejaría el precio congelado igual que
         el bug que tenía _consume_trade_stream-, así que cada iteración
         atrapa sus propios errores y sigue reintentando en el próximo
         ciclo."""
-        onchain = PumpSwapOnChainClient(self.cfg.solana_rpc_url)
         while self.position is not None and not self.position.closed:
             try:
-                price = await onchain.fetch_price_for_migrated_mint(self.mint)
+                price = await self._onchain_fetch_price()
                 if price is not None and price > 0:
                     self.latest_price = price
                     await self._on_price_update(price)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.warning(f"[Polling on-chain PumpSwap] error puntual, reintento en el "
+                logger.warning(f"[Polling on-chain] error puntual, reintento en el "
                                f"próximo ciclo: {e}")
             await asyncio.sleep(self.cfg.onchain_poll_interval_seconds)
 
@@ -764,40 +836,68 @@ class TrailingTakeProfitBot:
     async def _handle_feed_stall(self) -> bool:
         """Se llama cuando pasaron `stall_timeout_seconds` sin ningún
         trade nuevo del feed en vivo, con la posición ya abierta.
-        Confirma con UNA consulta on-chain puntual si el mint ya migró
-        a PumpSwap:
+        Confirma con consultas on-chain puntuales qué está pasando:
 
-          - Si hay un pool con precio válido: es una migración real (no
-            solo una pausa de volumen). Aplica ese precio de una, marca
-            `_using_onchain_fallback = True` y corre el polling on-chain
-            (_poll_onchain_price_loop) hasta que la posición se cierre
-            -> devuelve True (el llamador debe dejar de esperar el feed
-            en vivo, que ya sabemos que no va a entregar nada más para
-            este mint).
-          - Si no hay pool (o falla la consulta): probablemente es solo
-            un token con poco volumen momentáneo -> devuelve False y el
-            llamador sigue esperando el feed en vivo normalmente."""
+          1. Primero chequea si hay un pool de PumpSwap con precio
+             válido -es una migración real (no solo una pausa de
+             volumen). Si lo hay: aplica ese precio de una, marca
+             `_onchain_source = "pumpswap"` y corre el polling on-chain
+             (_poll_onchain_price_loop) hasta que la posición se cierre
+             -> devuelve True (el llamador debe dejar de esperar el
+             feed en vivo, que ya sabemos que no va a entregar nada más
+             para este mint).
+
+          2. Si NO hay pool de PumpSwap, el mint sigue en bonding curve
+             -pero eso no explica por qué subscribeTokenTrade dejó de
+             mandar trades (el síntoma reportado: puede pasar aunque el
+             mint siga perfectamente activo en la curva). En vez de
+             asumir sin más "poco volumen" y quedarnos ciegos hasta el
+             próximo trade real, leemos el precio DIRECTO de la cuenta
+             de la bonding curve on-chain. Si responde con un precio
+             válido, lo aplicamos como red de seguridad (sin abandonar
+             el feed en vivo: seguimos reintentando reconectar/recibir
+             trades reales en el loop de _consume_trade_stream) ->
+             devuelve False igual, pero con self.latest_price ya
+             refrescado en vez de congelado.
+
+          3. Si ni el pool ni la bonding curve dan nada legible ->
+             probablemente es solo un token con muy poco volumen
+             momentáneo -> devuelve False sin tocar el precio."""
         if self.position is None or self.position.closed:
             return True
         onchain = PumpSwapOnChainClient(self.cfg.solana_rpc_url)
         price = await onchain.fetch_price_for_migrated_mint(self.mint)
-        if price is None or price <= 0:
-            logger.debug(f"[Feed de trades de PumpPortal] sin trades nuevos hace "
-                         f"{self.cfg.stall_timeout_seconds:.0f}s, pero no se encontró (todavía) un pool "
-                         f"de PumpSwap con precio válido -> probablemente solo poco volumen, sigo "
-                         f"esperando el feed en vivo.")
-            return False
-        logger.warning(f"[Feed de trades de PumpPortal] sin trades nuevos hace "
-                       f"{self.cfg.stall_timeout_seconds:.0f}s y se confirmó un pool de PumpSwap con "
-                       f"precio válido -> el mint migró a mitad de la posición (subscribeTokenTrade no "
-                       f"lo va a cubrir más). Paso a polling on-chain cada "
-                       f"{self.cfg.onchain_poll_interval_seconds:.0f}s para no perder el precio.")
-        self._using_onchain_fallback = True
-        self.latest_price = price
-        await self._on_price_update(price)
-        if self.position is None or self.position.closed:
+        if price is not None and price > 0:
+            logger.warning(f"[Feed de trades de PumpPortal] sin trades nuevos hace "
+                           f"{self.cfg.stall_timeout_seconds:.0f}s y se confirmó un pool de PumpSwap "
+                           f"con precio válido -> el mint migró a mitad de la posición "
+                           f"(subscribeTokenTrade no lo va a cubrir más). Paso a polling on-chain cada "
+                           f"{self.cfg.onchain_poll_interval_seconds:.0f}s para no perder el precio.")
+            self._onchain_source = "pumpswap"
+            self.latest_price = price
+            await self._on_price_update(price)
+            if self.position is None or self.position.closed:
+                return True
+            await self._poll_onchain_price_loop()
             return True
-        await self._poll_onchain_price_loop()
+
+        curve = PumpCurveOnChainClient(self.cfg.solana_rpc_url)
+        curve_price, complete, exists = await curve.fetch_price_or_status(self.mint)
+        if curve_price is not None and not complete:
+            logger.info(f"[Feed de trades de PumpPortal] sin trades nuevos hace "
+                        f"{self.cfg.stall_timeout_seconds:.0f}s, pero la bonding curve sigue activa "
+                        f"con precio válido on-chain ({curve_price:.10f} SOL/token) -> lo uso como "
+                        f"red de seguridad mientras sigo intentando recibir trades reales del feed en "
+                        f"vivo.")
+            self.latest_price = curve_price
+            await self._on_price_update(curve_price)
+            return False
+
+        logger.debug(f"[Feed de trades de PumpPortal] sin trades nuevos hace "
+                     f"{self.cfg.stall_timeout_seconds:.0f}s, y tampoco se pudo leer un precio válido "
+                     f"ni de un pool de PumpSwap ni de la bonding curve -> probablemente solo poco "
+                     f"volumen, sigo esperando el feed en vivo.")
+        return False
         return True
 
     async def _status_printer_loop(self) -> None:
@@ -820,18 +920,26 @@ class TrailingTakeProfitBot:
 
     def _current_pool_override(self) -> Optional[str]:
         """Si ya confirmamos -sea al entrar (_try_onchain_fallback) o a
-        mitad de posición (_check_for_migration/_using_onchain_fallback)-
-        que este mint migró de la bonding curve a PumpSwap, hay que
-        decírselo explícito a la Lightning API con pool="pump-amm" en vez
-        de confiar en self.cfg.pool="auto".
+        mitad de posición (_handle_feed_stall)- que este mint migró de
+        la bonding curve a PumpSwap, hay que decírselo explícito a la
+        Lightning API con pool="pump-amm" en vez de confiar en
+        self.cfg.pool="auto".
 
         Motivo: pool="auto" le pide a PumpPortal que resuelva solo por
         dónde rutear la orden, y esa resolución puede quedar pisada con
         la bonding curve vieja para un mint recién migrado. Ahí la orden
         revierte on-chain con el error 6005 (BondingCurveComplete) del
         programa Pump, porque esa curva ya no existe para este mint -
-        aunque nosotros ya confirmamos el pool de PumpSwap on-chain."""
-        return "pump-amm" if self._using_onchain_fallback else None
+        aunque nosotros ya confirmamos el pool de PumpSwap on-chain.
+
+        OJO: esto es DISTINTO de `self._onchain_source == "bondingcurve"`
+        -ese caso es el mint SIGUE en bonding curve (solo cambió de
+        dónde sacamos el precio, no de dónde hay que rutear el trade),
+        así que ahí NO hay que overridear nada -> None, se deja que
+        cfg.pool decida como siempre. Overridear a "pump-amm" en ese
+        caso rompería exactamente el mismo BondingCurveComplete que este
+        override existe para evitar, pero al revés."""
+        return "pump-amm" if self._onchain_source == "pumpswap" else None
 
     async def _on_first_price(self, price: float) -> None:
         self.position = await self.executor.buy(self.mint, price, pool_override=self._current_pool_override())

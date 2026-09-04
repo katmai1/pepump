@@ -42,6 +42,22 @@ class FakeOnChainClient:
         return price
 
 
+class FakeCurveOnChainClient:
+    """Reemplaza PumpCurveOnChainClient en estos tests: devuelve
+    (price, complete, exists) fijos, sin pegarle a la red."""
+
+    def __init__(self, rpc_url, price=None, complete=False, exists=False):
+        self.rpc_url = rpc_url
+        self._price = price
+        self._complete = complete
+        self._exists = exists
+        self.calls = 0
+
+    async def fetch_price_or_status(self, mint: str):
+        self.calls += 1
+        return self._price, self._complete, self._exists
+
+
 def test_migracion_a_mitad_de_posicion_pasa_a_polling_onchain(monkeypatch):
     """Si el feed en vivo deja de mandar trades DESPUÉS de haber
     comprado y hay un pool de PumpSwap con precio válido, el bot debe
@@ -65,19 +81,25 @@ def test_migracion_a_mitad_de_posicion_pasa_a_polling_onchain(monkeypatch):
     # (stop en 1.30*0.85=1.105); 1.10 retrocede por debajo de ese stop -> vende.
     fake_onchain = FakeOnChainClient(cfg.solana_rpc_url, [1.20, 1.30, 1.10])
     monkeypatch.setattr(bot_module, "PumpSwapOnChainClient", lambda rpc_url: fake_onchain)
+    # No debería llegar a consultarse (el fake de PumpSwap ya da precio
+    # válido de una), pero lo dejamos parcheado igual para no pegarle a
+    # la red real si algo cambia.
+    monkeypatch.setattr(bot_module, "PumpCurveOnChainClient",
+                         lambda rpc_url: FakeCurveOnChainClient(rpc_url))
 
     asyncio.run(asyncio.wait_for(bot._consume_trade_stream(), timeout=2.0))
 
-    assert bot._using_onchain_fallback is True
+    assert bot._onchain_source == "pumpswap"
     assert executor.sell_calls == 1
     assert bot.position.closed is True
     assert bot.latest_price == pytest.approx(1.10)
 
 
-def test_handle_feed_stall_sin_pool_no_migra(monkeypatch):
-    """Si _handle_feed_stall NO encuentra un pool de PumpSwap con precio
-    (probablemente solo una pausa de volumen, no una migración real), no
-    debe activar el fallback on-chain: el llamador tiene que seguir
+def test_handle_feed_stall_sin_pool_ni_bonding_curve_no_migra(monkeypatch):
+    """Si _handle_feed_stall NO encuentra ni un pool de PumpSwap ni un
+    precio legible en la bonding curve (probablemente solo una pausa de
+    volumen, no una migración real ni un problema puntual del feed), no
+    debe activar ningún fallback on-chain: el llamador tiene que seguir
     esperando el feed en vivo normalmente."""
     executor = SpyExecutor()
     cfg = make_config(stall_timeout_seconds=0.05)
@@ -86,10 +108,38 @@ def test_handle_feed_stall_sin_pool_no_migra(monkeypatch):
 
     fake_onchain = FakeOnChainClient(cfg.solana_rpc_url, [None])
     monkeypatch.setattr(bot_module, "PumpSwapOnChainClient", lambda rpc_url: fake_onchain)
+    fake_curve = FakeCurveOnChainClient(cfg.solana_rpc_url, price=None, complete=False, exists=False)
+    monkeypatch.setattr(bot_module, "PumpCurveOnChainClient", lambda rpc_url: fake_curve)
 
     result = asyncio.run(bot._handle_feed_stall())
 
     assert result is False
-    assert bot._using_onchain_fallback is False
+    assert bot._onchain_source is None
     assert bot.position.closed is False
     assert executor.sell_calls == 0
+    assert bot.latest_price is None  # no se tocó: no había ningún precio legible
+
+
+def test_handle_feed_stall_bonding_curve_da_precio_de_seguridad(monkeypatch):
+    """Si no hay pool de PumpSwap pero la bonding curve SÍ responde con
+    un precio válido (y no completada), _handle_feed_stall debe usarlo
+    como red de seguridad -actualiza latest_price y dispara
+    _on_price_update- pero SIN activar el modo polling on-chain: sigue
+    devolviendo False para que _consume_trade_stream siga intentando
+    recibir trades reales del feed en vivo."""
+    executor = SpyExecutor()
+    cfg = make_config(stall_timeout_seconds=0.05, activation_pct=10.0, trailing_pct=15.0, initial_stop_pct=25.0)
+    bot = TrailingTakeProfitBot(client=None, executor=executor, config=cfg)
+    bot.position = Position(mint=cfg.mint, entry_price=1.0, sol_amount=0.05, token_amount=0.05)
+
+    fake_onchain = FakeOnChainClient(cfg.solana_rpc_url, [None])
+    monkeypatch.setattr(bot_module, "PumpSwapOnChainClient", lambda rpc_url: fake_onchain)
+    fake_curve = FakeCurveOnChainClient(cfg.solana_rpc_url, price=1.05, complete=False, exists=True)
+    monkeypatch.setattr(bot_module, "PumpCurveOnChainClient", lambda rpc_url: fake_curve)
+
+    result = asyncio.run(bot._handle_feed_stall())
+
+    assert result is False
+    assert bot._onchain_source is None  # NO pasa a modo polling on-chain
+    assert bot.latest_price == pytest.approx(1.05)
+    assert bot.position.closed is False  # 1.05 no dispara ni stop-loss ni trailing
