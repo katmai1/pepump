@@ -9,7 +9,6 @@ InstructionErrorCustom(1)))))"), que no dice nada por sí mismo. Ahora:
   - se pide la transacción completa (getTransaction) para sumar las
     líneas de log del programa que mencionan el error real.
 """
-import pytest
 from solders.transaction_status import InstructionErrorCustom, TransactionErrorInstructionError
 
 from pepump.pump import _describe_onchain_error, _extract_instruction_error

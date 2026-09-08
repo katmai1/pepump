@@ -2,6 +2,7 @@ import datetime
 import logging
 import time
 from dataclasses import dataclass, field
+from typing import Optional
 
 from pepump.history import append_closed_trade
 
@@ -54,7 +55,7 @@ class TradeExecutor:
         self.live = live
         self.cfg = config
 
-    async def buy(self, mint: str, price: float, pool_override: str = None) -> Position:
+    async def buy(self, mint: str, price: float, pool_override: Optional[str] = None) -> Position:
         # Valores ESTIMADOS a partir del precio de referencia -se usan
         # tal cual en modo SIMULADO, y como respaldo en modo REAL si no
         # se pudieron leer los datos reales de fill (ver más abajo).
@@ -116,7 +117,8 @@ class TradeExecutor:
         return Position(mint=mint, entry_price=entry_price, sol_amount=sol_amount,
                          token_amount=token_amount, entry_is_real_fill=real_fill)
 
-    async def sell(self, position: Position, price: float, reason: str, pool_override: str = None) -> None:
+    async def sell(self, position: Position, price: float, reason: str,
+                    pool_override: Optional[str] = None) -> None:
         # Valores ESTIMADOS a partir del precio de referencia -se usan
         # tal cual en modo SIMULADO, y como respaldo en modo REAL si no
         # se pudieron leer los datos reales de fill (ver más abajo).
@@ -172,9 +174,9 @@ class TradeExecutor:
                             f"{real_sol_received:.9f} SOL -> precio efectivo real: {exit_price:.10f} "
                             f"SOL/token.")
             else:
-                logger.warning(f"[REAL] No se pudieron confirmar los datos reales de la venta; "
-                                f"se usa el ESTIMADO (precio de referencia y token_amount de la "
-                                f"posición) para el PnL.")
+                logger.warning("[REAL] No se pudieron confirmar los datos reales de la venta; "
+                               "se usa el ESTIMADO (precio de referencia y token_amount de la "
+                               "posición) para el PnL.")
 
         # PnL calculado en SOL real gastado vs. SOL real recibido -no
         # como ratio de precios-, para que en modo REAL con datos reales

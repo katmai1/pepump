@@ -9,8 +9,6 @@ Tests de TrailingTakeProfitBot.run():
 """
 import asyncio
 
-import pytest
-
 from pepump.bot import TrailingTakeProfitBot
 
 from .conftest import FakeTradeStreamClient, SpyExecutor, make_config

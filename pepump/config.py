@@ -1,6 +1,9 @@
 from dataclasses import dataclass, fields
+import logging
 import os
 import tomllib
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -106,17 +109,10 @@ def load_config(path: str) -> AppConfig:
         section = raw.get(section_name, {})
         unknown = set(section) - valid_keys
         if unknown:
-            print(f"Aviso: claves desconocidas en el .toml para [{section_name}]: {sorted(unknown)}")
+            logger.warning(f"Claves desconocidas en el .toml para [{section_name}]: {sorted(unknown)}")
         merged.update({k: v for k, v in section.items() if k in valid_keys})
 
     config = AppConfig(**merged)
-
-    # Defensivo: un espacio, tab o salto de línea colado al copiar el mint
-    # (o la api_key) al .toml no rompe el parseo del TOML en sí, pero hace
-    # que el subscribeTokenTrade se acepte igual (PumpPortal no valida que
-    # el mint exista) y después nunca matchee ningún trade real -> el bot
-    # se queda esperando para siempre en silencio. Lo limpiamos acá.
-    #config.mint = config.mint.strip()
 
     # BUGFIX: el .toml de ejemplo y los mensajes de error de acá abajo
     # siempre dijeron que la api_key también se podía definir con la
@@ -128,9 +124,6 @@ def load_config(path: str) -> AppConfig:
     if not config.api_key:
         config.api_key = os.environ.get("PUMPPORTAL_API_KEY", "")
     config.api_key = config.api_key.strip()
-
-    # if not config.mint:
-    #     raise ValueError("Falta 'mint' en la sección [general] del archivo .toml")
 
     if not config.api_key:
         raise ValueError(

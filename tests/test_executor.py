@@ -1,6 +1,10 @@
+import csv
+import os
+
 import pytest
 
 from pepump.executor import Position, TradeExecutor
+from pepump.history import CSV_FIELDS
 
 
 def test_position_highest_price_starts_at_entry_price():
@@ -28,6 +32,7 @@ class DummyConfig:
     solana_rpc_url = "http://fake"
     tx_confirm_timeout_seconds = 30.0
     tx_confirm_poll_interval_seconds = 2.0
+    trade_history_csv = ""  # desactivado por default en estos tests
 
 
 class FakeLightningClient:
@@ -115,3 +120,52 @@ async def test_sell_live_failure_raises_and_position_stays_open():
         await executor.sell(pos, price=1.3, reason="trailing-stop")
 
     assert pos.closed is False
+
+
+async def test_sell_appends_row_to_trade_history_csv(tmp_path):
+    history_path = str(tmp_path / "history.csv")
+    config = DummyConfig()
+    config.trade_history_csv = history_path
+    client = FakeLightningClient()
+    executor = TradeExecutor(client=client, live=False, config=config)
+    pos = Position(mint="MintABC", entry_price=1.0, sol_amount=0.05, token_amount=0.05)
+
+    await executor.sell(pos, price=1.5, reason="trailing-stop")
+
+    with open(history_path, newline="", encoding="utf-8") as f:
+        rows = list(csv.reader(f))
+    assert rows[0] == CSV_FIELDS
+    row = dict(zip(CSV_FIELDS, rows[1]))
+    assert row["mint"] == "MintABC"
+    assert row["mode"] == "SIMULADO"
+    assert row["reason"] == "trailing-stop"
+    assert float(row["entry_price"]) == pytest.approx(1.0)
+    assert float(row["exit_price"]) == pytest.approx(1.5)
+    assert float(row["pnl_pct"]) == pytest.approx(50.0)
+
+
+async def test_sell_does_not_append_when_history_csv_disabled(tmp_path):
+    history_path = str(tmp_path / "history.csv")
+    config = DummyConfig()
+    config.trade_history_csv = ""  # deshabilitado explícitamente
+    client = FakeLightningClient()
+    executor = TradeExecutor(client=client, live=False, config=config)
+    pos = Position(mint="MintABC", entry_price=1.0, sol_amount=0.05, token_amount=0.05)
+
+    await executor.sell(pos, price=1.5, reason="trailing-stop")
+
+    assert not os.path.exists(history_path)
+
+
+async def test_failed_live_sell_does_not_append_to_history(tmp_path):
+    history_path = str(tmp_path / "history.csv")
+    config = DummyConfig()
+    config.trade_history_csv = history_path
+    client = FakeLightningClient(exc=RuntimeError("slippage excedido"))
+    executor = TradeExecutor(client=client, live=True, config=config)
+    pos = Position(mint="MintABC", entry_price=1.0, sol_amount=0.05, token_amount=0.05)
+
+    with pytest.raises(RuntimeError):
+        await executor.sell(pos, price=1.3, reason="trailing-stop")
+
+    assert not os.path.exists(history_path)

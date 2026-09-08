@@ -549,15 +549,6 @@ class PumpCurveOnChainClient:
         )
         return pda
 
-    async def fetch_price_for_mint(self, mint: str) -> Optional[float]:
-        """Versión simple: solo el precio (o None). Para el caso normal
-        de polling con una posición ya abierta on-chain (ver
-        _poll_onchain_price_loop en bot.py) -si la curva ya completó,
-        el llamador que necesite enterarse de eso debe usar
-        fetch_price_or_status en su lugar."""
-        price, _complete, _exists = await self.fetch_price_or_status(mint)
-        return price
-
     async def fetch_price_or_status(self, mint: str) -> tuple[Optional[float], bool, bool]:
         """Devuelve (price, complete, exists):
           - exists=False: no existe cuenta de bonding curve para este
@@ -727,8 +718,13 @@ class PumpSwapOnChainClient:
             return str(accounts[0].pubkey)
 
         # Más de un pool para el mismo mint: nos quedamos con el de mayor
-        # lp_supply comparando el account data crudo (evita otro round-trip
-        # de RPC por cada candidato).
+        # lp_supply.
+        #
+        # OJO: fetch_pool_state() hace su propio getAccountInfo, así que
+        # esto cuesta UN round-trip de RPC por candidato. El account data
+        # crudo ya viene en acc.account.data del getProgramAccounts de
+        # arriba, así que se podría parsear localmente y ahorrarlos todos
+        # -pendiente, ver PumpSwapPoolStateNew/Old en pumpswapamm.
         best_pubkey = None
         best_lp_supply = -1
         for acc in accounts:

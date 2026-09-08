@@ -9,7 +9,6 @@ bloquear la compra.
 """
 import asyncio
 
-import pytest
 from solders.signature import Signature
 from solders.transaction_status import TransactionConfirmationStatus
 

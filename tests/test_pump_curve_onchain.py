@@ -176,18 +176,3 @@ def test_excepcion_de_red_no_propaga(monkeypatch):
     assert price is None
     assert complete is False
     assert exists is False
-
-
-def test_fetch_price_for_mint_devuelve_solo_el_precio(monkeypatch):
-    data = _make_account_data(
-        virtual_token_reserves=1_073_000_000 * 10**6,
-        virtual_sol_reserves=30 * 10**9,
-        complete=False,
-    )
-    fake_client = FakeAsyncClient(FakeAccountInfoResp(FakeAccountInfoValue(data)))
-    monkeypatch.setattr(pump_module, "AsyncClient", lambda url: fake_client)
-
-    client = PumpCurveOnChainClient("http://fake-rpc")
-    price = asyncio.run(client.fetch_price_for_mint(FAKE_MINT))
-
-    assert abs(price - (30 / 1_073_000_000)) < 1e-12

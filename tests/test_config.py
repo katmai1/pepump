@@ -1,6 +1,17 @@
+import dataclasses
+import logging
+import pathlib
+import tomllib
+
 import pytest
 
-from pepump.config import load_config
+from pepump.config import AppConfig, load_config
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+CONFIG_SECTIONS = ("general", "trade", "strategy", "pumpportal", "onchain")
+# `mint` es el único campo de AppConfig que NO va en el .toml: siempre
+# llega por la línea de comandos (-m/--mint, required en run.py).
+FIELDS_NOT_IN_TOML = {"mint"}
 
 
 def write_toml(tmp_path, content: str):
@@ -90,7 +101,7 @@ def test_load_config_strips_whitespace_from_api_key(tmp_path, monkeypatch):
     assert cfg.api_key == "con-espacios"
 
 
-def test_load_config_unknown_keys_are_ignored_but_warned(tmp_path, capsys):
+def test_load_config_unknown_keys_are_ignored_but_warned(tmp_path, caplog):
     path = write_toml(tmp_path, """
 [general]
 live = false
@@ -101,5 +112,55 @@ api_key = "abc"
 """)
     cfg = load_config(path)
     assert not hasattr(cfg, "clave_inventada")
-    captured = capsys.readouterr()
-    assert "clave_inventada" in captured.out
+    # Se avisa por logging (nunca por print(), ver logging_config.py).
+    assert any("clave_inventada" in r.getMessage() for r in caplog.records)
+    assert all(r.levelno >= logging.WARNING for r in caplog.records)
+
+
+# --------------------------------------------------------------------------- #
+# config.toml.example <-> AppConfig
+# --------------------------------------------------------------------------- #
+
+def _example_keys() -> set:
+    raw = tomllib.loads((REPO_ROOT / "config.toml.example").read_text(encoding="utf-8"))
+    keys = set()
+    for section in CONFIG_SECTIONS:
+        keys |= set(raw.get(section, {}))
+    return keys
+
+
+def test_example_toml_documenta_todos_los_campos_de_appconfig():
+    """El .example es la única documentación de las opciones: si se agrega
+    un campo a AppConfig y no se documenta acá, nadie se entera de que
+    existe (y el default queda enterrado en el código)."""
+    declared = {f.name for f in dataclasses.fields(AppConfig)} - FIELDS_NOT_IN_TOML
+    missing = sorted(declared - _example_keys())
+    assert not missing, f"Faltan en config.toml.example: {missing}"
+
+
+def test_example_toml_no_tiene_claves_que_ya_no_existen():
+    """Al revés: una clave que quedó en el .example después de sacarla de
+    AppConfig hace que load_config avise 'clave desconocida' a todo el que
+    copie el ejemplo tal cual."""
+    declared = {f.name for f in dataclasses.fields(AppConfig)}
+    extra = sorted(_example_keys() - declared)
+    assert not extra, f"Sobran en config.toml.example: {extra}"
+
+
+def test_example_toml_carga_sin_errores(tmp_path):
+    """El ejemplo tiene que ser un .toml válido y cargable tal cual (con
+    una api_key puesta), no solo un archivo de comentarios."""
+    text = (REPO_ROOT / "config.toml.example").read_text(encoding="utf-8")
+    text = text.replace('api_key = ""', 'api_key = "clave-de-prueba"')
+    path = tmp_path / "config.toml"
+    path.write_text(text, encoding="utf-8")
+
+    cfg = load_config(str(path))
+
+    assert cfg.api_key == "clave-de-prueba"
+    # Los valores del ejemplo son los mismos defaults de AppConfig.
+    defaults = AppConfig(api_key="clave-de-prueba")
+    for field in dataclasses.fields(AppConfig):
+        if field.name in FIELDS_NOT_IN_TOML:
+            continue
+        assert getattr(cfg, field.name) == getattr(defaults, field.name), field.name

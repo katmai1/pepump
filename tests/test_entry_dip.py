@@ -4,6 +4,7 @@ precio de referencia (comportamiento de siempre). Si es > 0, esperar a
 que el precio baje ese %% desde la referencia antes de comprar.
 """
 import asyncio
+import logging
 
 from pepump.bot import TrailingTakeProfitBot
 from tests.conftest import FakeTradeStreamClient, SpyExecutor, make_config
@@ -71,6 +72,44 @@ def test_entry_dip_pct_reconecta_si_se_corta_mientras_espera_la_baja():
     price = asyncio.run(scenario())
     assert price == 0.9
     assert client.connect_calls == 2
+
+
+def test_entry_dip_pct_reconecta_ante_un_error_de_red_no_limpio(caplog):
+    """Igual que el test de arriba, pero cuando el feed se cae con un
+    error de red de verdad (no un cierre limpio del server). Las dos
+    ramas comparten el mismo `except Exception`, así que este test fija
+    que un error crudo también reconecta -y que el log dice 'conexión
+    interrumpida' con el error adentro, no 'la conexión se cerró'."""
+
+    class BoomThenRecoverClient(FakeTradeStreamClient):
+        """Primera conexión: entrega la referencia y después revienta con
+        un error de red. Segunda: entrega el precio que dispara la compra."""
+
+        async def iter_trade_events(self, ws):
+            if self.sockets.index(ws) == 0:
+                yield {"price": 1.0}
+                raise ConnectionResetError("el socket se murió (fake)")
+            yield {"price": 0.9}
+
+    client = BoomThenRecoverClient()
+    executor = SpyExecutor()
+    cfg = make_config(entry_dip_pct=5.0)
+    bot = TrailingTakeProfitBot(client, executor, cfg)
+
+    async def scenario():
+        bot._ws = await client.connect_trade_stream(cfg.mint)
+        bot._trade_events = client.iter_trade_events(bot._ws)
+        return await bot._get_initial_price()
+
+    with caplog.at_level(logging.WARNING):
+        price = asyncio.run(scenario())
+
+    assert price == 0.9
+    assert client.connect_calls == 2
+    mensajes = " | ".join(r.getMessage() for r in caplog.records)
+    assert "conexión interrumpida" in mensajes
+    assert "el socket se murió (fake)" in mensajes
+    assert "la conexión se cerró" not in mensajes
 
 
 def test_log_dip_wait_progress_calcula_el_porcentaje_que_falta(caplog):

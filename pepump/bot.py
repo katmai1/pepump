@@ -128,7 +128,6 @@ class TrailingTakeProfitBot:
                              f"(¿Windows?); el cierre ordenado con venta automática no va a "
                              f"funcionar para esta señal.")
 
-        tasks = []
         # OJO: connect_trade_stream ya deja el subscribe MANDADO del lado
         # de PumpPortal apenas conecta. Si algo revienta después de esto y
         # antes de que el finally pueda correr, la conexión queda
@@ -351,12 +350,9 @@ class TrailingTakeProfitBot:
         else:
             next_task = self._pending_next_event_task
         shutdown_task = asyncio.ensure_future(self._shutdown_requested.wait())
-        try:
-            done, _pending = await asyncio.wait(
-                {next_task, shutdown_task}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
-            )
-        finally:
-            pass
+        done, _pending = await asyncio.wait(
+            {next_task, shutdown_task}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+        )
 
         if shutdown_task in done:
             next_task.cancel()
@@ -647,7 +643,10 @@ class TrailingTakeProfitBot:
                     return None
                 except asyncio.CancelledError:
                     raise
-                except (StopAsyncIteration, Exception) as e:
+                except Exception as e:
+                    # StopAsyncIteration (cierre "limpio" del server) ya
+                    # entra por acá: es subclase de Exception. Solo se
+                    # distingue para el texto del log.
                     is_clean_close = isinstance(e, StopAsyncIteration)
                     logger.warning(f"[Feed en vivo] {'la conexión se cerró' if is_clean_close else f'conexión interrumpida ({e})'} "
                                    f"mientras se esperaba la baja de entrada; reconectando...")
@@ -898,7 +897,6 @@ class TrailingTakeProfitBot:
                      f"ni de un pool de PumpSwap ni de la bonding curve -> probablemente solo poco "
                      f"volumen, sigo esperando el feed en vivo.")
         return False
-        return True
 
     async def _status_printer_loop(self) -> None:
         """Imprime el %% de profit actual cada `status_interval_seconds`, sin

@@ -17,6 +17,12 @@ live = false
 # Se crea solo si no existe. "" desactiva el historial.
 trade_history_csv = "trade_history.csv"
 
+# Cada cuántos segundos se imprime el estado de la posición (precio actual,
+# máximo, nivel de venta y PnL %%), sin depender de que lleguen trades nuevos
+# en ese momento. También marca el ritmo del log de espera cuando
+# entry_dip_pct > 0.
+status_interval_seconds = 5.0
+
 [trade]
 # Cantidad de SOL a comprar.
 buy_sol = 0.05
@@ -62,6 +68,14 @@ entry_dip_pct = 0.0
 api_key = ""
 
 [onchain]
+# Cuántos segundos se espera el precio por el feed en vivo ANTES de recurrir
+# al fallback on-chain, PARA LA ENTRADA (todavía sin posición abierta). Solo
+# cuenta desde que llegó el ack de suscripción: si ya llegó el ack pero no
+# aparece ningún trade real, lo más probable es que el mint ya haya migrado
+# a PumpSwap, caso que subscribeTokenTrade no cubre. Mientras el mint sigue
+# en bonding curve el feed funciona bien y esto casi nunca se cumple.
+live_feed_timeout_seconds = 5.0
+
 # Si pasan estos segundos sin ningún trade nuevo por subscribeTokenTrade
 # CON LA POSICIÓN YA ABIERTA, el bot sospecha que el mint migró de la
 # bonding curve de pump.fun a PumpSwap a mitad de camino (el socket sigue
@@ -88,3 +102,12 @@ solana_rpc_url = "https://api.mainnet-beta.solana.com"
 # del ack de suscripción: ciclos de live_feed_timeout_seconds + intentos de
 # fallback on-chain, uno tras otro, hasta cumplir este total.
 entry_wait_timeout_seconds = 60.0
+
+# Después de mandar una compra/venta REAL a la Lightning API, cuántos
+# segundos se espera a que la transacción confirme on-chain antes de darla
+# por fallida, y cada cuánto se consulta su estado mientras tanto. Hace
+# falta porque PumpPortal puede devolver un 200 OK con firma de forma
+# "optimista", antes de saber si la tx va a confirmar o a revertir (p. ej.
+# por slippage excedido).
+tx_confirm_timeout_seconds = 30.0
+tx_confirm_poll_interval_seconds = 2.0

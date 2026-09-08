@@ -1,5 +1,8 @@
-
-config.toml
-*.pyc
+# Config local con la api_key real (el config.toml.example SÍ se versiona).
 *.toml
+
+# Historial de órdenes cerradas (ver general.trade_history_csv).
 *.csv
+
+__pycache__/
+*.pyc

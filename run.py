@@ -70,7 +70,7 @@ from pepump.executor import TradeExecutor
 from pepump.bot import TrailingTakeProfitBot
 from pepump.logging_config import setup_logging
 
-logger = logging.getLogger()
+logger = logging.getLogger(__name__)
 
 
 # Opciones
@@ -84,15 +84,21 @@ def parse_args():
     return p.parse_args()
 
 def show_header(live):
-    print("="*50)
-    print(f"\t PePump | Modo {"REAL" if live else "SIMULADO"}")
+    # Sin print(): todo sale por el mismo logger que el resto del bot, así
+    # el banner queda en el archivo/redirección junto a las operaciones.
+    # Las comillas del modo van en una variable aparte a propósito: un
+    # f-string con comillas dobles anidadas solo compila en Python 3.12+
+    # (PEP 701), y este proyecto arranca en 3.11 (tomllib).
+    modo = "REAL" if live else "SIMULADO"
+    logger.info("=" * 50)
+    logger.info(f"\t PePump | Modo {modo}")
     if live:
         logger.warning("⚠️  MODO REAL ACTIVADO (general.live = true en el .toml). Vas a operar con SOL real.")
         logger.warning("    Presiona Ctrl+C ahora para detenerlo.")
         time.sleep(3)
-    print("="*50)
-    
-    
+    logger.info("=" * 50)
+
+
 # logica inicial
 if __name__ == "__main__":
     args = parse_args()
