@@ -54,7 +54,29 @@ class Position:
         self.highest_price = self.market_entry_price
 
     def pnl_pct(self, price: float) -> float:
+        """PnL NETO: cuánto ganarías/perderías de verdad si vendieras a
+        `price`, medido contra el precio EFECTIVO que pagaste. Con datos
+        reales de fill eso incluye la comisión de pump.fun, la de
+        PumpPortal, el priority fee y el rent de crear la cuenta de
+        token -por eso arranca en negativo aunque el precio no se haya
+        movido."""
         return (price / self.entry_price - 1.0) * 100.0
+
+    def market_pnl_pct(self, price: float) -> float:
+        """PnL de MERCADO: cuánto se movió el precio desde que compraste,
+        sin contar ningún coste de la operación. Es el número comparable
+        con el que muestra pump.fun (y con el que se miden los umbrales
+        de la estrategia)."""
+        return (price / self.market_entry_price - 1.0) * 100.0
+
+    def entry_cost_pct(self) -> float:
+        """Cuánto por encima del precio de mercado te salió entrar, en %.
+        0 si no hay datos reales de fill (ahí ambos precios son el
+        mismo). Es exactamente la brecha entre `market_pnl_pct` y
+        `pnl_pct`."""
+        if not self.market_entry_price:
+            return 0.0
+        return (self.entry_price / self.market_entry_price - 1.0) * 100.0
 
 
 # --------------------------------------------------------------------------- #
@@ -126,12 +148,18 @@ class TradeExecutor:
                 entry_price = real_sol_spent / real_token_amount
                 real_fill = True
                 sobrecoste_pct = ((entry_price / price - 1.0) * 100.0) if price > 0 else 0.0
+                sobrecoste_sol = real_sol_spent - self.cfg.buy_sol
                 logger.info(f"[REAL] Datos REALES de la compra (de la tx confirmada, incluyen fees): "
                             f"gastaste {real_sol_spent:.9f} SOL y recibiste {real_token_amount:,.6f} "
                             f"tokens -> precio efectivo real: {entry_price:.10f} SOL/token "
                             f"({sobrecoste_pct:+.2f}% vs. el precio de mercado de referencia "
-                            f"{price:.10f}; la diferencia son comisiones, slippage y el rent de la "
-                            f"cuenta de token).")
+                            f"{price:.10f}).")
+                logger.info(f"[REAL] Coste de entrar: {sobrecoste_sol:+.9f} SOL sobre los "
+                            f"{self.cfg.buy_sol:.9f} SOL de la orden (comisión de pump.fun, comisión "
+                            f"de PumpPortal, priority fee, fee de red y el rent de la cuenta de token "
+                            f"-este último, ~0.002 SOL, vuelve al cerrarse la cuenta al vender). Por "
+                            f"eso el % que muestra pump.fun -que es solo movimiento de precio- va a "
+                            f"ir {sobrecoste_pct:+.2f}% por encima del PnL neto de pepump.")
             else:
                 logger.warning(f"[REAL] No se pudieron confirmar los datos reales de la compra; "
                                 f"se usa el ESTIMADO (precio de referencia {price:.10f} SOL/token, "
@@ -233,9 +261,14 @@ class TradeExecutor:
         pnl_pct = (pnl_sol / position.sol_amount * 100.0) if position.sol_amount > 0 else 0.0
         etiqueta = "REAL" if self.live else "SIMULADO"
         sufijo = " [datos reales]" if real_fill else (" [estimado]" if self.live else "")
+        # Se loguean los DOS números porque miden cosas distintas y no
+        # coinciden en cuanto hay costes reales de por medio: el de
+        # mercado es cuánto se movió el precio (el que muestra pump.fun),
+        # el neto es lo que de verdad entró y salió de la wallet.
+        pnl_mercado = position.market_pnl_pct(exit_price)
         logger.info(f"[{etiqueta}] VENTA de {position.mint} a precio {exit_price:.10f} SOL/token "
-                    f"| motivo: {reason} | PnL: {pnl_pct:+.2f}% ({pnl_sol:+.9f} SOL) "
-                    f"| SOL recibidos: {proceeds:.9f}{sufijo}")
+                    f"| motivo: {reason} | mercado: {pnl_mercado:+.2f}% | PnL neto: {pnl_pct:+.2f}% "
+                    f"({pnl_sol:+.9f} SOL) | SOL recibidos: {proceeds:.9f}{sufijo}")
         position.closed = True
 
         # Historial de órdenes cerradas: se registra DESPUÉS de marcar

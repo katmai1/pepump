@@ -76,3 +76,25 @@ def test_append_does_not_raise_on_unwritable_path(tmp_path, monkeypatch, caplog)
     with caplog.at_level("WARNING"):
         append_closed_trade(bad_path, _row())
     assert "No se pudo escribir" in caplog.text
+
+
+def test_append_closed_trade_no_propaga_errores_no_os(tmp_path, monkeypatch, caplog):
+    """El contrato es no propagar NADA: si la escritura falla por algo
+    que no es un OSError (un csv.Error, un valor raro en la fila), la
+    excepción llegaba hasta bot._try_sell(), que la leía como 'la venta
+    falló' -cuando la venta ya se había ejecutado y la posición ya
+    estaba marcada como cerrada."""
+    import csv as csv_module
+
+    from pepump import history as history_module
+
+    def writerow_que_revienta(self, row):
+        raise csv_module.Error("fila imposible de escribir (fake)")
+
+    monkeypatch.setattr(history_module.csv.DictWriter, "writerow", writerow_que_revienta)
+
+    destino = tmp_path / "trades.csv"
+    with caplog.at_level("WARNING"):
+        history_module.append_closed_trade(str(destino), {"mint": "M"})  # no debe lanzar
+
+    assert any("historial de órdenes cerradas" in rec.message for rec in caplog.records)

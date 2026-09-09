@@ -233,3 +233,56 @@ async def test_stop_loss_inicial_tambien_se_mide_contra_el_precio_de_mercado():
 
     await bot._on_price_update(0.74)   # -26%: ahora sí
     assert spy.sell_calls == 1
+
+
+# --------------------------------------------------------------------------- #
+# Los dos porcentajes: movimiento de mercado vs. PnL neto
+# --------------------------------------------------------------------------- #
+
+def test_market_pnl_pct_y_pnl_pct_se_separan_por_el_coste_de_entrada():
+    """El % de pump.fun es puro movimiento de precio (market_pnl_pct); el
+    de pepump con datos reales descuenta lo que costó entrar (pnl_pct).
+    La brecha entre los dos es constante y es exactamente
+    entry_cost_pct()."""
+    # Mercado a 1.0, pero entrar costó un 5% más (comisiones + rent).
+    pos = Position(mint="M", entry_price=1.05, sol_amount=0.0525,
+                   token_amount=0.05, market_entry_price=1.0,
+                   entry_is_real_fill=True)
+
+    assert pos.entry_cost_pct() == pytest.approx(5.0)
+    # Precio +20% de mercado -> pump.fun diría +20%, el neto es menor.
+    assert pos.market_pnl_pct(1.20) == pytest.approx(20.0)
+    assert pos.pnl_pct(1.20) == pytest.approx(1.20 / 1.05 * 100 - 100)
+    # Y sin moverse el precio, el neto ya arranca en negativo.
+    assert pos.market_pnl_pct(1.0) == pytest.approx(0.0)
+    assert pos.pnl_pct(1.0) < 0
+
+
+def test_sin_fill_real_los_dos_porcentajes_coinciden():
+    """En simulado (o si no se pudieron leer los datos reales) no hay
+    coste que descontar: los dos números tienen que dar lo mismo, como
+    siempre."""
+    pos = Position(mint="M", entry_price=2.0, sol_amount=0.05, token_amount=0.025)
+
+    assert pos.entry_cost_pct() == pytest.approx(0.0)
+    assert pos.pnl_pct(2.4) == pytest.approx(pos.market_pnl_pct(2.4))
+
+
+async def test_log_de_venta_muestra_mercado_y_neto(caplog):
+    """La línea de venta tiene que traer los dos números, para poder
+    comparar de un vistazo con lo que muestra pump.fun."""
+    client = FakeLightningClient(result={
+        "signature": "xyz",
+        "actual_sol_delta": 0.055,
+        "actual_token_delta": -1000.0,
+    })
+    executor = TradeExecutor(client=client, live=True, config=DummyConfig())
+    pos = Position(mint="M", entry_price=0.0000525, sol_amount=0.0525,
+                   token_amount=1000.0, market_entry_price=0.00005,
+                   entry_is_real_fill=True)
+
+    with caplog.at_level("INFO"):
+        await executor.sell(pos, price=0.000055, reason="trailing-stop")
+
+    assert "mercado:" in caplog.text
+    assert "PnL neto:" in caplog.text

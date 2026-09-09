@@ -143,3 +143,90 @@ def test_handle_feed_stall_bonding_curve_da_precio_de_seguridad(monkeypatch):
     assert bot._onchain_source is None  # NO pasa a modo polling on-chain
     assert bot.latest_price == pytest.approx(1.05)
     assert bot.position.closed is False  # 1.05 no dispara ni stop-loss ni trailing
+
+
+# --------------------------------------------------------------------------- #
+# Feed muerto para un mint que sigue en bonding curve
+# --------------------------------------------------------------------------- #
+#
+# Un stall aislado es probablemente una pausa de volumen y no justifica
+# abandonar el feed en vivo. Pero si se repiten, el trailing-stop pasa a
+# evaluarse solo una vez cada `stall_timeout_seconds` (20s por defecto):
+# demasiada ceguera con la posición abierta. A partir del segundo stall
+# seguido se pasa a polling on-chain de la curva.
+
+def test_stalls_repetidos_con_la_curva_viva_pasan_a_polling_onchain(monkeypatch):
+    executor = SpyExecutor()
+    cfg = make_config(
+        stall_timeout_seconds=0.05,
+        onchain_poll_interval_seconds=0.02,
+        activation_pct=10.0,
+        trailing_pct=15.0,
+        initial_stop_pct=25.0,
+    )
+    bot = TrailingTakeProfitBot(client=None, executor=executor, config=cfg)
+    bot.position = Position(mint=cfg.mint, entry_price=1.0, sol_amount=0.05, token_amount=0.05)
+
+    # Nunca hay pool de PumpSwap: el mint sigue en bonding curve.
+    monkeypatch.setattr(bot_module, "PumpSwapOnChainClient",
+                         lambda rpc_url: FakeOnChainClient(rpc_url, [None]))
+
+    # La curva responde: 1.02 (primer stall, solo red de seguridad),
+    # 1.20 (segundo stall -> pasa a polling y arma el trailing),
+    # 1.30 (nuevo máximo, stop en 1.105), 0.90 (retrocede -> vende).
+    precios = iter([1.02, 1.20, 1.30, 0.90])
+    ultimo = [1.02]
+
+    class CurvaConSecuencia(FakeCurveOnChainClient):
+        async def fetch_price_or_status(self, mint):
+            self.calls += 1
+            ultimo[0] = next(precios, ultimo[0])
+            return ultimo[0], False, True
+
+    monkeypatch.setattr(bot_module, "PumpCurveOnChainClient",
+                         lambda rpc_url: CurvaConSecuencia(rpc_url))
+
+    async def escenario():
+        # Primer stall: red de seguridad, sigue esperando el feed en vivo.
+        primero = await bot._handle_feed_stall()
+        assert primero is False
+        assert bot._onchain_source is None
+        assert bot.latest_price == pytest.approx(1.02)
+
+        # Segundo stall seguido: deja el feed y hace polling hasta cerrar.
+        return await bot._handle_feed_stall()
+
+    resultado = asyncio.run(asyncio.wait_for(escenario(), timeout=2.0))
+
+    assert resultado is True
+    assert bot._onchain_source == "bondingcurve"
+    assert executor.sell_calls == 1
+    assert bot.position.closed is True
+
+
+def test_un_trade_real_reinicia_el_contador_de_stalls():
+    """Si el feed vuelve a entregar, los stalls acumulados no cuentan:
+    hacen falta otros dos seguidos para abandonarlo."""
+    cfg = make_config(stall_timeout_seconds=0.05, activation_pct=10.0, initial_stop_pct=25.0)
+    bot = TrailingTakeProfitBot(client=None, executor=SpyExecutor(), config=cfg)
+    bot.position = Position(mint=cfg.mint, entry_price=1.0, sol_amount=0.05, token_amount=0.05)
+    bot._curve_stalls = 1
+
+    async def un_evento():
+        yield {"price": 1.01}
+
+    bot._trade_events = un_evento()
+    bot.client = type("C", (), {"extract_price": staticmethod(lambda e: e.get("price"))})()
+
+    # El stream entrega un trade y después se agota (StopAsyncIteration ->
+    # intento de reconexión, que falla porque no hay cliente real). Lo que
+    # importa es que el evento bueno pasó por el reseteo del contador.
+    async def correr():
+        try:
+            await asyncio.wait_for(bot._consume_trade_stream(), timeout=0.3)
+        except Exception:
+            pass
+
+    asyncio.run(correr())
+
+    assert bot._curve_stalls == 0

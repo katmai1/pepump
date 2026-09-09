@@ -14,6 +14,17 @@ logger = logging.getLogger(__name__)
 # más probables (wallet sin fondos, api_key inválida, token sin volumen).
 _DIAGNOSTIC_REMINDER_SECONDS = 10.0
 
+# Cuántos "stalls" SEGUIDOS del feed en vivo (sin migración a PumpSwap,
+# con la bonding curve todavía activa) se toleran antes de dejar de
+# confiar en subscribeTokenTrade para esta posición y pasar a polling
+# on-chain. Uno solo puede ser una pausa normal de volumen; varios
+# seguidos significan que el feed no está entregando nada para este
+# mint aunque el token siga vivo -y mientras tanto el trailing-stop
+# solo se evalúa una vez cada `stall_timeout_seconds`, que con el
+# default son 20s de ceguera por precio. Se reinicia en cuanto vuelve
+# a llegar un trade real (ver _consume_trade_stream).
+_MAX_CURVE_STALLS_BEFORE_POLLING = 2
+
 
 class _ShutdownRequested(Exception):
     """Señal interna: se pidió apagado (Ctrl+C/SIGTERM) mientras se
@@ -62,6 +73,9 @@ class TrailingTakeProfitBot:
         #                     precio directo del pool on-chain (ver
         #                     PumpSwapOnChainClient).
         self._onchain_source: Optional[str] = None
+        # Stalls SEGUIDOS del feed en vivo con la bonding curve todavía
+        # activa (ver _handle_feed_stall y _MAX_CURVE_STALLS_BEFORE_POLLING).
+        self._curve_stalls = 0
         # Se activa con Ctrl+C (SIGINT) o SIGTERM (ver run()). NO se usa
         # el try/except KeyboardInterrupt clásico porque en asyncio esa
         # señal interrumpe el loop de eventos "por afuera" de la
@@ -828,6 +842,9 @@ class TrailingTakeProfitBot:
                     self.latest_price = price
                     await self._on_price_update(price)
                     backoff = 2.0  # se recibió un evento bueno: reseteamos el backoff
+                    # El feed volvió a entregar: los stalls acumulados ya
+                    # no cuentan como "el feed está muerto para este mint".
+                    self._curve_stalls = 0
                 # (inalcanzable: el while True interno solo se sale por return)
             except _ShutdownRequested:
                 return
@@ -916,6 +933,28 @@ class TrailingTakeProfitBot:
         curve = PumpCurveOnChainClient(self.cfg.solana_rpc_url)
         curve_price, complete, exists = await curve.fetch_price_or_status(self.mint)
         if curve_price is not None and not complete:
+            self._curve_stalls += 1
+            if self._curve_stalls >= _MAX_CURVE_STALLS_BEFORE_POLLING:
+                # El feed lleva varios ciclos sin entregar NADA para un
+                # mint que sigue perfectamente vivo en la curva. Seguir
+                # esperándolo significa evaluar el trailing-stop una vez
+                # cada stall_timeout_seconds (20s por defecto): demasiado
+                # lento para una memecoin. Pasamos a polling on-chain de
+                # la bonding curve, que es la MISMA fuente contra la que
+                # se ejecuta el trade, cada onchain_poll_interval_seconds.
+                logger.warning(f"[Feed de trades de PumpPortal] {self._curve_stalls} ciclos seguidos "
+                               f"sin trades ({self.cfg.stall_timeout_seconds:.0f}s cada uno) con la "
+                               f"bonding curve todavía activa -> dejo de depender del feed en vivo "
+                               f"para esta posición y paso a leer el precio de la curva on-chain cada "
+                               f"{self.cfg.onchain_poll_interval_seconds:.0f}s.")
+                self._onchain_source = "bondingcurve"
+                self.latest_price = curve_price
+                await self._on_price_update(curve_price)
+                if self.position is None or self.position.closed:
+                    return True
+                await self._poll_onchain_price_loop()
+                return True
+
             logger.info(f"[Feed de trades de PumpPortal] sin trades nuevos hace "
                         f"{self.cfg.stall_timeout_seconds:.0f}s, pero la bonding curve sigue activa "
                         f"con precio válido on-chain ({curve_price:.10f} SOL/token) -> lo uso como "
@@ -940,21 +979,32 @@ class TrailingTakeProfitBot:
             if self.position is None or self.position.closed or self.latest_price is None:
                 continue
             pos = self.position
-            pnl = pos.pnl_pct(self.latest_price)
+            # DOS porcentajes a propósito, porque miden cosas distintas y
+            # confundirlos hace parecer que el bot calcula mal:
+            #   - "mercado": cuánto se movió el precio desde la compra. Es
+            #     el número que muestra pump.fun y el que usan los
+            #     umbrales de la estrategia.
+            #   - "neto": lo que realmente te llevarías vendiendo ahora,
+            #     contando lo que costó entrar (comisiones de pump.fun y
+            #     PumpPortal, priority fee y rent de la cuenta de token).
+            # La brecha entre los dos es fija: pos.entry_cost_pct().
+            pnl = pos.market_pnl_pct(self.latest_price)
+            neto = (f" | neto {pos.pnl_pct(self.latest_price):+.2f}%"
+                    if pos.entry_is_real_fill else "")
             if pos.armed:
                 stop_price = pos.highest_price * (1 - self.cfg.trailing_pct / 100.0)
                 logger.info(f"⏱️  [armado] precio {self.latest_price:.10f} | máximo {pos.highest_price:.10f} "
-                            f"| nivel de venta {stop_price:.10f} | PnL: {pnl:+.2f}%")
+                            f"| nivel de venta {stop_price:.10f} | mercado: {pnl:+.2f}%{neto}")
             else:
                 # `entrada` es el precio de MERCADO contra el que se mide
-                # la activación; si la compra trae datos reales de fill,
-                # el PnL sale del precio EFECTIVO pagado (con comisiones),
-                # así que se muestra aparte para que no parezca un error
-                # ver PnL negativo con el precio clavado en la entrada.
+                # la activación; el precio EFECTIVO pagado (con
+                # comisiones) se muestra aparte para que no parezca un
+                # error ver el neto en negativo con el precio clavado en
+                # la entrada.
                 coste = (f" | coste real {pos.entry_price:.10f}" if pos.entry_is_real_fill else "")
                 logger.info(f"⏱️  [esperando activación +{self.cfg.activation_pct}%] "
                             f"precio {self.latest_price:.10f} | entrada {pos.market_entry_price:.10f}"
-                            f"{coste} | PnL: {pnl:+.2f}%")
+                            f"{coste} | mercado: {pnl:+.2f}%{neto}")
 
     def _current_pool_override(self) -> Optional[str]:
         """Si ya confirmamos -sea al entrar (_try_onchain_fallback) o a
@@ -989,7 +1039,10 @@ class TrailingTakeProfitBot:
         pos = self.position
         if pos is None or pos.closed:
             return
-        pnl = pos.pnl_pct(price)
+        # Movimiento de MERCADO desde la compra: es lo que miden los
+        # umbrales de acá abajo y lo que muestra pump.fun. El neto (con
+        # los costes de entrada) lo imprime el status printer aparte.
+        pnl = pos.market_pnl_pct(price)
 
         # --- Caso 1: todavía no se armó el trailing-stop ------------------ #
         #

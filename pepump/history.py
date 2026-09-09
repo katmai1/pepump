@@ -54,5 +54,14 @@ def append_closed_trade(path: str, row: dict) -> None:
             if write_header:
                 writer.writeheader()
             writer.writerow(row)
-    except OSError as e:
+    except Exception as e:
+        # A propósito `Exception` y no solo `OSError`: el contrato de
+        # esta función es NO propagar nada. Un csv.Error, un valor no
+        # serializable colado en `row` o cualquier otra sorpresa se
+        # escapaba hacia arriba, y como esto se llama desde
+        # TradeExecutor.sell() DESPUÉS de marcar la posición cerrada, la
+        # excepción llegaba a bot._try_sell() -que la interpreta como
+        # "la venta falló"-: se logueaba una venta fallida que en
+        # realidad se ejecutó, y no se seteaba `_closed_event`. Un
+        # problema al escribir un CSV no puede tener ese efecto.
         logger.warning(f"No se pudo escribir en el historial de órdenes cerradas ({path}): {e}")
