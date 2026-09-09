@@ -15,6 +15,20 @@ class Position:
     entry_price: float                 # precio en SOL por token, al comprar
     sol_amount: float                  # SOL invertidos
     token_amount: float                # tokens obtenidos
+    # Precio de MERCADO de referencia en el momento de comprar (el que
+    # venía del feed/on-chain). Se separa de `entry_price` porque, con
+    # datos reales de fill, `entry_price` es el precio EFECTIVO pagado
+    # e incluye todos los costes de la tx (fee de pump.fun, priority
+    # fee, y el rent de crear la ATA del token -~0.002 SOL, que sobre
+    # una compra de 0.05 SOL ya es un 4%). Ese precio efectivo es el
+    # correcto para calcular el PnL real, pero NO para los umbrales de
+    # la estrategia: comparar el precio de mercado actual contra un
+    # precio inflado por comisiones desplaza en silencio la activación
+    # del trailing y el stop-loss inicial. Los umbrales usan esto; el
+    # PnL usa entry_price. Si no se pasa, vale lo mismo que entry_price
+    # (modo simulado, o compra real sin fill real -> comportamiento
+    # idéntico al de antes).
+    market_entry_price: Optional[float] = None
     highest_price: float = field(init=False)
     armed: bool = False                # ¿ya se activó el trailing stop?
     closed: bool = False
@@ -33,7 +47,11 @@ class Position:
     opened_at: float = field(default_factory=time.time)
 
     def __post_init__(self):
-        self.highest_price = self.entry_price
+        if self.market_entry_price is None or self.market_entry_price <= 0:
+            self.market_entry_price = self.entry_price
+        # El máximo se compara siempre contra precios de MERCADO, así que
+        # arranca en el precio de mercado de la entrada, no en el efectivo.
+        self.highest_price = self.market_entry_price
 
     def pnl_pct(self, price: float) -> float:
         return (price / self.entry_price - 1.0) * 100.0
@@ -95,16 +113,25 @@ class TradeExecutor:
             # lo que efectivamente pasó en la wallet (incluye fees).
             actual_sol_delta = result.get("actual_sol_delta") if isinstance(result, dict) else None
             actual_token_delta = result.get("actual_token_delta") if isinstance(result, dict) else None
-            if actual_sol_delta is not None and actual_token_delta is not None and actual_token_delta > 0:
+            # Una compra real SIEMPRE deja sol_delta negativo (se gasta
+            # SOL) y token_delta positivo (entran tokens). Si no se
+            # cumple, algo no cuadra con lo que leímos -mejor el
+            # estimado que un precio de entrada inventado.
+            if (actual_sol_delta is not None and actual_token_delta is not None
+                    and actual_token_delta > 0 and actual_sol_delta < 0):
                 real_sol_spent = abs(actual_sol_delta)  # gastamos SOL -> sol_delta viene negativo
                 real_token_amount = actual_token_delta
                 sol_amount = real_sol_spent
                 token_amount = real_token_amount
                 entry_price = real_sol_spent / real_token_amount
                 real_fill = True
+                sobrecoste_pct = ((entry_price / price - 1.0) * 100.0) if price > 0 else 0.0
                 logger.info(f"[REAL] Datos REALES de la compra (de la tx confirmada, incluyen fees): "
                             f"gastaste {real_sol_spent:.9f} SOL y recibiste {real_token_amount:,.6f} "
-                            f"tokens -> precio efectivo real: {entry_price:.10f} SOL/token.")
+                            f"tokens -> precio efectivo real: {entry_price:.10f} SOL/token "
+                            f"({sobrecoste_pct:+.2f}% vs. el precio de mercado de referencia "
+                            f"{price:.10f}; la diferencia son comisiones, slippage y el rent de la "
+                            f"cuenta de token).")
             else:
                 logger.warning(f"[REAL] No se pudieron confirmar los datos reales de la compra; "
                                 f"se usa el ESTIMADO (precio de referencia {price:.10f} SOL/token, "
@@ -115,7 +142,8 @@ class TradeExecutor:
         logger.info(f"[{etiqueta}] COMPRA de {sol_amount:.9f} SOL en {mint} a precio "
                     f"{entry_price:.10f} SOL/token (~{token_amount:,.2f} tokens){sufijo}")
         return Position(mint=mint, entry_price=entry_price, sol_amount=sol_amount,
-                         token_amount=token_amount, entry_is_real_fill=real_fill)
+                         token_amount=token_amount, market_entry_price=price,
+                         entry_is_real_fill=real_fill)
 
     async def sell(self, position: Position, price: float, reason: str,
                     pool_override: Optional[str] = None) -> None:
@@ -162,12 +190,28 @@ class TradeExecutor:
             # leer -ver pump.py:_fetch_actual_fill.
             actual_sol_delta = result.get("actual_sol_delta") if isinstance(result, dict) else None
             actual_token_delta = result.get("actual_token_delta") if isinstance(result, dict) else None
-            if actual_sol_delta is not None and actual_token_delta is not None and actual_sol_delta > 0:
+            # La señal de que la venta se leyó bien es el delta de TOKENS
+            # (negativo: salieron de la wallet). El delta de SOL no sirve
+            # como condición: en una posición chica que se hunde, las
+            # comisiones + priority fee pueden superar a lo que se recibe
+            # y dejarlo en cero o negativo -y ahí caer al ESTIMADO es lo
+            # peor que se puede hacer, porque el CSV registraría unos
+            # ingresos que nunca existieron.
+            if actual_sol_delta is not None and actual_token_delta is not None and actual_token_delta < 0:
                 real_sol_received = actual_sol_delta  # recibimos SOL -> sol_delta viene positivo
                 real_token_amount_sold = abs(actual_token_delta)  # vendimos tokens -> viene negativo
                 proceeds = real_sol_received
                 token_amount_sold = real_token_amount_sold
-                exit_price = real_sol_received / real_token_amount_sold if real_token_amount_sold > 0 else price
+                if real_sol_received > 0 and real_token_amount_sold > 0:
+                    exit_price = real_sol_received / real_token_amount_sold
+                else:
+                    # Sin ingresos netos no hay "precio de salida" que
+                    # tenga sentido: se deja el de mercado para el log/CSV
+                    # y el PnL igual sale de los SOL reales.
+                    logger.warning(f"[REAL] La venta de {position.mint} no dejó SOL neto positivo "
+                                    f"({real_sol_received:.9f} SOL): las comisiones se comieron los "
+                                    f"ingresos. Se registra el PnL real igual.")
+                    exit_price = price
                 real_fill = True
                 logger.info(f"[REAL] Datos REALES de la venta (de la tx confirmada, ya netos de fees): "
                             f"vendiste {real_token_amount_sold:,.6f} tokens y recibiste "

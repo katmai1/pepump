@@ -91,3 +91,29 @@ async def test_run_cancels_monitor_before_selling_on_shutdown():
     assert executor.buy_calls == 1
     assert executor.sell_calls == 1
     assert bot.position.closed is True
+
+
+async def test_run_no_se_cuelga_si_muere_el_monitor_de_precios(caplog):
+    """BUGFIX: si la tarea de monitoreo (_consume_trade_stream /
+    _poll_onchain_price_loop) muere con una excepción inesperada, antes
+    nadie se enteraba: nada esperaba esa tarea, así que run() se quedaba
+    bloqueado para siempre en _wait_for_close_or_shutdown con la posición
+    REAL abierta y sin nadie vigilando el trailing-stop. Ahora se detecta,
+    se avisa y se cierra la posición al precio actual."""
+    cfg = make_config(status_interval_seconds=999)
+    client = FakeTradeStreamClient(events_by_connection=[[{"price": 1.0}]])
+    executor = SpyExecutor()
+    bot = TrailingTakeProfitBot(client=client, executor=executor, config=cfg)
+
+    async def monitor_que_revienta():
+        raise RuntimeError("boom inesperado en el monitor (fake)")
+
+    bot._consume_trade_stream = monitor_que_revienta
+
+    with caplog.at_level("ERROR"):
+        await asyncio.wait_for(bot.run(), timeout=5)
+
+    assert executor.buy_calls == 1
+    assert executor.sell_calls == 1               # se cerró la posición, no quedó colgada
+    assert bot.position.closed is True
+    assert any("monitor de precios" in rec.message for rec in caplog.records)

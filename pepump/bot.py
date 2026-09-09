@@ -195,7 +195,7 @@ class TrailingTakeProfitBot:
             # devuelve si hace falta vender; monitor_task y el status printer
             # se cancelan acá ANTES de vender, así que cuando corre
             # _sell_on_shutdown ya no hay nada más que pueda pisarle la venta.
-            need_shutdown_sell = await self._wait_for_close_or_shutdown()
+            need_shutdown_sell = await self._wait_for_close_or_shutdown(monitor_task)
 
             for t in tasks:
                 t.cancel()
@@ -221,9 +221,23 @@ class TrailingTakeProfitBot:
 
         logger.info("Bot finalizado.")
 
-    async def _wait_for_close_or_shutdown(self) -> bool:
+    async def _wait_for_close_or_shutdown(self, monitor_task: Optional[asyncio.Task] = None) -> bool:
         """Espera a que la posición se cierre sola (TP/SL normal) O a que
-        se pida un apagado (Ctrl+C/SIGTERM).
+        se pida un apagado (Ctrl+C/SIGTERM) O a que muera el monitor de
+        precios.
+
+        BUGFIX (cuelgue silencioso con la posición abierta): antes esto
+        solo miraba `_closed_event` y `_shutdown_requested`. Si
+        monitor_task (_consume_trade_stream / _poll_onchain_price_loop)
+        se moría con una excepción inesperada, nadie se enteraba: la
+        tarea queda en estado "done con exception" sin que nada la
+        espere -asyncio ni siquiera lo loguea hasta que la recolecta el
+        GC-, así que el bot se quedaba acá esperando para siempre un
+        evento de cierre que ya no podía llegar, con SOL real
+        comprometido y sin vigilar el precio. La única salida era un
+        Ctrl+C a mano. Ahora la tarea de monitoreo también entra en la
+        espera: si termina antes de que la posición se cierre, se
+        loguea el motivo y se sale vendiendo, que es lo seguro.
 
         A propósito NO vende acá adentro (ver BUGFIX en run()): solo
         espera y devuelve si hace falta que run() dispare la venta de
@@ -237,11 +251,15 @@ class TrailingTakeProfitBot:
         """
         closed_task = asyncio.ensure_future(self._closed_event.wait())
         shutdown_task = asyncio.ensure_future(self._shutdown_requested.wait())
+        esperando = {closed_task, shutdown_task}
+        if monitor_task is not None:
+            esperando.add(monitor_task)
         try:
-            await asyncio.wait(
-                {closed_task, shutdown_task}, return_when=asyncio.FIRST_COMPLETED
-            )
+            await asyncio.wait(esperando, return_when=asyncio.FIRST_COMPLETED)
         finally:
+            # OJO: monitor_task NO se cancela acá -de eso se encarga
+            # run(), que lo cancela junto con el status printer ANTES de
+            # disparar la venta de cierre (ver el BUGFIX de la doble venta).
             for t in (closed_task, shutdown_task):
                 if not t.done():
                     t.cancel()
@@ -249,7 +267,22 @@ class TrailingTakeProfitBot:
         if self._closed_event.is_set():
             return False  # se cerró sola (TP/SL), no hace falta hacer nada más
 
-        return self._shutdown_requested.is_set()
+        if self._shutdown_requested.is_set():
+            return True
+
+        # No fue ni un cierre ni un Ctrl+C: se terminó el monitor de precios.
+        if monitor_task is not None and monitor_task.done() and not monitor_task.cancelled():
+            error = monitor_task.exception()
+            if error is not None:
+                logger.error(f"El monitor de precios se cortó con un error inesperado "
+                             f"({error!r}). Ya no hay quién vigile el trailing-stop, así que "
+                             f"cierro la posición al precio actual en vez de dejarla sin "
+                             f"supervisión.")
+            else:
+                logger.error("El monitor de precios terminó sin que la posición se cerrara. "
+                             "Cierro la posición al precio actual en vez de dejarla sin "
+                             "supervisión.")
+        return True
 
     async def _sell_on_shutdown(self) -> None:
         """Intenta conseguir el precio MÁS actual posible (una consulta
@@ -913,8 +946,15 @@ class TrailingTakeProfitBot:
                 logger.info(f"⏱️  [armado] precio {self.latest_price:.10f} | máximo {pos.highest_price:.10f} "
                             f"| nivel de venta {stop_price:.10f} | PnL: {pnl:+.2f}%")
             else:
+                # `entrada` es el precio de MERCADO contra el que se mide
+                # la activación; si la compra trae datos reales de fill,
+                # el PnL sale del precio EFECTIVO pagado (con comisiones),
+                # así que se muestra aparte para que no parezca un error
+                # ver PnL negativo con el precio clavado en la entrada.
+                coste = (f" | coste real {pos.entry_price:.10f}" if pos.entry_is_real_fill else "")
                 logger.info(f"⏱️  [esperando activación +{self.cfg.activation_pct}%] "
-                            f"precio {self.latest_price:.10f} | entrada {pos.entry_price:.10f} | PnL: {pnl:+.2f}%")
+                            f"precio {self.latest_price:.10f} | entrada {pos.market_entry_price:.10f}"
+                            f"{coste} | PnL: {pnl:+.2f}%")
 
     def _current_pool_override(self) -> Optional[str]:
         """Si ya confirmamos -sea al entrar (_try_onchain_fallback) o a
@@ -952,13 +992,23 @@ class TrailingTakeProfitBot:
         pnl = pos.pnl_pct(price)
 
         # --- Caso 1: todavía no se armó el trailing-stop ------------------ #
+        #
+        # OJO: los umbrales se comparan contra `market_entry_price` (el
+        # precio de MERCADO al comprar), no contra `entry_price`. Con
+        # datos reales de fill, entry_price es el precio EFECTIVO pagado
+        # e incluye comisiones + priority fee + el rent de la ATA (sobre
+        # una compra de 0.05 SOL eso puede ser un 4-5%): usarlo acá
+        # subiría de tapadillo el listón de activación y aflojaría el
+        # stop-loss en esa misma proporción, cambiando la estrategia sin
+        # que nadie lo haya pedido. El PnL sí usa entry_price -ver
+        # Position.pnl_pct-, que es donde el coste real corresponde.
         if not pos.armed:
-            if price >= pos.entry_price * (1 + self.cfg.activation_pct / 100.0):
+            if price >= pos.market_entry_price * (1 + self.cfg.activation_pct / 100.0):
                 pos.armed = True
                 pos.highest_price = price
                 logger.info(f"✅ Trailing-stop ARMADO. Precio actual {price:.10f} "
                             f"(PnL {pnl:+.2f}%). Máximo inicial registrado.")
-            elif price <= pos.entry_price * (1 - self.cfg.initial_stop_pct / 100.0):
+            elif price <= pos.market_entry_price * (1 - self.cfg.initial_stop_pct / 100.0):
                 await self._try_sell(pos, price, "stop-loss inicial (nunca se activó el trailing)")
             return
 

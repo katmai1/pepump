@@ -344,3 +344,113 @@ def test_fetch_actual_fill_no_adivina_si_hay_varias_cuentas_sin_owner(monkeypatc
     fill = asyncio.run(pump_module._fetch_actual_fill(FAKE_SIGNATURE, "https://fake-rpc.test", REAL_MINT))
 
     assert fill is None
+
+
+# --------------------------------------------------------------------------- #
+# BUGFIX: la token account de la bonding curve se tomaba como propia
+# --------------------------------------------------------------------------- #
+#
+# Éste es el bug por el que las COMPRAS caían siempre al estimado aunque la
+# tx confirmara: en una compra de pump.fun, `pre_token_balances` trae la
+# token account de la BONDING CURVE (que es la que tiene los tokens) y NO
+# trae ninguna cuenta nuestra -nuestra ATA se crea en esa misma tx-. Como
+# era la única entrada de ese mint, se la tomaba como propia y el
+# token_delta salía enorme y NEGATIVO, que es justo lo que executor.buy
+# descarta. En las ventas no pasaba, porque ahí nuestra ATA ya existe en
+# los dos lados: de ahí que la venta sí mostrara datos reales.
+
+CURVE_ACCOUNT_OWNER = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"  # programa de pump.fun
+
+
+def _tx_compra_real():
+    """Forma REAL de una primera compra: la curva aparece en los dos lados
+    (le salen los tokens que compramos) y nuestra ATA solo en post."""
+    meta = FakeMeta(
+        pre_balances=[2_000_000_000, 0],
+        post_balances=[1_948_800_000, 0],  # -0.0512 SOL (compra + fees + rent de la ATA)
+        pre_token_balances=[
+            PubkeyTokenBalance(REAL_MINT, CURVE_ACCOUNT_OWNER, 793_100_000.0),
+        ],
+        post_token_balances=[
+            PubkeyTokenBalance(REAL_MINT, CURVE_ACCOUNT_OWNER, 792_112_345.7),
+            PubkeyTokenBalance(REAL_MINT, REAL_WALLET, 987_654.3),
+        ],
+    )
+    return FakeConfirmedTx(meta, [Pubkey.from_string(REAL_WALLET), Pubkey.from_string(REAL_MINT)])
+
+
+def test_fetch_actual_fill_compra_ignora_la_cuenta_de_la_bonding_curve(monkeypatch):
+    tx = _tx_compra_real()
+    monkeypatch.setattr(pump_module, "AsyncClient", make_fake_async_client(tx))
+
+    fill = asyncio.run(pump_module._fetch_actual_fill(FAKE_SIGNATURE, "https://fake-rpc.test", REAL_MINT))
+
+    assert fill is not None
+    # Los tokens REALES comprados, no la diferencia contra el saldo de la curva.
+    assert fill["token_delta"] == pytest.approx(987_654.3)
+    assert fill["sol_delta"] == pytest.approx(-0.0512)
+
+
+def test_fetch_actual_fill_venta_con_la_cuenta_del_pool_presente(monkeypatch):
+    """La otra mitad del mismo caso: en la venta nuestra ATA está en los
+    dos lados y la de la curva/pool también -hay que seguir midiendo solo
+    la nuestra."""
+    meta = FakeMeta(
+        pre_balances=[1_948_800_000, 0],
+        post_balances=[2_029_800_000, 0],  # +0.081 SOL
+        pre_token_balances=[
+            PubkeyTokenBalance(REAL_MINT, CURVE_ACCOUNT_OWNER, 792_112_345.7),
+            PubkeyTokenBalance(REAL_MINT, REAL_WALLET, 987_654.3),
+        ],
+        post_token_balances=[
+            PubkeyTokenBalance(REAL_MINT, CURVE_ACCOUNT_OWNER, 793_100_000.0),
+            PubkeyTokenBalance(REAL_MINT, REAL_WALLET, 0.0),
+        ],
+    )
+    tx = FakeConfirmedTx(meta, [Pubkey.from_string(REAL_WALLET), Pubkey.from_string(REAL_MINT)])
+    monkeypatch.setattr(pump_module, "AsyncClient", make_fake_async_client(tx))
+
+    fill = asyncio.run(pump_module._fetch_actual_fill(FAKE_SIGNATURE, "https://fake-rpc.test", REAL_MINT))
+
+    assert fill is not None
+    assert fill["token_delta"] == pytest.approx(-987_654.3)
+    assert fill["sol_delta"] == pytest.approx(0.081)
+
+
+def test_fetch_actual_fill_none_si_ninguna_cuenta_con_owner_es_nuestra(monkeypatch):
+    """Si el nodo SÍ manda `owner` y ninguna de las cuentas del mint es de
+    la wallet, no hay nada que atribuirnos -> estimado, no adivinar."""
+    meta = FakeMeta(
+        pre_balances=[2_000_000_000, 0],
+        post_balances=[1_900_000_000, 0],
+        pre_token_balances=[PubkeyTokenBalance(REAL_MINT, CURVE_ACCOUNT_OWNER, 793_100_000.0)],
+        post_token_balances=[PubkeyTokenBalance(REAL_MINT, CURVE_ACCOUNT_OWNER, 792_000_000.0)],
+    )
+    tx = FakeConfirmedTx(meta, [Pubkey.from_string(REAL_WALLET), Pubkey.from_string(REAL_MINT)])
+    monkeypatch.setattr(pump_module, "AsyncClient", make_fake_async_client(tx))
+
+    fill = asyncio.run(pump_module._fetch_actual_fill(FAKE_SIGNATURE, "https://fake-rpc.test", REAL_MINT))
+
+    assert fill is None
+
+
+def test_fetch_actual_fill_suma_varias_cuentas_propias_del_mismo_mint(monkeypatch):
+    """Caso raro pero posible (la wallet ya tenía otra token account de
+    ese mint además de la ATA): el movimiento real es la suma de las
+    nuestras, no la primera que aparezca."""
+    meta = FakeMeta(
+        pre_balances=[2_000_000_000, 0],
+        post_balances=[1_900_000_000, 0],
+        pre_token_balances=[PubkeyTokenBalance(REAL_MINT, REAL_WALLET, 100.0)],
+        post_token_balances=[
+            PubkeyTokenBalance(REAL_MINT, REAL_WALLET, 100.0),
+            PubkeyTokenBalance(REAL_MINT, REAL_WALLET, 400.0),
+        ],
+    )
+    tx = FakeConfirmedTx(meta, [Pubkey.from_string(REAL_WALLET), Pubkey.from_string(REAL_MINT)])
+    monkeypatch.setattr(pump_module, "AsyncClient", make_fake_async_client(tx))
+
+    fill = asyncio.run(pump_module._fetch_actual_fill(FAKE_SIGNATURE, "https://fake-rpc.test", REAL_MINT))
+
+    assert fill is not None
+    assert fill["token_delta"] == pytest.approx(400.0)

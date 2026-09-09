@@ -147,6 +147,86 @@ async def _describe_onchain_error(signature: str, rpc_url: str, err) -> tuple[st
     return ": revirtió con un error no reconocido (corré con -v para ver más detalle, o abrí el link de Solscan)", detail
 
 
+def _wallet_token_delta(meta, mint: str, wallet: str) -> Optional[float]:
+    """Cuántos tokens de `mint` ganó (positivo) o gastó (negativo) LA
+    WALLET en esta transacción, a partir de los token balances pre/post
+    de la meta. None si no se puede identificar con certeza cuál de las
+    token accounts que aparecen es la nuestra.
+
+    BUGFIX (la compra SIEMPRE caía al estimado): la versión anterior
+    elegía, para cada lado, "la entrada del mint que sea de la wallet
+    y, si ninguna lo es pero hay UNA sola entrada de ese mint, esa".
+    Ese último atajo es justo el que rompía todas las compras:
+
+      - En una COMPRA de un mint nuevo, `pre_token_balances` NO trae
+        ninguna cuenta nuestra (todavía no existe nuestra ATA), pero SÍ
+        trae la token account de la bonding curve de pump.fun -que es
+        la que tiene los tokens y la que la tx toca-. Como era la única
+        entrada de ese mint, se la tomaba como "nuestra": pre_tokens
+        quedaba en cientos de millones de tokens (los de la curva).
+        `post_token_balances` sí traía nuestra ATA, así que post_tokens
+        eran los tokens comprados -> token_delta daba un número
+        enormemente NEGATIVO, y executor.buy exige `> 0` para aceptar
+        el fill real. De ahí que la compra terminara SIEMPRE en el
+        estimado aunque la tx confirmara perfecto.
+
+      - En una VENTA no pasaba: nuestra ATA ya existe y aparece con
+        `owner` en los dos lados, así que el atajo nunca se usaba. Por
+        eso la venta sí mostraba datos reales (el síntoma exacto
+        reportado).
+
+    Ahora la wallet se identifica SOLO por `owner`, y "nuestra cuenta
+    no aparece de este lado" se interpreta como 0 tokens (que es
+    literalmente lo que había: la cuenta no existía todavía), no como
+    "usá la cuenta de otro". El atajo de la única entrada queda
+    reservado para el caso en que el nodo RPC no mande `owner` en
+    NINGUNA entrada, y solo si de verdad hay una sola token account de
+    ese mint en toda la tx.
+    """
+    pre = [b for b in (meta.pre_token_balances or []) if str(b.mint) == mint]
+    post = [b for b in (meta.post_token_balances or []) if str(b.mint) == mint]
+    todos = pre + post
+    if not todos:
+        return None
+
+    if any(getattr(b, "owner", None) is not None for b in todos):
+        def es_nuestra(b) -> bool:
+            owner = getattr(b, "owner", None)
+            return owner is not None and str(owner) == wallet
+    else:
+        # Ningún balance trae `owner` (algunos nodos lo omiten). Solo
+        # podemos asumir que la cuenta es nuestra si hay UNA sola token
+        # account de ese mint en toda la transacción; si hay varias, no
+        # adivinamos y el llamador cae al estimado.
+        indices = {getattr(b, "account_index", None) for b in todos}
+        if None in indices:
+            if len(pre) > 1 or len(post) > 1:
+                return None
+        elif len(indices) > 1:
+            return None
+
+        def es_nuestra(b) -> bool:
+            return True
+
+    def _total_propio(balances) -> Optional[float]:
+        propias = [b for b in balances if es_nuestra(b)]
+        if not propias:
+            return None
+        total = 0.0
+        for b in propias:
+            ui_amount = b.ui_token_amount.ui_amount
+            total += float(ui_amount) if ui_amount is not None else 0.0
+        return total
+
+    pre_tokens = _total_propio(pre)
+    post_tokens = _total_propio(post)
+    # Si nuestra cuenta no aparece en NINGUNO de los dos lados, no
+    # pudimos identificar el movimiento de tokens -no asumimos 0.
+    if pre_tokens is None and post_tokens is None:
+        return None
+    return (post_tokens or 0.0) - (pre_tokens or 0.0)
+
+
 async def _fetch_actual_fill(signature: str, rpc_url: str, mint: str,
                               max_attempts: int = 3, retry_delay_seconds: float = 0.75) -> Optional[dict]:
     """Lee la transacción YA CONFIRMADA (ver _confirm_transaction_onchain,
@@ -219,46 +299,13 @@ async def _fetch_actual_fill(signature: str, rpc_url: str, mint: str,
 
             sol_delta = (meta.post_balances[0] - meta.pre_balances[0]) / 1_000_000_000.0
 
-            def _token_amount_for_wallet(balances) -> Optional[float]:
-                """BUGFIX: la comparación era `b.mint == mint and b.owner ==
-                wallet`, con `mint`/`wallet` strings. Pero solders devuelve
-                esos campos como objetos Pubkey, no como str, así que ambas
-                igualdades daban False SIEMPRE contra un RPC real -> esto
-                devolvía None en cada compra y en cada venta, y el bot caía
-                al valor ESTIMADO todas las veces (entry_is_real_fill nunca
-                llegaba a True). Los tests no lo agarraban porque sus dobles
-                usan strings. Ahora se normaliza con str() de los dos lados.
-
-                Además, `owner` puede venir ausente/None según el nodo RPC.
-                En ese caso, si hay UNA sola entrada para el mint, es la
-                nuestra -no tiene sentido descartar el fill real por un
-                campo opcional que el nodo no mandó."""
-                if not balances:
-                    return None
-                por_mint = [b for b in balances if str(b.mint) == mint]
-                if not por_mint:
-                    return None
-                propias = [b for b in por_mint
-                           if getattr(b, "owner", None) is not None and str(b.owner) == wallet]
-                if propias:
-                    elegida = propias[0]
-                elif len(por_mint) == 1:
-                    elegida = por_mint[0]
-                else:
-                    # Varias cuentas de ese mint y ninguna atribuible a la
-                    # wallet: no adivinamos cuál es la nuestra.
-                    return None
-                ui_amount = elegida.ui_token_amount.ui_amount
-                return float(ui_amount) if ui_amount is not None else 0.0
-
-            pre_tokens = _token_amount_for_wallet(meta.pre_token_balances)
-            post_tokens = _token_amount_for_wallet(meta.post_token_balances)
-            # Si el mint no aparece en ninguno de los dos lados es que no
-            # pudimos identificar el movimiento de tokens (rareza en el
-            # formato de respuesta del RPC) -no asumimos 0 en ese caso.
-            if pre_tokens is None and post_tokens is None:
+            # Movimiento real de tokens de NUESTRA wallet -ver
+            # _wallet_token_delta, que es donde vive la identificación de
+            # cuál de las token accounts de la tx es la nuestra (y el
+            # bugfix por el que las compras caían siempre al estimado).
+            token_delta = _wallet_token_delta(meta, mint, wallet)
+            if token_delta is None:
                 return None
-            token_delta = (post_tokens or 0.0) - (pre_tokens or 0.0)
 
             return {"sol_delta": sol_delta, "token_delta": token_delta}
         except Exception as e:
