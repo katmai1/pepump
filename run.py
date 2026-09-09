@@ -64,7 +64,7 @@ import logging
 import sys
 import time
 
-from pepump.config import load_config
+from pepump.config import load_config, validate_mint
 from pepump.pump import PumpPortalClient
 from pepump.executor import TradeExecutor
 from pepump.bot import TrailingTakeProfitBot
@@ -89,14 +89,14 @@ def show_header(live):
     # Las comillas del modo van en una variable aparte a propósito: un
     # f-string con comillas dobles anidadas solo compila en Python 3.12+
     # (PEP 701), y este proyecto arranca en 3.11 (tomllib).
-    modo = "REAL" if live else "SIMULADO"
+    modo = "REAL ⚠️" if live else "SIMULADO"
     logger.info("=" * 50)
     logger.info(f"\t PePump | Modo {modo}")
+    logger.info("=" * 50)
     if live:
         logger.warning("⚠️  MODO REAL ACTIVADO (general.live = true en el .toml). Vas a operar con SOL real.")
         logger.warning("    Presiona Ctrl+C ahora para detenerlo.")
         time.sleep(3)
-    logger.info("=" * 50)
 
 
 # logica inicial
@@ -107,17 +107,16 @@ if __name__ == "__main__":
     
     try:
         config = load_config(args.config)
-        # Un espacio/tab/salto de línea colado al copiar el mint no rompe
-        # el parseo de argparse, pero hace que subscribeTokenTrade nunca
-        # matchee ningún trade real -> el bot se queda esperando para
-        # siempre sin ningún error visible. Lo limpiamos acá.
-        config.mint = args.mint.strip()
+        # El mint viene SIEMPRE de la línea de comandos, nunca del .toml.
+        # Se normaliza y valida aqui para fallar rápido y con un mensaje
+        # que apunte a la causa real -ver validate_mint en config.py.
+        config.mint = validate_mint(args.mint)
     except FileNotFoundError:
         logger.error(f"No se encontró el archivo de configuración '{args.config}'.")
         sys.exit(1)
     except ValueError as e:
         # tomllib.TOMLDecodeError también hereda de ValueError, así que un
-        # .toml mal formado cae acá también (probado: da un mensaje claro).
+        # .toml mal formado cae aqui también (probado: da un mensaje claro).
         logger.error(f"ERROR de configuración: {e}")
         sys.exit(1)
    

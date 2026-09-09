@@ -5,7 +5,7 @@ import tomllib
 
 import pytest
 
-from pepump.config import AppConfig, load_config
+from pepump.config import AppConfig, load_config, validate_mint
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 CONFIG_SECTIONS = ("general", "trade", "strategy", "pumpportal", "onchain")
@@ -164,3 +164,145 @@ def test_example_toml_carga_sin_errores(tmp_path):
         if field.name in FIELDS_NOT_IN_TOML:
             continue
         assert getattr(cfg, field.name) == getattr(defaults, field.name), field.name
+
+
+# --------------------------------------------------------------------------- #
+# validate_mint
+# --------------------------------------------------------------------------- #
+
+WSOL = "So11111111111111111111111111111111111111112"
+
+
+def test_validate_mint_limpia_espacios_y_saltos_de_linea():
+    """Un mint copiado con espacios/tabs alrededor pasa el parseo de
+    argparse y hasta el subscribeTokenTrade sin error, pero después nunca
+    matchea ningún trade: el bot espera para siempre en silencio."""
+    assert validate_mint(f"  {WSOL}\n") == WSOL
+    assert validate_mint(f"\t{WSOL}  ") == WSOL
+
+
+@pytest.mark.parametrize("malo", [
+    "",
+    "   ",
+    "no-es-un-mint",
+    "0OIl" * 11,                    # base58 no admite 0, O, I, l
+    WSOL[:-5],                      # muy corto
+    WSOL + "abcdef",                # muy largo
+])
+def test_validate_mint_rechaza_direcciones_invalidas(malo):
+    with pytest.raises(ValueError):
+        validate_mint(malo)
+
+
+def test_validate_mint_mensaje_menciona_el_valor_recibido():
+    """El error tiene que apuntar a la causa real. Antes un mint inválido
+    reventaba adentro del fallback on-chain y salía como 'no hay ninguna
+    fuente de precio disponible', que despista por completo."""
+    with pytest.raises(ValueError, match="mint"):
+        validate_mint("chirimoya")
+
+
+# --------------------------------------------------------------------------- #
+# Validación de la configuración
+# --------------------------------------------------------------------------- #
+
+BASE_TOML = """
+[trade]
+buy_sol = {buy_sol}
+slippage = {slippage}
+pool = "{pool}"
+
+[strategy]
+activation_pct = {activation_pct}
+trailing_pct = {trailing_pct}
+initial_stop_pct = {initial_stop_pct}
+entry_dip_pct = {entry_dip_pct}
+
+[pumpportal]
+api_key = "abc"
+
+[onchain]
+live_feed_timeout_seconds = {live_feed_timeout_seconds}
+entry_wait_timeout_seconds = {entry_wait_timeout_seconds}
+solana_rpc_url = "{solana_rpc_url}"
+"""
+
+DEFAULTS = dict(buy_sol=0.05, slippage=15.0, pool="auto", activation_pct=10.0,
+                trailing_pct=15.0, initial_stop_pct=25.0, entry_dip_pct=0.0,
+                live_feed_timeout_seconds=5.0, entry_wait_timeout_seconds=60.0,
+                solana_rpc_url="https://rpc.test")
+
+
+def write_scenario(tmp_path, **overrides):
+    valores = {**DEFAULTS, **overrides}
+    return write_toml(tmp_path, BASE_TOML.format(**valores))
+
+
+def test_config_valida_carga_sin_quejarse(tmp_path):
+    cfg = load_config(write_scenario(tmp_path))
+    assert cfg.buy_sol == 0.05
+    assert cfg.entry_dip_pct == 0.0  # 0 es válido: significa "comprar en la referencia"
+
+
+@pytest.mark.parametrize("overrides, fragmento", [
+    ({"buy_sol": 0}, "buy_sol"),
+    ({"buy_sol": -0.1}, "buy_sol"),
+    ({"slippage": 0}, "slippage"),
+    ({"pool": "uniswap"}, "pool"),
+    ({"activation_pct": 0}, "activation_pct"),
+    # 100% de trailing pone el nivel de venta en 0: desarma el stop sin avisar.
+    ({"trailing_pct": 100.0}, "trailing_pct"),
+    ({"trailing_pct": 0}, "trailing_pct"),
+    ({"initial_stop_pct": 100.0}, "initial_stop_pct"),
+    # 100% de dip deja el precio objetivo en 0: nunca se llega a comprar.
+    ({"entry_dip_pct": 100.0}, "entry_dip_pct"),
+    ({"entry_dip_pct": -5.0}, "entry_dip_pct"),
+    ({"solana_rpc_url": "rpc.test"}, "solana_rpc_url"),
+    # El presupuesto total de espera no puede ser menor que un solo ciclo.
+    ({"entry_wait_timeout_seconds": 2.0, "live_feed_timeout_seconds": 5.0},
+     "entry_wait_timeout_seconds"),
+])
+def test_config_invalida_falla_con_mensaje_que_nombra_la_clave(tmp_path, overrides, fragmento):
+    with pytest.raises(ValueError, match=fragmento):
+        load_config(write_scenario(tmp_path, **overrides))
+
+
+def test_config_junta_todos_los_errores_en_un_solo_mensaje(tmp_path):
+    """No sirve arreglar de a un error por corrida: se listan todos."""
+    with pytest.raises(ValueError) as exc:
+        load_config(write_scenario(tmp_path, buy_sol=0, trailing_pct=150.0, pool="uniswap"))
+    mensaje = str(exc.value)
+    assert "buy_sol" in mensaje
+    assert "trailing_pct" in mensaje
+    assert "pool" in mensaje
+
+
+def test_stall_timeout_corto_avisa_pero_no_falla(tmp_path, caplog):
+    """Es raro pero puede ser deliberado, así que arranca igual."""
+    path = write_toml(tmp_path, """
+[pumpportal]
+api_key = "abc"
+
+[onchain]
+live_feed_timeout_seconds = 20.0
+stall_timeout_seconds = 5.0
+""")
+    with caplog.at_level(logging.WARNING):
+        cfg = load_config(path)
+    assert cfg.stall_timeout_seconds == 5.0
+    assert any("stall_timeout_seconds" in r.getMessage() for r in caplog.records)
+
+
+def test_mint_en_el_toml_se_ignora_con_aviso(tmp_path, caplog):
+    """El mint viene solo por -m/--mint. Si el .toml lo define, el valor
+    se pisa después en run.py: hay que decirlo, no ignorarlo en silencio."""
+    path = write_toml(tmp_path, """
+[general]
+mint = "%s"
+
+[pumpportal]
+api_key = "abc"
+""" % WSOL)
+    with caplog.at_level(logging.WARNING):
+        load_config(path)
+    assert any("-m/--mint" in r.getMessage() for r in caplog.records)

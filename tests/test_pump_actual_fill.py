@@ -253,3 +253,94 @@ def test_fetch_actual_fill_pasa_commitment_confirmed(monkeypatch):
     asyncio.run(pump_module._fetch_actual_fill(FAKE_SIGNATURE, "http://fake-rpc", MINT))
 
     assert seen_commitments == [Confirmed]
+
+
+# --------------------------------------------------------------------------- #
+# BUGFIX: solders devuelve mint/owner como Pubkey, no como str
+# --------------------------------------------------------------------------- #
+#
+# El resto de esta suite usa dobles con strings, que es justamente por lo
+# que el bug pasó desapercibido: contra un RPC real la comparación
+# `b.mint == mint` (str) daba False SIEMPRE, así que _fetch_actual_fill
+# devolvía None en cada compra y en cada venta y el bot caía al valor
+# ESTIMADO todas las veces. Estos tests usan los tipos REALES.
+
+from solders.pubkey import Pubkey  # noqa: E402
+
+REAL_MINT = "So11111111111111111111111111111111111111112"
+REAL_WALLET = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM"
+
+
+class PubkeyTokenBalance:
+    """Como FakeTokenBalance, pero con mint/owner tipados igual que los
+    devuelve solders de verdad."""
+
+    def __init__(self, mint, owner, ui_amount):
+        self.mint = Pubkey.from_string(mint)
+        self.owner = Pubkey.from_string(owner) if owner is not None else None
+        self.ui_token_amount = FakeUiTokenAmount(ui_amount)
+
+
+def make_fake_async_client(tx):
+    """Igual que en los tests de arriba, pero devolviendo el FakeConfirmedTx
+    que se le pase envuelto en la respuesta de get_transaction."""
+    resp = FakeGetTransactionResp(tx)
+    return lambda url: FakeAsyncClient(resp=resp)
+
+
+def _tx_con_tipos_reales(pre_tokens, post_tokens, owner=REAL_WALLET):
+    meta = FakeMeta(
+        pre_balances=[2_000_000_000, 0],
+        post_balances=[1_900_000_000, 0],
+        pre_token_balances=([PubkeyTokenBalance(REAL_MINT, owner, pre_tokens)]
+                            if pre_tokens is not None else []),
+        post_token_balances=([PubkeyTokenBalance(REAL_MINT, owner, post_tokens)]
+                             if post_tokens is not None else []),
+    )
+    return FakeConfirmedTx(meta, [Pubkey.from_string(REAL_WALLET), Pubkey.from_string(REAL_MINT)])
+
+
+def test_fetch_actual_fill_funciona_con_los_tipos_reales_de_solders(monkeypatch):
+    """El test de regresión del bug: con Pubkey (no str) tiene que leer
+    el fill igual. Antes devolvía None y el bot usaba el estimado."""
+    tx = _tx_con_tipos_reales(pre_tokens=None, post_tokens=1500.0)
+    monkeypatch.setattr(pump_module, "AsyncClient", make_fake_async_client(tx))
+
+    fill = asyncio.run(pump_module._fetch_actual_fill(FAKE_SIGNATURE, "https://fake-rpc.test", REAL_MINT))
+
+    assert fill is not None
+    assert fill["token_delta"] == pytest.approx(1500.0)
+    assert fill["sol_delta"] == pytest.approx(-0.1)
+
+
+def test_fetch_actual_fill_tolera_owner_ausente_si_hay_un_solo_balance(monkeypatch):
+    """Algunos nodos no mandan `owner` en los token balances. Si hay UNA
+    sola entrada para el mint, es la nuestra: descartar el fill real por
+    un campo opcional que el nodo omitió sería tirar el dato bueno."""
+    tx = _tx_con_tipos_reales(pre_tokens=None, post_tokens=1500.0, owner=None)
+    monkeypatch.setattr(pump_module, "AsyncClient", make_fake_async_client(tx))
+
+    fill = asyncio.run(pump_module._fetch_actual_fill(FAKE_SIGNATURE, "https://fake-rpc.test", REAL_MINT))
+
+    assert fill is not None
+    assert fill["token_delta"] == pytest.approx(1500.0)
+
+
+def test_fetch_actual_fill_no_adivina_si_hay_varias_cuentas_sin_owner(monkeypatch):
+    """Con varias cuentas del mismo mint y ninguna atribuible a la wallet,
+    mejor caer al estimado que elegir una al azar."""
+    meta = FakeMeta(
+        pre_balances=[2_000_000_000, 0],
+        post_balances=[1_900_000_000, 0],
+        pre_token_balances=[],
+        post_token_balances=[
+            PubkeyTokenBalance(REAL_MINT, None, 1500.0),
+            PubkeyTokenBalance(REAL_MINT, None, 99.0),
+        ],
+    )
+    tx = FakeConfirmedTx(meta, [Pubkey.from_string(REAL_WALLET)])
+    monkeypatch.setattr(pump_module, "AsyncClient", make_fake_async_client(tx))
+
+    fill = asyncio.run(pump_module._fetch_actual_fill(FAKE_SIGNATURE, "https://fake-rpc.test", REAL_MINT))
+
+    assert fill is None

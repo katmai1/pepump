@@ -3,6 +3,7 @@ import websockets
 import json
 import logging
 import asyncio
+import math
 import time
 from typing import AsyncIterator, Optional
 
@@ -14,6 +15,8 @@ from solders.signature import Signature  # type: ignore
 from pumpswapamm.pumpswapamm import fetch_pool_state
 from pumpswapamm.fetch_reserves import fetch_pool_base_price
 
+from pepump.onchain_errors import describe_custom_error, failing_program_from_logs
+
 logger = logging.getLogger(__name__)
 
 # Programa de PumpSwap en Solana (constante pública, no cambia).
@@ -24,42 +27,21 @@ PUMPFUN_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 # encontramos está denominado en SOL antes de usar su precio.
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 
-# Códigos de error "custom" del programa spl-token (spl_token::error::TokenError),
-# estables y públicos. Como `pool = "auto"` puede terminar rutando la compra/venta
-# por distintos programas (bonding curve de pump.fun, PumpSwap, Raydium, etc.), no
-# tiene sentido mantener una tabla por-programa -pero casi cualquier ruta termina
-# haciendo un CPI a spl-token para mover el WSOL o el token, así que estos códigos
-# son los que más se ven en la práctica cuando revienta una compra/venta real.
-_SPL_TOKEN_CUSTOM_ERRORS = {
-    0: "NotRentExempt (la cuenta quedaría por debajo del mínimo exento de rent)",
-    1: "InsufficientFunds (fondos insuficientes para cubrir la transferencia — "
-       "revisa el balance de SOL/WSOL o del token en la wallet)",
-    2: "InvalidMint",
-    3: "MintMismatch (el mint de la cuenta no coincide con el esperado)",
-    4: "OwnerMismatch (la cuenta no pertenece al owner esperado)",
-    5: "FixedSupply",
-    6: "AlreadyInUse",
-    7: "InvalidNumberOfProvidedSigners",
-    8: "InvalidNumberOfRequiredSigners",
-    9: "UninitializedState",
-    10: "NativeNotSupported",
-    11: "NonNativeHasBalance",
-    12: "InvalidInstruction",
-    13: "InvalidState",
-    14: "Overflow",
-    15: "AuthorityTypeNotSupported",
-    16: "MintCannotFreeze",
-    17: "AccountFrozen",
-    18: "MintDecimalsMismatch",
-    19: "NonNativeNotSupported",
-}
-
-# Versión corta (una línea, sin la explicación entre paréntesis) de la
-# tabla de arriba, para el mensaje de error PRINCIPAL -la explicación
-# larga queda solo en el log de debug, no hace falta repetirla siempre.
-_SPL_TOKEN_CUSTOM_ERRORS_SHORT = {
-    code: msg.split(" (", 1)[0] for code, msg in _SPL_TOKEN_CUSTOM_ERRORS.items()
-}
+def _as_positive_float(value) -> Optional[float]:
+    """Convierte a float y devuelve el valor SOLO si es finito y > 0.
+    None en cualquier otro caso (ausente, string no numérico, 0,
+    negativo, NaN, inf). Los feeds no siempre mandan los números como
+    números, y un 0 o un NaN colado en un precio es peor que no tener
+    precio: dispara ventas/compras contra un valor inventado."""
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number <= 0:
+        return None
+    return number
 
 
 def _extract_instruction_error(err) -> Optional[tuple]:
@@ -82,12 +64,24 @@ def _extract_instruction_error(err) -> Optional[tuple]:
     return None
 
 
-async def _fetch_relevant_program_logs(signature: str, rpc_url: str) -> list[str]:
-    """Pide la transacción completa (getTransaction) para sacar sus
-    logMessages -que casi siempre incluyen la razón real y en texto
-    plano de por qué revirtió un programa (ej. un AnchorError con
-    "Error Message: ..." o el motivo exacto de spl-token)- y devuelve
-    solo las líneas que parecen relevantes (mencionan error/fallo).
+def _relevant_log_lines(logs: list[str]) -> list[str]:
+    """Filtra los logMessages a las líneas que parecen explicar la falla."""
+    keywords = ("error", "Error", "fail", "Fail", "insufficient", "Insufficient",
+                "slippage", "Slippage", "revert", "exceed", "Exceed")
+    relevant = [line for line in logs if any(k in line for k in keywords)]
+    return relevant[-5:] if relevant else []
+
+
+async def _fetch_program_logs(signature: str, rpc_url: str) -> list[str]:
+    """Pide la transacción completa (getTransaction) y devuelve TODOS sus
+    logMessages. Se necesitan completos -no solo las líneas que mencionan
+    un error- porque la línea "Program <id> invoke/failed" es la que
+    permite saber QUÉ programa revirtió, y de eso depende contra qué
+    tabla de errores se traduce el código Custom(N) (ver
+    onchain_errors.py: el mismo número significa cosas distintas en
+    pump.fun y en PumpSwap). El filtrado a lo "relevante" para mostrar se
+    hace después, en _relevant_log_lines.
+
     Devuelve lista vacía si no se puede obtener nada (no debe hacer
     fallar la confirmación por esto, es solo información extra)."""
     try:
@@ -100,12 +94,7 @@ async def _fetch_relevant_program_logs(signature: str, rpc_url: str) -> list[str
             return []
         meta = resp.value.transaction.meta
         logs = meta.log_messages if meta is not None else None
-        if not logs:
-            return []
-        keywords = ("error", "Error", "fail", "Fail", "insufficient", "Insufficient",
-                    "slippage", "Slippage", "revert", "exceed", "Exceed")
-        relevant = [line for line in logs if any(k in line for k in keywords)]
-        return relevant[-5:] if relevant else []
+        return list(logs) if logs else []
     except Exception as e:
         logger.debug(f"[Confirmación on-chain] no se pudieron leer los logs de {signature} "
                      f"para un mensaje de error más claro: {e}")
@@ -115,33 +104,45 @@ async def _fetch_relevant_program_logs(signature: str, rpc_url: str) -> list[str
 async def _describe_onchain_error(signature: str, rpc_url: str, err) -> tuple[str, str]:
     """Devuelve (razón_corta, detalle_técnico):
       - razón_corta: UNA frase legible para meter directo en el mensaje
-        de error principal (ej. ": fondos insuficientes en la wallet
-        (spl-token InsufficientFunds, instrucción #3)"). Vacía si no se
-        pudo determinar nada mejor que el error crudo.
+        de error principal (ej. ": pump.fun BondingCurveComplete (código
+        6005, instrucción #3)"). Vacía si no se pudo determinar nada
+        mejor que el error crudo.
       - detalle_técnico: el error crudo de solders + los logs relevantes
-        de la transacción, para loguear aparte a nivel DEBUG -no hace
-        falta ensuciar el mensaje principal con esto, pero conviene
-        tenerlo a mano con -v para casos raros/no reconocidos."""
+        de la transacción, para loguear aparte a nivel DEBUG.
+
+    BUGFIX: antes, cualquier código Custom(N) se buscaba SIEMPRE en la
+    tabla de spl-token. Eso hacía dos cosas mal a la vez: los errores
+    propios de pump.fun/PumpSwap (Anchor, 6000 para arriba) nunca
+    matcheaban y caían en el genérico "revirtió con un error no
+    reconocido" -incluido el 6005 BondingCurveComplete, justo el que más
+    aparece cuando el ruteo del pool quedó desalineado con la migración-,
+    y un código bajo se atribuía a spl-token aunque lo hubiese tirado
+    otro programa. Ahora se identifica primero QUÉ programa revirtió
+    (línea "Program <id> failed" de los logs) y recién ahí se traduce el
+    código contra la tabla de ESE programa."""
     decoded = _extract_instruction_error(err)
-    logs = await _fetch_relevant_program_logs(signature, rpc_url)
+    logs = await _fetch_program_logs(signature, rpc_url)
+    relevant = _relevant_log_lines(logs)
 
     debug_lines = [f"error crudo: {err}"]
-    if logs:
-        debug_lines.append("logs relevantes del programa:\n  " + "\n  ".join(logs))
+    program_id = failing_program_from_logs(logs)
+    if program_id:
+        debug_lines.append(f"programa que revirtió: {program_id}")
+    if relevant:
+        debug_lines.append("logs relevantes del programa:\n  " + "\n  ".join(relevant))
     detail = "\n  ".join(debug_lines)
 
     if decoded is not None:
         ix_index, code = decoded
-        short = _SPL_TOKEN_CUSTOM_ERRORS_SHORT.get(code)
-        if short:
-            return f": {short} (spl-token, instrucción #{ix_index})", detail
+        described = describe_custom_error(code, program_id)
+        if described:
+            return f": {described} (código {code}, instrucción #{ix_index})", detail
 
-    if logs:
-        # Sin código de spl-token conocido, pero SÍ hay algún log
-        # relevante (típicamente el motivo real que imprime el propio
-        # programa que revirtió, ej. un AnchorError con "Error Message:
-        # ...") -usamos la línea más específica (la última) como razón.
-        return f": {logs[-1].strip()}", detail
+    if relevant:
+        # Sin código traducible, pero SÍ hay algún log relevante
+        # (típicamente el motivo real que imprime el propio programa que
+        # revirtió, ej. un AnchorError con "Error Message: ...").
+        return f": {relevant[-1].strip()}", detail
 
     return ": revirtió con un error no reconocido (corré con -v para ver más detalle, o abrí el link de Solscan)", detail
 
@@ -219,13 +220,36 @@ async def _fetch_actual_fill(signature: str, rpc_url: str, mint: str,
             sol_delta = (meta.post_balances[0] - meta.pre_balances[0]) / 1_000_000_000.0
 
             def _token_amount_for_wallet(balances) -> Optional[float]:
+                """BUGFIX: la comparación era `b.mint == mint and b.owner ==
+                wallet`, con `mint`/`wallet` strings. Pero solders devuelve
+                esos campos como objetos Pubkey, no como str, así que ambas
+                igualdades daban False SIEMPRE contra un RPC real -> esto
+                devolvía None en cada compra y en cada venta, y el bot caía
+                al valor ESTIMADO todas las veces (entry_is_real_fill nunca
+                llegaba a True). Los tests no lo agarraban porque sus dobles
+                usan strings. Ahora se normaliza con str() de los dos lados.
+
+                Además, `owner` puede venir ausente/None según el nodo RPC.
+                En ese caso, si hay UNA sola entrada para el mint, es la
+                nuestra -no tiene sentido descartar el fill real por un
+                campo opcional que el nodo no mandó."""
                 if not balances:
                     return None
-                for b in balances:
-                    if b.mint == mint and b.owner == wallet:
-                        ui_amount = b.ui_token_amount.ui_amount
-                        return float(ui_amount) if ui_amount is not None else 0.0
-                return None
+                por_mint = [b for b in balances if str(b.mint) == mint]
+                if not por_mint:
+                    return None
+                propias = [b for b in por_mint
+                           if getattr(b, "owner", None) is not None and str(b.owner) == wallet]
+                if propias:
+                    elegida = propias[0]
+                elif len(por_mint) == 1:
+                    elegida = por_mint[0]
+                else:
+                    # Varias cuentas de ese mint y ninguna atribuible a la
+                    # wallet: no adivinamos cuál es la nuestra.
+                    return None
+                ui_amount = elegida.ui_token_amount.ui_amount
+                return float(ui_amount) if ui_amount is not None else 0.0
 
             pre_tokens = _token_amount_for_wallet(meta.pre_token_balances)
             post_tokens = _token_amount_for_wallet(meta.post_token_balances)
@@ -332,31 +356,37 @@ class PumpPortalClient:
            de los tres (es el precio de UN trade, no una cotización
            instantánea de reservas), pero sigue siendo 100% PumpPortal,
            en vivo, sin fuentes externas.
+
+        BUGFIX: el nivel 1 no tenía ninguna de las guardas que sí tenían
+        el 2 y el 3. Un evento con esos campos como string reventaba con
+        TypeError, y esa excepción subía hasta el `except Exception` de
+        _consume_trade_stream, que la logueaba como "conexión
+        interrumpida" y disparaba una reconexión con backoff que no
+        hacía falta. Y un `vSolInBondingCurve` en 0 devolvía 0.0, que el
+        llamador descarta como "sin precio" -en vez de seguir al nivel 2
+        (marketCapSol), que probablemente sí tenía el dato. Ahora los
+        tres niveles convierten y validan igual, y un nivel que no da un
+        precio positivo cae al siguiente en lugar de cortar la cadena.
         """
-        v_sol = event.get("vSolInBondingCurve")
-        v_tok = event.get("vTokensInBondingCurve")
-        if v_sol is not None and v_tok is not None and v_tok:
-            return v_sol / v_tok
+        v_sol = _as_positive_float(event.get("vSolInBondingCurve"))
+        v_tok = _as_positive_float(event.get("vTokensInBondingCurve"))
+        if v_sol is not None and v_tok is not None:
+            price = v_sol / v_tok
+            if price > 0:
+                return price
 
-        market_cap_sol = event.get("marketCapSol")
+        market_cap_sol = _as_positive_float(event.get("marketCapSol"))
         if market_cap_sol is not None:
-            try:
-                price = float(market_cap_sol) / cls.TOTAL_SUPPLY_TOKENS
-                if price > 0:
-                    return price
-            except (TypeError, ValueError):
-                pass
+            price = market_cap_sol / cls.TOTAL_SUPPLY_TOKENS
+            if price > 0:
+                return price
 
-        sol_amount = event.get("solAmount")
-        token_amount = event.get("tokenAmount")
+        sol_amount = _as_positive_float(event.get("solAmount"))
+        token_amount = _as_positive_float(event.get("tokenAmount"))
         if sol_amount is not None and token_amount is not None:
-            try:
-                sol_amount = float(sol_amount)
-                token_amount = float(token_amount)
-                if token_amount > 0:
-                    return sol_amount / token_amount
-            except (TypeError, ValueError):
-                pass
+            price = sol_amount / token_amount
+            if price > 0:
+                return price
 
         return None
 
@@ -635,11 +665,25 @@ class PumpSwapOnChainClient:
     externa nueva — tenelo en cuenta.
     """
 
-    # Offset en bytes de `base_mint` dentro de la cuenta del pool,
-    # verificado contra el struct real de pumpswapamm
-    # (PumpSwapPoolStateNew/Old en pumpswapamm.py):
-    #   8 (discriminador Anchor) + 1 (pool_bump) + 2 (index) + 32 (creator)
+    # Offsets en bytes dentro de la cuenta del pool, verificados contra el
+    # struct real de pumpswapamm (PumpSwapPoolStateNew/Old en
+    # pumpswapamm.py). Los campos son todos de largo fijo y los dos
+    # layouts (NEW/OLD) coinciden hasta `lp_supply` -solo difieren en el
+    # `coin_creator` del final-, así que estos offsets valen para ambos:
+    #   0   discriminador Anchor        (8)
+    #   8   pool_bump                   (1)
+    #   9   index                       (2)
+    #   11  creator                     (32)
+    #   43  base_mint                   (32)
+    #   75  quote_mint                  (32)
+    #   107 lp_mint                     (32)
+    #   139 pool_base_token_account     (32)
+    #   171 pool_quote_token_account    (32)
+    #   203 lp_supply                   (u64 little-endian)
     _BASE_MINT_OFFSET = 43
+    _QUOTE_MINT_OFFSET = 75
+    _LP_SUPPLY_OFFSET = 203
+    _MIN_POOL_ACCOUNT_LEN = _LP_SUPPLY_OFFSET + 8
 
     def __init__(self, rpc_url: str):
         self.rpc_url = rpc_url
@@ -700,12 +744,41 @@ class PumpSwapOnChainClient:
                 logger.warning(f"[On-chain PumpSwap] Falló la consulta on-chain para {mint}: {e}")
                 return None, False
 
+    @classmethod
+    def _pool_quote_mint(cls, data: bytes) -> Optional[str]:
+        """quote_mint del pool, leído del account data crudo."""
+        if data is None or len(data) < cls._MIN_POOL_ACCOUNT_LEN:
+            return None
+        raw = data[cls._QUOTE_MINT_OFFSET:cls._QUOTE_MINT_OFFSET + 32]
+        try:
+            return str(Pubkey.from_bytes(raw))
+        except Exception:
+            return None
+
+    @classmethod
+    def _pool_lp_supply(cls, data: bytes) -> Optional[int]:
+        """lp_supply del pool (u64 little-endian), leído del account data
+        crudo."""
+        if data is None or len(data) < cls._MIN_POOL_ACCOUNT_LEN:
+            return None
+        return int.from_bytes(data[cls._LP_SUPPLY_OFFSET:cls._LP_SUPPLY_OFFSET + 8], "little")
+
     async def _find_pool_address(self, client: AsyncClient, mint: str) -> Optional[str]:
         """getProgramAccounts sobre el programa de PumpSwap, filtrando por
         `base_mint == mint` con un memcmp en el offset exacto del struct.
         Si hay varios pools para el mismo mint (raro, pero el struct
         soporta `index`), nos quedamos con el de mayor `lp_supply` (el
-        pool "real" con liquidez, no uno vacío/de prueba)."""
+        pool "real" con liquidez, no uno vacío/de prueba).
+
+        BUGFIX: la selección entre candidatos llamaba a fetch_pool_state()
+        por cada uno, y esa función hace su PROPIO getAccountInfo -o sea,
+        un round-trip de RPC extra por candidato, justo en el camino que
+        ya es el que se come el rate limit. El account data crudo ya viene
+        en `acc.account.data` de este mismo getProgramAccounts, así que
+        ahora se parsea localmente: cero llamadas extra. De paso se
+        descartan acá los pools que no están denominados en SOL, en vez de
+        elegir el de mayor liquidez y recién después descubrir que no
+        sirve."""
         resp = await client.get_program_accounts(
             Pubkey.from_string(PUMPSWAP_PROGRAM_ID),
             encoding="base64",
@@ -717,23 +790,25 @@ class PumpSwapOnChainClient:
         if len(accounts) == 1:
             return str(accounts[0].pubkey)
 
-        # Más de un pool para el mismo mint: nos quedamos con el de mayor
-        # lp_supply.
-        #
-        # OJO: fetch_pool_state() hace su propio getAccountInfo, así que
-        # esto cuesta UN round-trip de RPC por candidato. El account data
-        # crudo ya viene en acc.account.data del getProgramAccounts de
-        # arriba, así que se podría parsear localmente y ahorrarlos todos
-        # -pendiente, ver PumpSwapPoolStateNew/Old en pumpswapamm.
         best_pubkey = None
         best_lp_supply = -1
+        descartados_por_quote = 0
         for acc in accounts:
-            try:
-                pool_keys, _ = await fetch_pool_state(acc.pubkey, client)
-                lp_supply = (pool_keys or {}).get("lp_supply", 0)
-                if lp_supply > best_lp_supply:
-                    best_lp_supply = lp_supply
-                    best_pubkey = str(acc.pubkey)
-            except Exception:
+            data = getattr(getattr(acc, "account", None), "data", None)
+            quote_mint = self._pool_quote_mint(data)
+            if quote_mint is not None and quote_mint != WSOL_MINT:
+                descartados_por_quote += 1
                 continue
+            lp_supply = self._pool_lp_supply(data)
+            if lp_supply is None:
+                # Cuenta más corta de lo esperado (¿layout nuevo?): no la
+                # descartamos, pero solo la usamos si no hay nada mejor.
+                lp_supply = 0
+            if lp_supply > best_lp_supply:
+                best_lp_supply = lp_supply
+                best_pubkey = str(acc.pubkey)
+
+        if descartados_por_quote:
+            logger.debug(f"[On-chain PumpSwap] {len(accounts)} pools para {mint}; "
+                         f"{descartados_por_quote} descartados por no estar denominados en SOL.")
         return best_pubkey
