@@ -265,7 +265,13 @@ class TradeExecutor:
         # coinciden en cuanto hay costes reales de por medio: el de
         # mercado es cuánto se movió el precio (el que muestra pump.fun),
         # el neto es lo que de verdad entró y salió de la wallet.
-        pnl_mercado = position.market_pnl_pct(exit_price)
+        # BUGFIX: se medía contra `exit_price`, que con datos reales de
+        # fill es el precio EFECTIVO (ya neto de comisiones de venta) —
+        # o sea, el número "de mercado" venía descontando fees y no era
+        # comparable con el que muestra pump.fun, que es justo para lo
+        # que existe. El movimiento de precio se mide siempre contra el
+        # precio de MERCADO con el que se disparó la venta.
+        pnl_mercado = position.market_pnl_pct(price)
         logger.info(f"[{etiqueta}] VENTA de {position.mint} a precio {exit_price:.10f} SOL/token "
                     f"| motivo: {reason} | mercado: {pnl_mercado:+.2f}% | PnL neto: {pnl_pct:+.2f}% "
                     f"({pnl_sol:+.9f} SOL) | SOL recibidos: {proceeds:.9f}{sufijo}")

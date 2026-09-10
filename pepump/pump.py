@@ -374,9 +374,19 @@ class PumpPortalClient:
         ya abierta y suscripta (ver connect_trade_stream)."""
         async for raw_msg in ws:
             try:
-                yield json.loads(raw_msg)
+                event = json.loads(raw_msg)
             except json.JSONDecodeError:
                 continue
+            # BUGFIX: un mensaje JSON válido pero que NO es un objeto
+            # (una lista, un string suelto) llegaba igual hasta
+            # extract_price()/`event.keys()` y reventaba con
+            # AttributeError. Esa excepción no la atrapa el camino de
+            # entrada (_get_reference_price la deja subir), así que
+            # tumbaba el bot con un traceback crudo. Acá se descarta.
+            if not isinstance(event, dict):
+                logger.debug(f"[Feed de trades] mensaje descartado (no es un objeto JSON): {event!r}")
+                continue
+            yield event
 
     @classmethod
     def extract_price(cls, event: dict) -> Optional[float]:

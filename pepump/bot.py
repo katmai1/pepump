@@ -231,7 +231,15 @@ class TrailingTakeProfitBot:
                 self._pending_next_event_task.cancel()
                 self._pending_next_event_task = None
             if self._ws is not None:
-                await self._ws.close()
+                # Un fallo al cerrar (socket ya roto del otro lado) no
+                # puede reventar el cierre del bot: si esto tira, la
+                # excepción sale de run() por el finally y run.py -que
+                # solo atrapa KeyboardInterrupt- muere con un traceback
+                # crudo DESPUÉS de una operación que salió bien.
+                try:
+                    await self._ws.close()
+                except Exception as e:
+                    logger.debug(f"No se pudo cerrar prolijamente el websocket: {e}")
 
         logger.info("Bot finalizado.")
 
@@ -392,10 +400,28 @@ class TrailingTakeProfitBot:
         llamada -mismo generador, mismo __anext__() en vuelo, sin
         cortar nada-. Recién se cancela de verdad si gana el shutdown
         (ahí sí termina todo)."""
-        if self._pending_next_event_task is None or self._pending_next_event_task.done():
+        # BUGFIX (evento perdido tras un stall): si la tarea que quedó
+        # pendiente de un timeout anterior YA terminó, su resultado es un
+        # trade real que llegó mientras hacíamos otra cosa (típicamente
+        # las consultas RPC de _handle_feed_stall, que tardan). Antes se
+        # descartaba y se creaba un __anext__() nuevo: ese trade se
+        # perdía -y con él, una evaluación del trailing-stop y el reset
+        # de self._curve_stalls-. Si terminó con excepción (conexión
+        # cerrada), .result() la propaga acá y el llamador reconecta, en
+        # vez de quedar como "Task exception was never retrieved".
+        pending = self._pending_next_event_task
+        if pending is not None and pending.done() and not pending.cancelled():
+            self._pending_next_event_task = None
+            if self._shutdown_requested.is_set():
+                # Se pidió apagado mientras tanto: no devolvemos un
+                # precio que dispararía una compra justo al salir.
+                raise _ShutdownRequested()
+            return pending.result()
+
+        if pending is None or pending.cancelled():
             next_task = asyncio.ensure_future(self._trade_events.__anext__())
         else:
-            next_task = self._pending_next_event_task
+            next_task = pending
         shutdown_task = asyncio.ensure_future(self._shutdown_requested.wait())
         done, _pending = await asyncio.wait(
             {next_task, shutdown_task}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
