@@ -636,11 +636,19 @@ class PumpCurveOnChainClient:
         )
         return pda
 
-    async def fetch_price_or_status(self, mint: str) -> tuple[Optional[float], bool, bool]:
+    async def fetch_price_or_status(self, mint: str) -> tuple[Optional[float], bool, Optional[bool]]:
         """Devuelve (price, complete, exists):
-          - exists=False: no existe cuenta de bonding curve para este
-            mint (mint inválido, o -muy raro- ya se cerró tras migrar).
-            price y complete no significan nada en este caso.
+          - exists=False: CONFIRMADO que no existe cuenta de bonding
+            curve para este mint (la consulta a la cuenta respondió
+            bien y vino vacía) -señal fuerte de que este mint nunca se
+            lanzó en pump.fun (ej. un mint nativo de Raydium/Meteora/
+            otro DEX), a diferencia de exists=None (ver abajo). price y
+            complete no significan nada en este caso.
+          - exists=None: la consulta on-chain en sí falló (red/RPC/
+            parseo) -NO es una confirmación de nada sobre la cuenta,
+            a diferencia de exists=False. El llamador no debería sacar
+            ninguna conclusión sobre si el mint es o no de pump.fun a
+            partir de este caso.
           - exists=True, complete=True: la curva ya completó. price
             puede venir igual (últimas reservas antes de completar) pero
             el llamador NO debería seguir operando con este fallback -
@@ -650,9 +658,9 @@ class PumpCurveOnChainClient:
 
         Nunca tira excepción hacia arriba (mismo criterio que
         PumpSwapOnChainClient.fetch_price_or_confirm_absent): cualquier
-        error de red/RPC/parseo devuelve (None, False, False), para que
-        el llamador no asuma ninguna conclusión de un fallo que no tiene
-        nada que ver con el estado real de la curva."""
+        error de red/RPC/parseo devuelve (None, False, None) -exists=None,
+        no False- para no confundir un fallo de RPC con una confirmación
+        real de que la cuenta no existe."""
         try:
             pda = self._bonding_curve_address(mint)
             async with AsyncClient(self.rpc_url) as client:
@@ -694,7 +702,7 @@ class PumpCurveOnChainClient:
                 return float(price), complete, True
         except Exception as e:
             logger.warning(f"[On-chain bonding curve] Falló la consulta on-chain para {mint}: {e}")
-            return None, False, False
+            return None, False, None
 
 
 class PumpSwapOnChainClient:

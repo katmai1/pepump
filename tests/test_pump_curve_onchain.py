@@ -175,4 +175,4 @@ def test_excepcion_de_red_no_propaga(monkeypatch):
 
     assert price is None
     assert complete is False
-    assert exists is False
+    assert exists is None

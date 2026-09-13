@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import logging
 import signal
 import time
@@ -24,6 +25,16 @@ _DIAGNOSTIC_REMINDER_SECONDS = 10.0
 # default son 20s de ceguera por precio. Se reinicia en cuanto vuelve
 # a llegar un trade real (ver _consume_trade_stream).
 _MAX_CURVE_STALLS_BEFORE_POLLING = 2
+
+# Mientras el chequeo temprano de existencia on-chain (ver
+# _confirm_mint_not_pumpfun / _get_reference_price) todavía no terminó,
+# cada espera de un trade del feed en vivo se corta en rebanadas de
+# esta duración en vez de esperar de una todo `live_feed_timeout_seconds`
+# -así, apenas ese chequeo confirma que el mint no es de pump.fun, el
+# bot aborta en el próximo ciclo del loop en vez de recién después de
+# los live_feed_timeout_seconds completos (pensados para tolerar
+# tokens de poco volumen, no para esto).
+_EXISTENCE_CHECK_POLL_SECONDS = 0.5
 
 
 class _ShutdownRequested(Exception):
@@ -73,6 +84,16 @@ class TrailingTakeProfitBot:
         #                     precio directo del pool on-chain (ver
         #                     PumpSwapOnChainClient).
         self._onchain_source: Optional[str] = None
+        # Si _get_reference_price (o algo que llame desde ahí) ya
+        # logueó un motivo específico para devolver None -mint que no es
+        # de pump.fun, timeout total, fallback on-chain sin precio,
+        # conexión cortada, etc.-, se marca acá para que el caller en
+        # run() NO agregue ENCIMA el mensaje genérico de "se cortó la
+        # conexión, verificá la dirección y la api_key": antes se
+        # logueaban los dos, uno específico y después uno genérico que
+        # podía contradecirlo (ej. "no es un token de pump.fun" seguido
+        # de "verificá la api_key"), muy confuso para el usuario.
+        self._initial_price_failure_reason_logged = False
         # Stalls SEGUIDOS del feed en vivo con la bonding curve todavía
         # activa (ver _handle_feed_stall y _MAX_CURVE_STALLS_BEFORE_POLLING).
         self._curve_stalls = 0
@@ -173,7 +194,14 @@ class TrailingTakeProfitBot:
             if initial_price is None:
                 if self._shutdown_requested.is_set():
                     logger.info("Cancelado antes de abrir posición; no hay nada que vender.")
-                else:
+                elif not self._initial_price_failure_reason_logged:
+                    # Solo llegamos acá si no se logueó ningún motivo
+                    # específico arriba (ver _initial_price_failure_reason_logged):
+                    # un caso realmente no cubierto por los diagnósticos de
+                    # _get_reference_price. Si ya se logueó un motivo
+                    # puntual (mint que no es de pump.fun, timeout total,
+                    # fallback on-chain sin precio, etc.) NO lo repetimos acá
+                    # con un mensaje genérico que podría contradecirlo.
                     logger.error("Se cortó la conexión con PumpPortal antes de recibir un trade con "
                                  "precio. Verificá la dirección del token y la api_key, y volvé a intentar.")
                 return
@@ -481,6 +509,15 @@ class TrailingTakeProfitBot:
              confirmado a mano) y probamos el fallback on-chain
              (_try_onchain_fallback).
 
+        En PARALELO con lo anterior, desde el arranque, corre
+        _confirm_mint_not_pumpfun() en segundo plano (ver ese método):
+        confirma cuanto antes -sin esperar ningún timeout pensado para
+        tolerar tokens de poco volumen- si el mint directamente NO es de
+        pump.fun/PumpSwap (ni bonding curve ni pool, ambas consultas
+        confirmando ausencia). Es una pregunta que no depende de cuánto
+        volumen tenga el token, así que no tiene sentido esperar a
+        `live_feed_timeout_seconds` para hacerla.
+
         En cualquier momento de esta espera, Ctrl+C/SIGTERM corta todo de
         una y devuelve None (todavía no hay posición abierta, así que no
         hay nada que vender).
@@ -493,90 +530,158 @@ class TrailingTakeProfitBot:
         ack_received_at: Optional[float] = None
         sin_precio = 0
 
-        while True:
-            timeout = None
-            if recibio_ack:
-                elapsed_since_ack = time.monotonic() - ack_received_at
-                timeout = self.cfg.live_feed_timeout_seconds - elapsed_since_ack
-                if timeout <= 0:
-                    if time.monotonic() - start >= self.cfg.entry_wait_timeout_seconds:
-                        logger.error(f"[Feed en vivo] pasaron {self.cfg.entry_wait_timeout_seconds:.0f}s "
-                                     f"en total esperando el precio de entrada, sin ningún trade real y "
-                                     f"sin encontrar un pool de PumpSwap. Abortando esta entrada.")
+        existence_check_task: Optional[asyncio.Task] = asyncio.ensure_future(
+            self._confirm_mint_not_pumpfun()
+        )
+        try:
+            while True:
+                if existence_check_task is not None and existence_check_task.done():
+                    mint_not_pumpfun = existence_check_task.result()
+                    existence_check_task = None
+                    if mint_not_pumpfun:
+                        self._log_mint_not_pumpfun_abort()
+                        self._initial_price_failure_reason_logged = True
                         return None
 
-                    logger.debug(f"[Feed en vivo] pasaron {self.cfg.live_feed_timeout_seconds:.0f}s desde el "
-                                 f"ack sin ningún trade real -> probablemente este mint ya migró a PumpSwap "
-                                 f"y subscribeTokenTrade no lo cubre. Probando fallback on-chain...")
-                    price, pool_confirmed_absent = await self._try_onchain_fallback()
-                    if price is not None:
-                        return price
-                    if pool_confirmed_absent:
-                        logger.info(f"[On-chain PumpSwap] Confirmado: todavía no hay pool de PumpSwap "
-                                     f"para este mint -sigue en bonding curve, probablemente solo poco "
-                                     f"volumen-. Sigo esperando el feed en vivo (hasta "
-                                     f"{self.cfg.entry_wait_timeout_seconds:.0f}s en total)...")
-                        ack_received_at = time.monotonic()  # reinicia la ventana antes del próximo intento
-                        continue
-                    logger.error("[On-chain PumpSwap] Tampoco se pudo obtener precio on-chain para este "
-                                 "mint. No hay ninguna fuente de precio disponible; abortando esta entrada.")
+                timeout = None
+                if recibio_ack:
+                    elapsed_since_ack = time.monotonic() - ack_received_at
+                    timeout = self.cfg.live_feed_timeout_seconds - elapsed_since_ack
+                    if timeout <= 0:
+                        if time.monotonic() - start >= self.cfg.entry_wait_timeout_seconds:
+                            logger.error(f"[Feed en vivo] pasaron {self.cfg.entry_wait_timeout_seconds:.0f}s "
+                                         f"en total esperando el precio de entrada, sin ningún trade real y "
+                                         f"sin encontrar un pool de PumpSwap. Abortando esta entrada.")
+                            self._initial_price_failure_reason_logged = True
+                            return None
+
+                        logger.debug(f"[Feed en vivo] pasaron {self.cfg.live_feed_timeout_seconds:.0f}s desde el "
+                                     f"ack sin ningún trade real -> probablemente este mint ya migró a PumpSwap "
+                                     f"y subscribeTokenTrade no lo cubre. Probando fallback on-chain...")
+                        price, pool_confirmed_absent, mint_not_pumpfun = await self._try_onchain_fallback()
+                        if price is not None:
+                            return price
+                        if mint_not_pumpfun:
+                            self._log_mint_not_pumpfun_abort()
+                            self._initial_price_failure_reason_logged = True
+                            return None
+                        if pool_confirmed_absent:
+                            logger.info(f"[On-chain PumpSwap] Confirmado: todavía no hay pool de PumpSwap "
+                                         f"para este mint -sigue en bonding curve, probablemente solo poco "
+                                         f"volumen-. Sigo esperando el feed en vivo (hasta "
+                                         f"{self.cfg.entry_wait_timeout_seconds:.0f}s en total)...")
+                            ack_received_at = time.monotonic()  # reinicia la ventana antes del próximo intento
+                            continue
+                        logger.error("[On-chain PumpSwap] Tampoco se pudo obtener precio on-chain para este "
+                                     "mint. No hay ninguna fuente de precio disponible; abortando esta entrada.")
+                        self._initial_price_failure_reason_logged = True
+                        return None
+
+                    if existence_check_task is not None:
+                        # Todavía no se resolvió el chequeo temprano de
+                        # existencia: en vez de bloquearnos acá hasta
+                        # los live_feed_timeout_seconds completos,
+                        # cortamos la espera en rebanadas cortas para
+                        # poder revisarlo (arriba, al volver al inicio
+                        # del loop) y abortar apenas confirme que el
+                        # mint no es de pump.fun.
+                        timeout = min(timeout, _EXISTENCE_CHECK_POLL_SECONDS)
+
+                try:
+                    event = await self._next_trade_event(timeout=timeout)
+                except _ShutdownRequested:
+                    logger.info("Cancelado por el usuario mientras se esperaba el precio de entrada.")
+                    return None
+                except asyncio.TimeoutError:
+                    continue  # se recalcula el timeout restante y dispara el fallback arriba
+                except StopAsyncIteration:
+                    logger.warning("[Feed en vivo] la conexión se cerró antes de recibir un trade con precio.")
+                    self._initial_price_failure_reason_logged = True
+                    return None
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.error(f"[Feed en vivo] la conexión falló: {e}")
+                    self._initial_price_failure_reason_logged = True
                     return None
 
-            try:
-                event = await self._next_trade_event(timeout=timeout)
-            except _ShutdownRequested:
-                logger.info("Cancelado por el usuario mientras se esperaba el precio de entrada.")
-                return None
-            except asyncio.TimeoutError:
-                continue  # se recalcula el timeout restante y dispara el fallback arriba
-            except StopAsyncIteration:
-                logger.warning("[Feed en vivo] la conexión se cerró antes de recibir un trade con precio.")
-                return None
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.error(f"[Feed en vivo] la conexión falló: {e}")
-                return None
+                price = self.client.extract_price(event)
+                if price is not None and price > 0:
+                    logger.info(f"Precio de referencia (feed en vivo, subscribe_trade): {price:.10f} SOL/token")
+                    return price
 
-            price = self.client.extract_price(event)
-            if price is not None and price > 0:
-                logger.info(f"Precio de referencia (feed en vivo, subscribe_trade): {price:.10f} SOL/token")
-                return price
+                # Distinguimos el ack de confirmación del subscribe (evento
+                # con ÚNICAMENTE la clave "message", ej.
+                # {"message": "Successfully subscribed to keys."}) de
+                # cualquier otro evento con forma rara. El ack en sí es
+                # normal y no indica ningún problema: solo confirma que la
+                # suscripción fue aceptada.
+                if not recibio_ack and set(event.keys()) == {"message"}:
+                    recibio_ack = True
+                    ack_received_at = time.monotonic()
+                    logger.debug(f"[Feed en vivo] confirmación de suscripción recibida ({event['message']!r}). "
+                                 f"Esperando hasta {self.cfg.live_feed_timeout_seconds:.0f}s más por un trade "
+                                 f"real antes de recurrir al fallback on-chain...")
+                else:
+                    # Llegó un evento (que no es el ack) pero no se pudo
+                    # calcular el precio. Lo avisamos, con las claves del
+                    # evento, para poder diagnosticarlo sin quedar en silencio.
+                    sin_precio += 1
+                    if sin_precio == 1 or sin_precio % 20 == 0:
+                        logger.debug(f"[Feed en vivo] llegaron eventos pero no se pudo calcular el precio "
+                                     f"(claves del evento: {sorted(event.keys())}). Sigo esperando...")
 
-            # Distinguimos el ack de confirmación del subscribe (evento
-            # con ÚNICAMENTE la clave "message", ej.
-            # {"message": "Successfully subscribed to keys."}) de
-            # cualquier otro evento con forma rara. El ack en sí es
-            # normal y no indica ningún problema: solo confirma que la
-            # suscripción fue aceptada.
-            if not recibio_ack and set(event.keys()) == {"message"}:
-                recibio_ack = True
-                ack_received_at = time.monotonic()
-                logger.debug(f"[Feed en vivo] confirmación de suscripción recibida ({event['message']!r}). "
-                             f"Esperando hasta {self.cfg.live_feed_timeout_seconds:.0f}s más por un trade "
-                             f"real antes de recurrir al fallback on-chain...")
-            else:
-                # Llegó un evento (que no es el ack) pero no se pudo
-                # calcular el precio. Lo avisamos, con las claves del
-                # evento, para poder diagnosticarlo sin quedar en silencio.
-                sin_precio += 1
-                if sin_precio == 1 or sin_precio % 20 == 0:
-                    logger.debug(f"[Feed en vivo] llegaron eventos pero no se pudo calcular el precio "
-                                 f"(claves del evento: {sorted(event.keys())}). Sigo esperando...")
+                # Recordatorio periódico SOLO mientras no llegó ni el ack —
+                # una vez que llega, el timeout de arriba ya se encarga de
+                # decidir cuándo pasar al fallback, así que este recordatorio
+                # sería redundante.
+                if not recibio_ack:
+                    now = time.monotonic()
+                    if now - last_reminder >= _DIAGNOSTIC_REMINDER_SECONDS:
+                        last_reminder = now
+                        elapsed = now - start
+                        logger.warning(f"[Feed en vivo] {elapsed:.0f}s esperando y todavía ni siquiera llegó "
+                                       f"el ack de suscripción. Revisá la conexión de red y que el mint sea correcto.")
+        finally:
+            if existence_check_task is not None and not existence_check_task.done():
+                existence_check_task.cancel()
+                with contextlib.suppress(BaseException):
+                    await existence_check_task
 
-            # Recordatorio periódico SOLO mientras no llegó ni el ack —
-            # una vez que llega, el timeout de arriba ya se encarga de
-            # decidir cuándo pasar al fallback, así que este recordatorio
-            # sería redundante.
-            if not recibio_ack:
-                now = time.monotonic()
-                if now - last_reminder >= _DIAGNOSTIC_REMINDER_SECONDS:
-                    last_reminder = now
-                    elapsed = now - start
-                    logger.warning(f"[Feed en vivo] {elapsed:.0f}s esperando y todavía ni siquiera llegó "
-                                   f"el ack de suscripción. Revisá la conexión de red y que el mint sea correcto.")
+    def _log_mint_not_pumpfun_abort(self) -> None:
+        """Único mensaje de error para el caso "este mint no es de
+        pump.fun/PumpSwap" -antes se logueaba una vez en
+        _try_onchain_fallback (o en el chequeo temprano) Y OTRA VEZ acá,
+        con textos parecidos pero no idénticos, lo que se leía como dos
+        errores mezclados para un solo problema."""
+        logger.error(f"Abortando esta entrada: {self.mint} no es un token de pump.fun/PumpSwap "
+                     f"(no tiene bonding curve ni pool de PumpSwap). Si este mint está en "
+                     f"Raydium/Meteora/otro DEX, este bot no puede calcular su precio de entrada.")
 
-    async def _try_onchain_fallback(self) -> tuple[Optional[float], bool]:
+    async def _confirm_mint_not_pumpfun(self) -> bool:
+        """Chequeo temprano y SIN efectos secundarios (no toca
+        self._onchain_source, a diferencia de _try_onchain_fallback):
+        confirma lo antes posible si este mint NUNCA se lanzó en
+        pump.fun, consultando en paralelo con la espera del feed en vivo
+        desde el arranque de _get_reference_price -en vez de recién
+        después de `live_feed_timeout_seconds`, que existe para tolerar
+        tokens de poco volumen y no tiene nada que ver con esta pregunta.
+
+        Devuelve True solo si AMBAS consultas on-chain (PumpSwap y
+        bonding curve) respondieron bien y confirmaron ausencia -nunca
+        ante un fallo de RPC (ver PumpSwapOnChainClient.
+        fetch_price_or_confirm_absent y PumpCurveOnChainClient.
+        fetch_price_or_status), para no abortar una entrada válida por
+        un problema transitorio de conexión."""
+        onchain = PumpSwapOnChainClient(self.cfg.solana_rpc_url)
+        _, pool_confirmed_absent = await onchain.fetch_price_or_confirm_absent(self.mint)
+        if not pool_confirmed_absent:
+            return False
+        curve = PumpCurveOnChainClient(self.cfg.solana_rpc_url)
+        _, _, exists = await curve.fetch_price_or_status(self.mint)
+        return exists is False
+
+    async def _try_onchain_fallback(self) -> tuple[Optional[float], bool, bool]:
         """Consulta puntual a los fallbacks on-chain, en dos pasos:
 
         1. PumpSwap (ver PumpSwapOnChainClient): si aparece un pool con
@@ -592,15 +697,25 @@ class TrailingTakeProfitBot:
            quedamos en modo polling on-chain por bonding curve para el
            resto de la posición.
 
-        Devuelve (price, pool_confirmed_absent):
+        Devuelve (price, pool_confirmed_absent, mint_not_pumpfun):
           - price no-None: se resolvió por alguno de los dos fallbacks
             -`self._onchain_source` queda seteado ("pumpswap" o
             "bondingcurve") para que el monitoreo posterior de la
             posición (ver _poll_onchain_price_loop) sepa con cuál seguir.
-          - price None, pool_confirmed_absent True: NI el pool de
-            PumpSwap NI la bonding curve dieron un precio utilizable
-            (curva sin datos legibles, o ya completada pero el pool de
-            PumpSwap todavía no está indexado). El llamador
+          - price None, pool_confirmed_absent True, mint_not_pumpfun
+            True: NI el pool de PumpSwap NI la cuenta de bonding curve
+            existen para este mint (ambas consultas respondieron bien y
+            confirmaron ausencia, no un fallo de RPC) -> este mint NUNCA
+            se lanzó en pump.fun (ej. un mint nativo de Raydium/
+            Meteora/otro DEX). No tiene sentido seguir esperando el feed
+            en vivo ni reintentar este fallback: nunca va a aparecer
+            nada acá. El llamador (_get_reference_price) debería
+            abortar de una en vez de esperar hasta el timeout.
+          - price None, pool_confirmed_absent True, mint_not_pumpfun
+            False: la bonding curve existe pero no dio un precio
+            utilizable (ya completada y el pool de PumpSwap todavía no
+            está indexado, cuenta con datos ilegibles, o falló la
+            consulta on-chain en sí -RPC caído-). El llamador
             (_get_reference_price) decide si sigue esperando el feed en
             vivo un ciclo más.
           - price None, pool_confirmed_absent False: la consulta de
@@ -613,7 +728,7 @@ class TrailingTakeProfitBot:
         if price is not None:
             logger.info(f"Precio de referencia (fallback on-chain PumpSwap): {price:.10f} SOL/token")
             self._onchain_source = "pumpswap"
-            return price, pool_confirmed_absent
+            return price, pool_confirmed_absent, False
 
         if pool_confirmed_absent:
             curve = PumpCurveOnChainClient(self.cfg.solana_rpc_url)
@@ -622,13 +737,22 @@ class TrailingTakeProfitBot:
                 logger.info(f"Precio de referencia (fallback on-chain bonding curve): "
                             f"{curve_price:.10f} SOL/token")
                 self._onchain_source = "bondingcurve"
-                return curve_price, pool_confirmed_absent
+                return curve_price, pool_confirmed_absent, False
             if exists and complete:
                 logger.debug("[On-chain bonding curve] La curva ya completó (migrando a PumpSwap) "
                              "pero el pool de PumpSwap todavía no aparece indexado. Reintento en el "
                              "próximo ciclo.")
+            elif exists is False:
+                # Mensaje de error único para este caso: lo loguea el
+                # llamador (_get_reference_price._log_mint_not_pumpfun_abort),
+                # no acá -de lo contrario saldrían dos ERROR casi
+                # idénticos para un solo problema (este chequeo normalmente
+                # ya lo detectó antes vía _confirm_mint_not_pumpfun).
+                logger.debug(f"[On-chain] {self.mint} no tiene bonding curve de pump.fun NI pool de "
+                             f"PumpSwap (ambas consultas confirmaron ausencia).")
+                return price, pool_confirmed_absent, True
 
-        return price, pool_confirmed_absent
+        return price, pool_confirmed_absent, False
 
     async def _wait_for_dip_entry(self, reference_price: float, target_price: float) -> Optional[float]:
         """Sólo se llama cuando `entry_dip_pct` > 0 (ver _get_initial_price).
