@@ -287,6 +287,57 @@ def test_mint_de_raydium_cpmm_usa_precio_del_pool_y_rutea_por_raydium_cpmm(monke
     assert asyncio.run(bot._onchain_fetch_price()) == pytest.approx(0.00206)
 
 
+def test_curva_completa_con_pool_oficial_contra_otro_token_usa_meteora_dlmm(monkeypatch):
+    """Caso real (Hg5Ja5...pump, baton): la bonding curve completó, pero el
+    pool oficial de PumpSwap está cotizado contra PUMP (se descarta ->
+    'sin pool') y la liquidez contra SOL vive en Meteora DLMM. Antes el bot
+    reintentaba "pool todavía no indexado" hasta entry_wait_timeout_seconds
+    y abortaba."""
+    client = FakeTradeStreamClient()
+    executor = SpyExecutor()
+    cfg = make_config(live_feed_timeout_seconds=0.03, entry_wait_timeout_seconds=5.0)
+    bot = TrailingTakeProfitBot(client=client, executor=executor, config=cfg)
+    bot._trade_events = _ack_then_hang()
+
+    fake_onchain = FakeOnChainClient(cfg.solana_rpc_url, [(None, True)])
+    monkeypatch.setattr(bot_module, "PumpSwapOnChainClient", lambda rpc_url: fake_onchain)
+    fake_curve = FakeCurveOnChainClient(cfg.solana_rpc_url, [(None, True, True)])  # curva completada
+    monkeypatch.setattr(bot_module, "PumpCurveOnChainClient", lambda rpc_url: fake_curve)
+    fake_dlmm = FakeCpmmOnChainClient(cfg.solana_rpc_url, [(0.0000787, False)])
+    monkeypatch.setattr(bot_module, "MeteoraDlmmOnChainClient", lambda rpc_url: fake_dlmm)
+
+    price = asyncio.run(asyncio.wait_for(bot._get_reference_price(), timeout=5))
+
+    assert price == pytest.approx(0.0000787)
+    assert bot._onchain_source == "meteora-dlmm"
+    # PumpPortal no tiene pool "meteora": se fuerza "auto" aunque cfg.pool diga otra cosa.
+    bot.cfg.pool = "pump"
+    assert bot._current_pool_override() == "auto"
+    assert asyncio.run(bot._onchain_fetch_price()) == pytest.approx(0.0000787)
+
+
+def test_mint_sin_bonding_curve_ni_cpmm_usa_meteora_dlmm(monkeypatch):
+    """Mint que nunca pasó por pump.fun, sin pool CPMM, pero con pool DLMM
+    contra SOL: no hay que abortar como 'mint no es de pump.fun'."""
+    client = FakeTradeStreamClient()
+    executor = SpyExecutor()
+    cfg = make_config(live_feed_timeout_seconds=0.03, entry_wait_timeout_seconds=5.0)
+    bot = TrailingTakeProfitBot(client=client, executor=executor, config=cfg)
+    bot._trade_events = _ack_then_hang()
+
+    fake_onchain = FakeOnChainClient(cfg.solana_rpc_url, [(None, True)])
+    monkeypatch.setattr(bot_module, "PumpSwapOnChainClient", lambda rpc_url: fake_onchain)
+    fake_curve = FakeCurveOnChainClient(cfg.solana_rpc_url, [(None, False, False)])
+    monkeypatch.setattr(bot_module, "PumpCurveOnChainClient", lambda rpc_url: fake_curve)
+    fake_dlmm = FakeCpmmOnChainClient(cfg.solana_rpc_url, [(0.0031, False)])
+    monkeypatch.setattr(bot_module, "MeteoraDlmmOnChainClient", lambda rpc_url: fake_dlmm)
+
+    price = asyncio.run(asyncio.wait_for(bot._get_reference_price(), timeout=5))
+
+    assert price == pytest.approx(0.0031)
+    assert bot._onchain_source == "meteora-dlmm"
+
+
 def test_mint_sin_bonding_curve_ni_pool_aborta_sin_esperar_live_feed_timeout(monkeypatch):
     """Regresión del bug reportado: antes, aunque el mint NUNCA hubiera
     sido de pump.fun, el bot se quedaba esperando `live_feed_timeout_seconds`

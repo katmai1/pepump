@@ -119,8 +119,8 @@ class SpyExecutor:
 
 
 class _RaydiumCpmmSinPools:
-    """Doble de RaydiumCpmmOnChainClient que siempre confirma 'no hay
-    pool'."""
+    """Doble de RaydiumCpmmOnChainClient / MeteoraDlmmOnChainClient que
+    siempre confirma 'no hay pool'."""
 
     def __init__(self, rpc_url):
         self.rpc_url = rpc_url
@@ -134,11 +134,12 @@ class _RaydiumCpmmSinPools:
 
 @pytest.fixture(autouse=True)
 def _sin_raydium_cpmm_real(monkeypatch):
-    """Ningún test de bot.py le pega al RPC real de Raydium CPMM por
-    accidente: por defecto 'no hay pool'. Los tests que necesitan otra
-    cosa lo pisan con su propio monkeypatch."""
+    """Ningún test de bot.py le pega al RPC real de Raydium CPMM ni de
+    Meteora DLMM por accidente: por defecto 'no hay pool'. Los tests que
+    necesitan otra cosa lo pisan con su propio monkeypatch."""
     from pepump import bot as bot_module
     monkeypatch.setattr(bot_module, "RaydiumCpmmOnChainClient", _RaydiumCpmmSinPools)
+    monkeypatch.setattr(bot_module, "MeteoraDlmmOnChainClient", _RaydiumCpmmSinPools)
 
 
 @pytest.fixture

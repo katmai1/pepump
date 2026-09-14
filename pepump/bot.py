@@ -6,7 +6,8 @@ import time
 from typing import AsyncIterator, Optional
 
 from pepump.executor import Position
-from pepump.pump import PumpSwapOnChainClient, PumpCurveOnChainClient, RaydiumCpmmOnChainClient
+from pepump.pump import (PumpSwapOnChainClient, PumpCurveOnChainClient, RaydiumCpmmOnChainClient,
+                         MeteoraDlmmOnChainClient)
 
 logger = logging.getLogger(__name__)
 
@@ -391,6 +392,9 @@ class TrailingTakeProfitBot:
         if self._onchain_source == "raydium-cpmm":
             cpmm = RaydiumCpmmOnChainClient(self.cfg.solana_rpc_url)
             return await cpmm.fetch_price(self.mint)
+        if self._onchain_source == "meteora-dlmm":
+            dlmm = MeteoraDlmmOnChainClient(self.cfg.solana_rpc_url)
+            return await dlmm.fetch_price(self.mint)
         if self._onchain_source == "bondingcurve":
             curve = PumpCurveOnChainClient(self.cfg.solana_rpc_url)
             price, complete, exists = await curve.fetch_price_or_status(self.mint)
@@ -659,8 +663,9 @@ class TrailingTakeProfitBot:
         errores mezclados para un solo problema."""
         logger.error(f"Abortando esta entrada: no hay de dónde sacar el precio de {self.mint} "
                      f"(no tiene bonding curve de pump.fun, ni pool oficial de migración en "
-                     f"PumpSwap, ni pool de Raydium CPMM contra SOL con liquidez real). Si está en "
-                     f"otro DEX (Meteora, Raydium AMM v4/CLMM, LaunchLab sin graduar...), este bot "
+                     f"PumpSwap, ni pool de Raydium CPMM ni de Meteora DLMM contra SOL con liquidez "
+                     f"real). Si está en otro DEX (Meteora DAMM, Raydium AMM v4/CLMM, LaunchLab sin "
+                     f"graduar...), este bot "
                      f"no puede calcular su precio de entrada.")
 
     async def _confirm_mint_not_pumpfun(self) -> bool:
@@ -673,7 +678,7 @@ class TrailingTakeProfitBot:
         tokens de poco volumen y no tiene nada que ver con esta pregunta.
 
         Devuelve True solo si TODAS las consultas on-chain (PumpSwap,
-        bonding curve y Raydium CPMM) respondieron bien y confirmaron
+        bonding curve, Raydium CPMM y Meteora DLMM) respondieron bien y confirmaron
         ausencia -nunca ante un fallo de RPC (ver PumpSwapOnChainClient.
         fetch_price_or_confirm_absent y PumpCurveOnChainClient.
         fetch_price_or_status), para no abortar una entrada válida por
@@ -688,7 +693,23 @@ class TrailingTakeProfitBot:
             return False
         cpmm = RaydiumCpmmOnChainClient(self.cfg.solana_rpc_url)
         _, cpmm_confirmed_absent = await cpmm.fetch_price_or_confirm_absent(self.mint)
-        return cpmm_confirmed_absent
+        if not cpmm_confirmed_absent:
+            return False
+        dlmm = MeteoraDlmmOnChainClient(self.cfg.solana_rpc_url)
+        _, dlmm_confirmed_absent = await dlmm.fetch_price_or_confirm_absent(self.mint)
+        return dlmm_confirmed_absent
+
+    async def _try_meteora_dlmm(self) -> tuple[Optional[float], bool]:
+        """Fallback de Meteora DLMM para las dos ramas de
+        _try_onchain_fallback que no encontraron pool contra SOL en
+        pump.fun/PumpSwap/Raydium CPMM. (price, confirmed_absent); si hay
+        precio, deja `self._onchain_source` en "meteora-dlmm"."""
+        dlmm = MeteoraDlmmOnChainClient(self.cfg.solana_rpc_url)
+        price, confirmed_absent = await dlmm.fetch_price_or_confirm_absent(self.mint)
+        if price is not None:
+            logger.info(f"Precio de referencia (fallback on-chain Meteora DLMM): {price:.10f} SOL/token")
+            self._onchain_source = "meteora-dlmm"
+        return price, confirmed_absent
 
     async def _try_onchain_fallback(self) -> tuple[Optional[float], bool, bool]:
         """Consulta puntual a los fallbacks on-chain, en dos pasos:
@@ -709,7 +730,7 @@ class TrailingTakeProfitBot:
         Devuelve (price, pool_confirmed_absent, mint_not_pumpfun):
           - price no-None: se resolvió por alguno de los dos fallbacks
             -`self._onchain_source` queda seteado ("pumpswap",
-            "bondingcurve" o "raydium-cpmm") para que el monitoreo posterior de la
+            "bondingcurve", "raydium-cpmm" o "meteora-dlmm") para que el monitoreo posterior de la
             posición (ver _poll_onchain_price_loop) sepa con cuál seguir.
           - price None, pool_confirmed_absent True, mint_not_pumpfun
             True: NI el pool de PumpSwap NI la cuenta de bonding curve
@@ -748,6 +769,13 @@ class TrailingTakeProfitBot:
                 self._onchain_source = "bondingcurve"
                 return curve_price, pool_confirmed_absent, False
             if exists and complete:
+                # Curva completada sin pool oficial de PumpSwap contra SOL:
+                # o todavía no está indexado, o el pool oficial está
+                # cotizado contra otro token y la liquidez contra SOL vive
+                # en Meteora DLMM (caso real Hg5Ja5...pump, pool contra PUMP).
+                dlmm_price, _ = await self._try_meteora_dlmm()
+                if dlmm_price is not None:
+                    return dlmm_price, pool_confirmed_absent, False
                 logger.debug("[On-chain bonding curve] La curva ya completó (migrando a PumpSwap) "
                              "pero el pool de PumpSwap todavía no aparece indexado. Reintento en el "
                              "próximo ciclo.")
@@ -762,14 +790,17 @@ class TrailingTakeProfitBot:
                                 f"{cpmm_price:.10f} SOL/token")
                     self._onchain_source = "raydium-cpmm"
                     return cpmm_price, pool_confirmed_absent, False
-                if cpmm_confirmed_absent:
+                dlmm_price, dlmm_confirmed_absent = await self._try_meteora_dlmm()
+                if dlmm_price is not None:
+                    return dlmm_price, pool_confirmed_absent, False
+                if cpmm_confirmed_absent and dlmm_confirmed_absent:
                     # Mensaje de error único para este caso: lo loguea el
                     # llamador (_get_reference_price._log_mint_not_pumpfun_abort),
                     # no acá -de lo contrario saldrían dos ERROR casi
                     # idénticos para un solo problema (este chequeo normalmente
                     # ya lo detectó antes vía _confirm_mint_not_pumpfun).
                     logger.debug(f"[On-chain] {self.mint} no tiene bonding curve de pump.fun, NI pool "
-                                 f"de PumpSwap, NI pool de Raydium CPMM utilizable (las tres consultas "
+                                 f"de PumpSwap, NI pool de Raydium CPMM/Meteora DLMM utilizable (todas las consultas "
                                  f"confirmaron ausencia).")
                     return price, pool_confirmed_absent, True
 
@@ -1200,7 +1231,11 @@ class TrailingTakeProfitBot:
         override existe para evitar, pero al revés."""
         # Raydium CPMM: se rutea explícito al mismo tipo de pool del que
         # sacamos el precio, en vez de dejar que "auto" lo adivine.
-        return {"pumpswap": "pump-amm", "raydium-cpmm": "raydium-cpmm"}.get(self._onchain_source)
+        # Meteora DLMM: la Lightning API no tiene un pool "meteora", así que
+        # se fuerza "auto" (aunque cfg.pool diga otra cosa) y PumpPortal
+        # decide por dónde rutear.
+        return {"pumpswap": "pump-amm", "raydium-cpmm": "raydium-cpmm",
+                "meteora-dlmm": "auto"}.get(self._onchain_source)
 
     async def _on_first_price(self, price: float) -> None:
         self.position = await self.executor.buy(self.mint, price, pool_override=self._current_pool_override())
