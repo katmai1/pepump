@@ -118,6 +118,29 @@ class SpyExecutor:
         position.closed = True
 
 
+class _RaydiumCpmmSinPools:
+    """Doble de RaydiumCpmmOnChainClient que siempre confirma 'no hay
+    pool'."""
+
+    def __init__(self, rpc_url):
+        self.rpc_url = rpc_url
+
+    async def fetch_price_or_confirm_absent(self, mint: str):
+        return None, True
+
+    async def fetch_price(self, mint: str):
+        return None
+
+
+@pytest.fixture(autouse=True)
+def _sin_raydium_cpmm_real(monkeypatch):
+    """Ningún test de bot.py le pega al RPC real de Raydium CPMM por
+    accidente: por defecto 'no hay pool'. Los tests que necesitan otra
+    cosa lo pisan con su propio monkeypatch."""
+    from pepump import bot as bot_module
+    monkeypatch.setattr(bot_module, "RaydiumCpmmOnChainClient", _RaydiumCpmmSinPools)
+
+
 @pytest.fixture
 def open_position():
     return Position(mint="TestMint1111111111111111111111111111111111",

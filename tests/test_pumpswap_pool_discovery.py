@@ -20,15 +20,17 @@ OTRO_QUOTE_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"  # USDC
 
 
 def build_pool_account_data(base_mint: str, quote_mint: str, lp_supply: int,
-                            con_coin_creator: bool = True) -> bytes:
+                            con_coin_creator: bool = True, creator: str = None) -> bytes:
     """Arma el account data crudo de un pool de PumpSwap con el mismo
-    layout que PumpSwapPoolStateNew/Old de pumpswapamm."""
+    layout que PumpSwapPoolStateNew/Old de pumpswapamm. Por defecto el
+    `creator` es el del pool oficial de migración de pump.fun."""
     relleno32 = bytes(32)
+    creator = creator or PumpSwapOnChainClient.canonical_pool_creator(base_mint)
     data = (
         bytes(8)                                    # discriminador Anchor
         + bytes([255])                              # pool_bump
         + (0).to_bytes(2, "little")                 # index
-        + relleno32                                 # creator
+        + bytes(Pubkey.from_string(creator))        # creator
         + bytes(Pubkey.from_string(base_mint))      # base_mint
         + bytes(Pubkey.from_string(quote_mint))     # quote_mint
         + relleno32                                 # lp_mint
@@ -144,6 +146,38 @@ def test_cuenta_mas_corta_de_lo_esperado_no_rompe_la_seleccion():
     address, _ = _find(accounts)
 
     assert address == POOL_B
+
+
+WALLET_CUALQUIERA = "9UqBvwTW1WU3e5TTEtSqY7SBcRgN89qZeCiMH8ag1JR7"
+
+
+def test_se_ignoran_los_pools_que_no_son_el_oficial_de_migracion():
+    """Caso real (Dz9mQ9...bonk, token de bonk.fun): un pool de PumpSwap
+    creado a mano por una wallet cualquiera daba un precio inventado y la
+    Lightning API rechazaba la compra con "Pool account not found"."""
+    accounts = [
+        FakeKeyedAccount(POOL_A, build_pool_account_data(MINT, WSOL_MINT, 100, creator=WALLET_CUALQUIERA)),
+    ]
+    address, _ = _find(accounts)
+
+    assert address is None
+
+
+def test_el_pool_oficial_gana_aunque_haya_uno_no_oficial_con_mas_liquidez():
+    accounts = [
+        FakeKeyedAccount(POOL_A, build_pool_account_data(MINT, WSOL_MINT, 9_999_999, creator=WALLET_CUALQUIERA)),
+        FakeKeyedAccount(POOL_B, build_pool_account_data(MINT, WSOL_MINT, 1_000)),
+    ]
+    address, _ = _find(accounts)
+
+    assert address == POOL_B
+
+
+def test_canonical_pool_creator_coincide_con_el_pda_real():
+    """PDA verificado on-chain para Dz9mQ9...bonk."""
+    mint = "Dz9mQ9NzkBcCsuGPFJ3r1bS4wgqKMHBPiVuniW8Mbonk"
+    assert (PumpSwapOnChainClient.canonical_pool_creator(mint)
+            == "HCbKYZiFNfjTY5UtBBX2ETak9FFnTQ9KE1pGUH2HkTvv")
 
 
 def test_sin_pools_devuelve_none():

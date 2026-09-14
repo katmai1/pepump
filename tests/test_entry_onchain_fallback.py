@@ -241,6 +241,52 @@ def test_mint_sin_bonding_curve_ni_pool_aborta_de_una(monkeypatch):
     assert fake_curve.calls == 1
 
 
+class FakeCpmmOnChainClient:
+    """Reemplaza RaydiumCpmmOnChainClient. Devuelve (price,
+    confirmed_absent) de una lista fija, uno por llamada."""
+
+    def __init__(self, rpc_url, results):
+        self.rpc_url = rpc_url
+        self._results = list(results)
+        self.calls = 0
+
+    async def fetch_price_or_confirm_absent(self, mint: str):
+        result = self._results[min(self.calls, len(self._results) - 1)]
+        self.calls += 1
+        return result
+
+    async def fetch_price(self, mint: str):
+        price, _ = await self.fetch_price_or_confirm_absent(mint)
+        return price
+
+
+def test_mint_de_raydium_cpmm_usa_precio_del_pool_y_rutea_por_raydium_cpmm(monkeypatch):
+    """Caso real (Dz9mQ9...bonk, bonk.fun graduado a Raydium CPMM): ni
+    bonding curve ni pool oficial de PumpSwap, pero sí un pool CPMM contra
+    SOL. Antes el bot abortaba (o, peor, usaba un pool de relleno de
+    PumpSwap y forzaba pool="pump-amm" -> "Pool account not found")."""
+    client = FakeTradeStreamClient()
+    executor = SpyExecutor()
+    cfg = make_config(live_feed_timeout_seconds=0.03, entry_wait_timeout_seconds=5.0)
+    bot = TrailingTakeProfitBot(client=client, executor=executor, config=cfg)
+    bot._trade_events = _ack_then_hang()
+
+    fake_onchain = FakeOnChainClient(cfg.solana_rpc_url, [(None, True)])
+    monkeypatch.setattr(bot_module, "PumpSwapOnChainClient", lambda rpc_url: fake_onchain)
+    fake_curve = FakeCurveOnChainClient(cfg.solana_rpc_url, [(None, False, False)])
+    monkeypatch.setattr(bot_module, "PumpCurveOnChainClient", lambda rpc_url: fake_curve)
+    fake_cpmm = FakeCpmmOnChainClient(cfg.solana_rpc_url, [(0.00206, False)])
+    monkeypatch.setattr(bot_module, "RaydiumCpmmOnChainClient", lambda rpc_url: fake_cpmm)
+
+    price = asyncio.run(asyncio.wait_for(bot._get_reference_price(), timeout=5))
+
+    assert price == pytest.approx(0.00206)
+    assert bot._onchain_source == "raydium-cpmm"
+    assert bot._current_pool_override() == "raydium-cpmm"
+    # El polling de la posición también sale del pool CPMM.
+    assert asyncio.run(bot._onchain_fetch_price()) == pytest.approx(0.00206)
+
+
 def test_mint_sin_bonding_curve_ni_pool_aborta_sin_esperar_live_feed_timeout(monkeypatch):
     """Regresión del bug reportado: antes, aunque el mint NUNCA hubiera
     sido de pump.fun, el bot se quedaba esperando `live_feed_timeout_seconds`
