@@ -64,7 +64,7 @@ class AppConfig:
     entry_wait_timeout_seconds: float = 60.0
     # RPC de Solana usado ÚNICAMENTE para leer, on-chain, las reservas
     # reales del pool de PumpSwap cuando el mint ya migró (ver
-    # pumpswapamm en pump.py). Un endpoint público gratuito alcanza para
+    # PumpSwapOnChainClient en pump.py). Un endpoint público gratuito alcanza para
     # esto (una sola lectura, no trading), pero es lento/rate-limited;
     # para uso serio conviene un RPC dedicado (Helius, QuickNode, etc.).
     solana_rpc_url: str = "https://api.mainnet-beta.solana.com"

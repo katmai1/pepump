@@ -8,12 +8,10 @@ import time
 from typing import AsyncIterator, Optional
 
 from solana.rpc.async_api import AsyncClient
-from solana.rpc.commitment import Confirmed
+from solana.rpc.commitment import Confirmed, Processed
 from solana.rpc.types import MemcmpOpts
 from solders.pubkey import Pubkey  # type: ignore
 from solders.signature import Signature  # type: ignore
-from pumpswapamm.pumpswapamm import fetch_pool_state
-from pumpswapamm.fetch_reserves import fetch_pool_base_price
 
 from pepump.onchain_errors import describe_custom_error, failing_program_from_logs
 
@@ -1135,26 +1133,24 @@ class PumpSwapOnChainClient:
     -la misma cuenta contra la que se ejecutaría el trade real- así que
     no mete ningún desfasaje de una fuente externa tipo DexScreener.
 
-    Usa la librería `pumpswapamm` (github.com/FLOCK4H/PumpSwapAMM) solo
-    para parsear la cuenta del pool; el descubrimiento del pool a partir
-    del mint lo hacemos nosotros con un getProgramAccounts + memcmp
-    directo sobre el programa de PumpSwap, porque esa librería no trae
-    una función para "encontrar el pool de este mint" (solo puede leer
-    un pool si ya conocés su dirección, o derivarla si ya conocés el
-    `creator`, que para un mint migrado automáticamente desde pump.fun
-    no es el wallet que creó el token).
+    El descubrimiento del pool a partir del mint y el parseo de la cuenta
+    los hacemos nosotros, con un getProgramAccounts + memcmp directo
+    sobre el programa de PumpSwap y los offsets de abajo.
 
-    OJO: pumpswapamm es de un solo mantenedor y no está auditada. Se usa
-    acá solo para DECODIFICAR una cuenta pública de solo lectura (no
-    firma ni manda transacciones), pero aun así es una dependencia
-    externa nueva — tenelo en cuenta.
+    Antes esta parte se apoyaba en la librería `pumpswapamm`
+    (github.com/FLOCK4H/PumpSwapAMM) para leer el pool y su precio, pero
+    su `fetch_pool_base_price` cotiza `quote_vault / base_vault` a secas
+    -sin la reserva VIRTUAL de quote que el programa sí suma en su curva
+    (ver _VIRTUAL_QUOTE_OFFSET)-, así que daba un precio hasta ~27% por
+    debajo del real en los pools nuevos. Parseando acá, además, se deja
+    de depender de una librería externa sin auditar.
     """
 
     # Offsets en bytes dentro de la cuenta del pool, verificados contra el
-    # struct real de pumpswapamm (PumpSwapPoolStateNew/Old en
-    # pumpswapamm.py). Los campos son todos de largo fijo y los dos
-    # layouts (NEW/OLD) coinciden hasta `lp_supply` -solo difieren en el
-    # `coin_creator` del final-, así que estos offsets valen para ambos:
+    # struct `Pool` del IDL que el propio programa de PumpSwap publica
+    # on-chain (cuenta anchor:idl). Los campos son todos de largo fijo y
+    # los layouts viejo/nuevo coinciden hasta `lp_supply` -solo difieren
+    # en lo que viene después-, así que estos offsets valen para todos:
     #   0   discriminador Anchor        (8)
     #   8   pool_bump                   (1)
     #   9   index                       (2)
@@ -1165,11 +1161,43 @@ class PumpSwapOnChainClient:
     #   139 pool_base_token_account     (32)
     #   171 pool_quote_token_account    (32)
     #   203 lp_supply                   (u64 little-endian)
+    #   211 coin_creator               (32)
+    #   243 is_mayhem_mode             (1)
+    #   244 is_cashback_coin           (1)
+    #   245 reserva VIRTUAL de quote   (u64 little-endian, lamports)
     _CREATOR_OFFSET = 11
     _BASE_MINT_OFFSET = 43
     _QUOTE_MINT_OFFSET = 75
+    _BASE_VAULT_OFFSET = 139
+    _QUOTE_VAULT_OFFSET = 171
     _LP_SUPPLY_OFFSET = 203
     _MIN_POOL_ACCOUNT_LEN = _LP_SUPPLY_OFFSET + 8
+
+    # BUGFIX (precio ~27% por debajo del real): el precio de un pool de
+    # PumpSwap NO es `quote_vault / base_vault`. Los pools nuevos (301
+    # bytes) traen, después de los dos flags `is_mayhem_mode` /
+    # `is_cashback_coin`, un u64 con una reserva VIRTUAL de quote en
+    # lamports que el programa SUMA a la reserva real del vault para su
+    # curva x*y=k. Ese campo todavía no está en el IDL publicado on-chain
+    # (el struct `Pool` del IDL termina en `is_cashback_coin`), pero está
+    # verificado contra la cadena:
+    #
+    #   - Caso FZrn97...2cra (FLIPPY): vaults = 231.429.599 tokens /
+    #     66,0657 SOL -> ratio crudo 0,0000002855. Campo virtual =
+    #     17,5845 SOL -> (66,0657 + 17,5845) / 231.429.599 =
+    #     0,00000036145, que es el precio real (DexScreener: 0,0000003619).
+    #   - Despejando la reserva efectiva de quote de la matemática de los
+    #     BuyEvent/SellEvent reales del programa da 17.584.502.436 /
+    #     17.584.468.479 / 17.584.505.258 lamports, contra los
+    #     17.584.505.366 que trae este campo: coincide hasta el lamport.
+    #   - En pools donde el campo es 0 (los viejos), sumarlo no cambia
+    #     nada y el precio sigue siendo el ratio de siempre.
+    #
+    # Ignorarlo hacía que el bot entrara con un precio de referencia ~21%
+    # más bajo que el real (y que el stop-loss saltara solo, porque el
+    # precio de entrada REAL leído del fill sí era el correcto).
+    _VIRTUAL_QUOTE_OFFSET = 245
+    _MIN_POOL_ACCOUNT_LEN_CON_VIRTUAL = _VIRTUAL_QUOTE_OFFSET + 8
 
     def __init__(self, rpc_url: str):
         self.rpc_url = rpc_url
@@ -1199,32 +1227,38 @@ class PumpSwapOnChainClient:
         vivo."""
         async with AsyncClient(self.rpc_url) as client:
             try:
-                pool_address = await self._find_pool_address(client, mint)
+                pool_address, pool = await self._find_pool(client, mint)
                 if pool_address is None:
                     logger.debug(f"[On-chain PumpSwap] No se encontró ningún pool de PumpSwap para {mint}.")
                     return None, True
 
-                pool_keys, _pool_type = await fetch_pool_state(pool_address, client)
-                if pool_keys is None:
+                if pool is None:
                     logger.debug("[On-chain PumpSwap] No se pudo leer/parsear la cuenta del pool.")
                     return None, False
 
-                if pool_keys.get("quote_mint") != WSOL_MINT:
+                if pool["quote_mint"] != WSOL_MINT:
                     logger.debug(f"[On-chain PumpSwap] El pool de {mint} no está denominado en SOL "
-                                 f"(quote_mint={pool_keys.get('quote_mint')}); no lo puedo usar acá.")
+                                 f"(quote_mint={pool['quote_mint']}); no lo puedo usar acá.")
                     return None, False
 
-                result = await fetch_pool_base_price(pool_keys, client)
-                if result is None:
+                reserves = await self._fetch_reserves(client, pool)
+                if reserves is None:
                     logger.debug("[On-chain PumpSwap] No se pudieron leer las reservas del pool.")
                     return None, False
 
-                price, base_balance, quote_balance = result
-                if not base_balance or float(price) <= 0:
+                base_balance, quote_balance = reserves
+                # La reserva de quote que usa el programa para su curva es
+                # la del vault MÁS la virtual (ver _VIRTUAL_QUOTE_OFFSET).
+                virtual_quote = pool["virtual_quote_lamports"] / 1e9
+                if not base_balance:
+                    return None, False
+                price = (quote_balance + virtual_quote) / base_balance
+                if price <= 0:
                     return None, False
 
                 logger.debug(f"[On-chain PumpSwap] Pool {pool_address} | reservas: "
-                             f"{base_balance} tokens / {quote_balance} SOL")
+                             f"{base_balance} tokens / {quote_balance} SOL"
+                             + (f" + {virtual_quote} SOL virtuales" if virtual_quote else ""))
                 return float(price), False
             except Exception as e:
                 logger.warning(f"[On-chain PumpSwap] Falló la consulta on-chain para {mint}: {e}")
@@ -1271,12 +1305,67 @@ class PumpSwapOnChainClient:
         except Exception:
             return None
 
+    @classmethod
+    def _pool_virtual_quote_lamports(cls, data) -> int:
+        """Reserva VIRTUAL de quote del pool, en lamports (ver
+        _VIRTUAL_QUOTE_OFFSET). 0 si la cuenta es de un layout viejo/más
+        corto que no trae el campo -ahí no hay nada que sumar."""
+        if data is None or len(data) < cls._MIN_POOL_ACCOUNT_LEN_CON_VIRTUAL:
+            return 0
+        return int.from_bytes(
+            bytes(data)[cls._VIRTUAL_QUOTE_OFFSET:cls._VIRTUAL_QUOTE_OFFSET + 8], "little")
+
+    @classmethod
+    def _parse_pool(cls, data) -> Optional[dict]:
+        """Los campos del pool que hacen falta para cotizarlo, leídos del
+        account data crudo que ya trajo el getProgramAccounts -sin ningún
+        round-trip extra de RPC. None si la cuenta está cortada."""
+        if data is None or len(data) < cls._MIN_POOL_ACCOUNT_LEN:
+            return None
+        data = bytes(data)
+        return {
+            "quote_mint": cls._pool_quote_mint(data),
+            "base_vault": str(Pubkey.from_bytes(
+                data[cls._BASE_VAULT_OFFSET:cls._BASE_VAULT_OFFSET + 32])),
+            "quote_vault": str(Pubkey.from_bytes(
+                data[cls._QUOTE_VAULT_OFFSET:cls._QUOTE_VAULT_OFFSET + 32])),
+            "virtual_quote_lamports": cls._pool_virtual_quote_lamports(data),
+        }
+
+    async def _fetch_reserves(self, client: AsyncClient, pool: dict) -> Optional[tuple[float, float]]:
+        """(reserva de tokens, reserva de SOL) de los vaults del pool, en
+        unidades enteras (no lamports), en UNA sola llamada de RPC. None
+        si alguna de las dos cuentas no se pudo leer."""
+        resp = await client.get_multiple_accounts_json_parsed(
+            [Pubkey.from_string(pool["base_vault"]), Pubkey.from_string(pool["quote_vault"])],
+            commitment=Processed,
+        )
+        infos = resp.value
+        if not infos or len(infos) < 2 or infos[0] is None or infos[1] is None:
+            return None
+        balances = []
+        for info in infos:
+            amount = info.data.parsed["info"]["tokenAmount"]
+            # Se calcula desde el entero crudo (no desde `uiAmount`, que
+            # viene como float y puede llegar en None).
+            balances.append(int(amount["amount"]) / 10 ** int(amount["decimals"]))
+        return balances[0], balances[1]
+
     async def _find_pool_address(self, client: AsyncClient, mint: str) -> Optional[str]:
+        """Dirección del pool elegido por _find_pool (ver allá)."""
+        address, _pool = await self._find_pool(client, mint)
+        return address
+
+    async def _find_pool(self, client: AsyncClient, mint: str) -> tuple[Optional[str], Optional[dict]]:
         """getProgramAccounts sobre el programa de PumpSwap, filtrando por
         `base_mint == mint` con un memcmp en el offset exacto del struct.
         Si hay varios pools para el mismo mint (raro, pero el struct
         soporta `index`), nos quedamos con el de mayor `lp_supply` (el
         pool "real" con liquidez, no uno vacío/de prueba).
+
+        Devuelve (dirección del pool, campos ya parseados de su cuenta
+        -ver _parse_pool), para no tener que volver a leer on-chain una
+        cuenta que este mismo getProgramAccounts ya trajo entera.
 
         BUGFIX: la selección entre candidatos llamaba a fetch_pool_state()
         por cada uno, y esa función hace su PROPIO getAccountInfo -o sea,
@@ -1304,10 +1393,11 @@ class PumpSwapOnChainClient:
         )
         accounts = resp.value
         if not accounts:
-            return None
+            return None, None
 
         canonical_creator = self.canonical_pool_creator(mint)
         best_pubkey = None
+        best_data = None
         best_lp_supply = -1
         descartados_por_quote = 0
         descartados_no_oficiales = 0
@@ -1328,6 +1418,7 @@ class PumpSwapOnChainClient:
             if lp_supply > best_lp_supply:
                 best_lp_supply = lp_supply
                 best_pubkey = str(acc.pubkey)
+                best_data = data
 
         if descartados_no_oficiales:
             logger.debug(f"[On-chain PumpSwap] {len(accounts)} pools para {mint}; "
@@ -1336,4 +1427,4 @@ class PumpSwapOnChainClient:
         if descartados_por_quote:
             logger.debug(f"[On-chain PumpSwap] {len(accounts)} pools para {mint}; "
                          f"{descartados_por_quote} descartados por no estar denominados en SOL.")
-        return best_pubkey
+        return best_pubkey, self._parse_pool(best_data)
