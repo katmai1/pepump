@@ -1,6 +1,6 @@
 """
 Tests de TrailingTakeProfitBot.run():
-  - manejo prolijo del error cuando connect_trade_stream() falla (segundo
+  - manejo correcto del error cuando connect_trade_stream() falla (segundo
     bug pedido a arreglar: antes se escapaba un traceback crudo, ahora
     se loguea y se sale ordenadamente).
   - que run() cancele monitor_task/status_printer ANTES de vender por
@@ -67,8 +67,8 @@ async def test_run_cancels_monitor_before_selling_on_shutdown():
 
     Se simula pidiendo shutdown inmediatamente después de la compra, con
     un stream de eventos que se queda "colgado" (nunca llega un segundo
-    trade): si el bug siguiera presente, este test igual pasaría porque
-    no hay una condición de carrera activa -lo importante acá es que NO
+    trade): si el bug siguiera presente, este test pasaría de todos
+    modos porque no hay una condición de carrera activa -lo importante aquí es que NO
     haya ningún error/duplicado y que sell termine llamándose una sola
     vez con el bot ya limpio.
     """

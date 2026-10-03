@@ -50,7 +50,7 @@ def _extract_instruction_error(err) -> Optional[tuple]:
     """Si `err` (el `.err` de getSignatureStatuses) es un
     TransactionErrorInstructionError con un código Custom(N), devuelve
     (índice_de_instrucción, código). None si no matchea esa forma (otro
-    tipo de error, versión distinta de solders, etc.) -nunca tira
+    tipo de error, versión distinta de solders, etc.) -nunca lanza
     excepción, esto es solo para dar un mensaje más claro, no crítico."""
     try:
         from solders.transaction_status import (
@@ -120,7 +120,7 @@ async def _describe_onchain_error(signature: str, rpc_url: str, err) -> tuple[st
     aparece cuando el ruteo del pool quedó desalineado con la migración-,
     y un código bajo se atribuía a spl-token aunque lo hubiese tirado
     otro programa. Ahora se identifica primero QUÉ programa revirtió
-    (línea "Program <id> failed" de los logs) y recién ahí se traduce el
+    (línea "Program <id> failed" de los logs) y solo entonces se traduce el
     código contra la tabla de ESE programa."""
     decoded = _extract_instruction_error(err)
     logs = await _fetch_program_logs(signature, rpc_url)
@@ -146,7 +146,7 @@ async def _describe_onchain_error(signature: str, rpc_url: str, err) -> tuple[st
         # revirtió, ej. un AnchorError con "Error Message: ...").
         return f": {relevant[-1].strip()}", detail
 
-    return ": revirtió con un error no reconocido (corré con -v para ver más detalle, o abrí el link de Solscan)", detail
+    return ": revirtió con un error no reconocido (ejecuta con -v para ver más detalle, o abre el enlace de Solscan)", detail
 
 
 def _wallet_token_delta(meta, mint: str, wallet: str) -> Optional[float]:
@@ -180,7 +180,7 @@ def _wallet_token_delta(meta, mint: str, wallet: str) -> Optional[float]:
     Ahora la wallet se identifica SOLO por `owner`, y "nuestra cuenta
     no aparece de este lado" se interpreta como 0 tokens (que es
     literalmente lo que había: la cuenta no existía todavía), no como
-    "usá la cuenta de otro". El atajo de la única entrada queda
+    "usa la cuenta de otro". El atajo de la única entrada queda
     reservado para el caso en que el nodo RPC no mande `owner` en
     NINGUNA entrada, y solo si de verdad hay una sola token account de
     ese mint en toda la tx.
@@ -244,7 +244,7 @@ async def _fetch_actual_fill(signature: str, rpc_url: str, mint: str,
     api_key -así que ese índice 0 es, siempre, nuestra propia wallet.
 
     Devuelve None si por lo que sea no se puede leer/parsear la tx (el
-    llamador debe caer entonces al precio/monto ESTIMADO en vez de
+    llamador debe caer entonces al precio/importe ESTIMADO en vez de
     fallar la operación por esto: la compra/venta YA CONFIRMÓ on-chain
     -eso ya lo garantizó _confirm_transaction_onchain-, esto es solo
     para reportar números reales, no para decidir si salió bien).
@@ -260,7 +260,7 @@ async def _fetch_actual_fill(signature: str, rpc_url: str, mint: str,
     `max_attempts`/`retry_delay_seconds`: get_transaction puede no
     encontrar todavía la tx (resp.value/transaction en None) aunque
     _confirm_transaction_onchain ya la haya dado por confirmada -hay un
-    desfasaje real entre "el status ya dice confirmed/finalized" y "ya
+    desfase real entre "el status ya dice confirmed/finalized" y "ya
     está indexada y consultable vía getTransaction" en el nodo RPC, sea
     el mismo nodo u otro. Reintentamos un par de veces con una espera
     corta antes de rendirnos y caer al estimado. Los demás casos de
@@ -380,11 +380,11 @@ class PumpPortalClient:
             except json.JSONDecodeError:
                 continue
             # BUGFIX: un mensaje JSON válido pero que NO es un objeto
-            # (una lista, un string suelto) llegaba igual hasta
+            # (una lista, un string suelto) llegaba de todos modos hasta
             # extract_price()/`event.keys()` y reventaba con
             # AttributeError. Esa excepción no la atrapa el camino de
             # entrada (_get_reference_price la deja subir), así que
-            # tumbaba el bot con un traceback crudo. Acá se descarta.
+            # tumbaba el bot con un traceback crudo. Aquí se descarta.
             if not isinstance(event, dict):
                 logger.debug(f"[Feed de trades] mensaje descartado (no es un objeto JSON): {event!r}")
                 continue
@@ -410,7 +410,7 @@ class PumpPortalClient:
 
         3. Si tampoco viene `marketCapSol` (algunos trades de pools ya
            migrados no lo incluyen), se cae al precio efectivo de ESE
-           trade puntual: `solAmount / tokenAmount`, los montos reales que
+           trade puntual: `solAmount / tokenAmount`, los importes reales que
            se intercambiaron en esa operación. Es el nivel menos preciso
            de los tres (es el precio de UN trade, no una cotización
            instantánea de reservas), pero sigue siendo 100% PumpPortal,
@@ -424,8 +424,9 @@ class PumpPortalClient:
         hacía falta. Y un `vSolInBondingCurve` en 0 devolvía 0.0, que el
         llamador descarta como "sin precio" -en vez de seguir al nivel 2
         (marketCapSol), que probablemente sí tenía el dato. Ahora los
-        tres niveles convierten y validan igual, y un nivel que no da un
-        precio positivo cae al siguiente en lugar de cortar la cadena.
+        tres niveles convierten y validan del mismo modo, y un nivel que
+        no da un precio positivo cae al siguiente en lugar de cortar la
+        cadena.
         """
         v_sol = _as_positive_float(event.get("vSolInBondingCurve"))
         v_tok = _as_positive_float(event.get("vTokensInBondingCurve"))
@@ -464,7 +465,7 @@ class PumpPortalClient:
         la transacción se confirme en la red- y esa transacción puede
         reventar después on-chain (típicamente por slippage excedido si
         el precio se movió entre que se armó la tx y se incluyó en un
-        bloque). Sin este chequeo, el bot trataría un 200 OK con firma
+        bloque). Sin esta comprobación, el bot trataría un 200 OK con firma
         como compra/venta exitosa aunque en la práctica no haya pasado
         nada en la wallet real.
 
@@ -472,9 +473,9 @@ class PumpPortalClient:
         que NO hay que dar la operación por hecha):
           - HTTP distinto de 200.
           - 200 OK pero sin firma en el body (PumpPortal rechazó la
-            orden de una: slippage inválido, fondos insuficientes, etc.).
+            orden de inmediato: slippage inválido, fondos insuficientes, etc.).
           - Firma válida pero la transacción FALLÓ on-chain (revert) —
-            acá es donde cae el caso real de "slippage excedido" que
+            aquí es donde cae el caso real de "slippage excedido" que
             pasa DESPUÉS de que PumpPortal ya contestó 200.
           - Firma válida pero no confirma dentro de
             `tx_confirm_timeout_seconds` (puede seguir pendiente, pero
@@ -516,7 +517,8 @@ class PumpPortalClient:
             signature, solana_rpc_url, tx_confirm_timeout_seconds, tx_confirm_poll_interval_seconds
         )
 
-        # La tx YA confirmó on-chain (lo de arriba no tira si no). Ahora
+        # La tx YA confirmó on-chain (lo de arriba lanza una excepción si
+        # no es así). Ahora
         # leemos los datos REALES de fill (SOL y tokens que realmente se
         # movieron en la wallet) para no depender del precio de
         # referencia estimado -ver executor.py, que usa esto para armar
@@ -562,7 +564,7 @@ class PumpPortalClient:
                 if time.monotonic() >= deadline:
                     raise RuntimeError(
                         f"La transacción {signature} no confirmó en {timeout_seconds:.1f}s "
-                        f"(puede seguir pendiente) — revisá https://solscan.io/tx/{signature}"
+                        f"(puede seguir pendiente) — revisa https://solscan.io/tx/{signature}"
                     )
                 await asyncio.sleep(poll_interval_seconds)
 
@@ -573,7 +575,7 @@ class PumpCurveOnChainClient:
     de pump.fun (no migraron a PumpSwap) -para el caso en que
     subscribeTokenTrade da el ack de suscripción pero no entrega NINGÚN
     trade real (ver bot.py: mismo síntoma que dispara
-    PumpSwapOnChainClient, pero acá ya confirmado por
+    PumpSwapOnChainClient, pero aquí ya confirmado por
     `PumpSwapOnChainClient.fetch_price_or_confirm_absent` que el mint
     sigue en bonding curve -pool_confirmed_absent=True-, así que no
     tiene sentido seguir esperando a ciegas un feed que puede no estar
@@ -582,13 +584,13 @@ class PumpCurveOnChainClient:
     Lee la cuenta de la bonding curve DIRECTO de Solana vía RPC -la
     misma cuenta contra la que se ejecutaría el trade real, y la misma
     fuente que usa PumpPortal para calcular vSolInBondingCurve /
-    vTokensInBondingCurve- así que no mete ningún desfasaje de una
+    vTokensInBondingCurve- así que no mete ningún desfase de una
     fuente externa.
 
     Layout de la cuenta (estable desde el lanzamiento del programa; el
     equipo de pump.fun documentó públicamente que la cuenta CRECIÓ para
     sumar campos nuevos -ej. cashback- pero los offsets de los campos
-    viejos, incluidos los que usamos acá, no cambiaron -ver
+    viejos, incluidos los que usamos aquí, no cambiaron -ver
     pump-public-docs/PUMP_PROGRAM_README.md, que recomienda no depender
     del tamaño de la cuenta sino del discriminador):
 
@@ -609,7 +611,7 @@ class PumpCurveOnChainClient:
     PumpPortal Lightning API)-, así que los cambios de layout de
     INSTRUCCIONES de trading que hubo en el programa de pump.fun
     durante 2026 (la cuenta bonding-curve-v2 agregada como cuenta extra
-    en las instrucciones buy/sell) no afectan nada acá: seguimos
+    en las instrucciones buy/sell) no afectan nada aquí: seguimos
     leyendo la cuenta bonding-curve original (v1), que es la que trae
     las reservas y no cambió de offsets.
     """
@@ -652,13 +654,13 @@ class PumpCurveOnChainClient:
             ninguna conclusión sobre si el mint es o no de pump.fun a
             partir de este caso.
           - exists=True, complete=True: la curva ya completó. price
-            puede venir igual (últimas reservas antes de completar) pero
-            el llamador NO debería seguir operando con este fallback -
+            puede venir de todos modos (últimas reservas antes de
+            completar) pero el llamador NO debería seguir operando con este fallback -
             hay que pasar a PumpSwapOnChainClient.
           - exists=True, complete=False, price no-None: caso normal,
             precio válido calculado de las reservas virtuales.
 
-        Nunca tira excepción hacia arriba (mismo criterio que
+        Nunca lanza ninguna excepción hacia arriba (mismo criterio que
         PumpSwapOnChainClient.fetch_price_or_confirm_absent): cualquier
         error de red/RPC/parseo devuelve (None, False, None) -exists=None,
         no False- para no confundir un fallo de RPC con una confirmación
@@ -675,7 +677,7 @@ class PumpCurveOnChainClient:
 
                 data = info.data
                 if len(data) < self._MIN_ACCOUNT_LEN:
-                    logger.warning(f"[On-chain bonding curve] Cuenta de {mint} más chica de lo "
+                    logger.warning(f"[On-chain bonding curve] Cuenta de {mint} más pequeña de lo "
                                     f"esperado ({len(data)} bytes, se esperaban al menos "
                                     f"{self._MIN_ACCOUNT_LEN}); no se puede leer con este layout.")
                     return None, False, True
@@ -791,7 +793,7 @@ class RaydiumCpmmOnChainClient:
         confirmed_absent=True SOLO si las consultas respondieron bien y no
         hay ningún pool mint/WSOL utilizable (incluido el caso de que solo
         haya pools de relleno). Cualquier error de RPC/parseo devuelve
-        (None, False); nunca tira excepción hacia arriba."""
+        (None, False); nunca lanza ninguna excepción hacia arriba."""
         try:
             async with AsyncClient(self.rpc_url) as client:
                 cached = self._best_pool_by_mint.get(mint)
@@ -1131,7 +1133,7 @@ class PumpSwapOnChainClient:
     síntoma real, confirmado a mano, de un mint que ya salió de la
     bonding curve). Lee las reservas del pool DIRECTO de Solana vía RPC
     -la misma cuenta contra la que se ejecutaría el trade real- así que
-    no mete ningún desfasaje de una fuente externa tipo DexScreener.
+    no mete ningún desfase de una fuente externa tipo DexScreener.
 
     El descubrimiento del pool a partir del mint y el parseo de la cuenta
     los hacemos nosotros, con un getProgramAccounts + memcmp directo
@@ -1142,7 +1144,7 @@ class PumpSwapOnChainClient:
     su `fetch_pool_base_price` cotiza `quote_vault / base_vault` a secas
     -sin la reserva VIRTUAL de quote que el programa sí suma en su curva
     (ver _VIRTUAL_QUOTE_OFFSET)-, así que daba un precio hasta ~27% por
-    debajo del real en los pools nuevos. Parseando acá, además, se deja
+    debajo del real en los pools nuevos. Parseando aquí, además, se deja
     de depender de una librería externa sin auditar.
     """
 
@@ -1206,7 +1208,7 @@ class PumpSwapOnChainClient:
         """Busca el pool de PumpSwap para `mint` y devuelve su precio
         actual en SOL/token leyendo las reservas on-chain. None si no
         encuentra el pool, si no está denominado en SOL, o si falla la
-        lectura (red, RPC caído, etc.) — nunca tira excepción hacia
+        lectura (red, RPC caído, etc.) — nunca lanza ninguna excepción hacia
         arriba, para que el bot pueda seguir esperando el feed en vivo
         en vez de caerse por un problema de este fallback secundario."""
         price, _pool_confirmed_absent = await self.fetch_price_or_confirm_absent(mint)
@@ -1215,7 +1217,7 @@ class PumpSwapOnChainClient:
     async def fetch_price_or_confirm_absent(self, mint: str) -> tuple[Optional[float], bool]:
         """Igual que `fetch_price_for_migrated_mint`, pero además devuelve
         `pool_confirmed_absent`: True ÚNICAMENTE cuando el
-        getProgramAccounts para este mint respondió sin tirar excepción
+        getProgramAccounts para este mint respondió sin lanzar ninguna excepción
         y no encontró ningún pool -es decir, una confirmación limpia de
         que el mint TODAVÍA NO migró a PumpSwap (sigue en bonding
         curve). En cualquier otro caso (se encontró un pool pero no se
@@ -1238,7 +1240,7 @@ class PumpSwapOnChainClient:
 
                 if pool["quote_mint"] != WSOL_MINT:
                     logger.debug(f"[On-chain PumpSwap] El pool de {mint} no está denominado en SOL "
-                                 f"(quote_mint={pool['quote_mint']}); no lo puedo usar acá.")
+                                 f"(quote_mint={pool['quote_mint']}); no lo puedo usar aquí.")
                     return None, False
 
                 reserves = await self._fetch_reserves(client, pool)
@@ -1352,7 +1354,7 @@ class PumpSwapOnChainClient:
         return balances[0], balances[1]
 
     async def _find_pool_address(self, client: AsyncClient, mint: str) -> Optional[str]:
-        """Dirección del pool elegido por _find_pool (ver allá)."""
+        """Dirección del pool elegido por _find_pool (ver más arriba)."""
         address, _pool = await self._find_pool(client, mint)
         return address
 
@@ -1373,8 +1375,8 @@ class PumpSwapOnChainClient:
         ya es el que se come el rate limit. El account data crudo ya viene
         en `acc.account.data` de este mismo getProgramAccounts, así que
         ahora se parsea localmente: cero llamadas extra. De paso se
-        descartan acá los pools que no están denominados en SOL, en vez de
-        elegir el de mayor liquidez y recién después descubrir que no
+        descartan aquí los pools que no están denominados en SOL, en vez de
+        elegir el de mayor liquidez y solo después descubrir que no
         sirve.
 
         BUGFIX: cualquiera puede crear un pool de PumpSwap para cualquier

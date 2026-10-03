@@ -36,9 +36,9 @@ class AppConfig:
     # arrancar) que se espera ANTES de comprar. 0 (default) = comprar de
     # una al precio de referencia, exactamente como antes. Si es > 0
     # (ej. 5), el bot NO compra en la referencia: sigue mirando el precio
-    # y recién entra cuando toca `referencia * (1 - entry_dip_pct/100)` o
+    # y no entra hasta que toca `referencia * (1 - entry_dip_pct/100)` o
     # menos (ver _wait_for_dip_entry en bot.py). Si el precio nunca baja
-    # tanto, el bot se queda esperando indefinidamente -cancelá con
+    # tanto, el bot se queda esperando indefinidamente -cancela con
     # Ctrl+C/SIGTERM si hace falta, no hay timeout para esto.
     entry_dip_pct: float = 0.0
 
@@ -77,7 +77,7 @@ class AppConfig:
     # Igual que live_feed_timeout_seconds pero para una posición YA
     # ABIERTA: si pasan estos segundos sin ningún trade nuevo por
     # subscribeTokenTrade, puede ser que el mint haya migrado a PumpSwap
-    # A MITAD de la posición (el socket sigue abierto y no tira ningún
+    # A MITAD de la posición (el socket sigue abierto y no lanza ningún
     # error -simplemente deja de mandar trades para ese mint- así que el
     # precio quedaba congelado para siempre sin aviso). Cuando se cumple
     # este timeout, se hace UNA consulta on-chain puntual para confirmar;
@@ -108,9 +108,10 @@ def validate_mint(mint: str) -> str:
     Un espacio, tab o salto de línea colado al copiar el mint no rompe el
     parseo de argparse ni hace fallar el subscribeTokenTrade (PumpPortal
     acepta la suscripción sin verificar que el mint exista), así que el
-    bot arrancaba igual y después nunca matcheaba ningún trade. Y un mint
-    directamente inválido tampoco se detectaba acá: reventaba mucho más
-    tarde, adentro del fallback on-chain, donde el `except` amplio lo
+    bot arrancaba de todos modos y después nunca coincidía con ningún
+    trade. Y un mint directamente inválido tampoco se detectaba aquí:
+    reventaba mucho más
+    tarde, dentro del fallback on-chain, donde el `except` amplio lo
     convertía en "no hay ninguna fuente de precio disponible" -un mensaje
     que no tiene nada que ver con la causa real.
 
@@ -124,17 +125,17 @@ def validate_mint(mint: str) -> str:
     except Exception:
         raise ValueError(
             f"'{limpio}' no es una dirección de mint válida de Solana (se espera una pubkey "
-            f"base58 de 32 bytes, típicamente 43-44 caracteres). Revisá que lo hayas copiado "
+            f"base58 de 32 bytes, típicamente 43-44 caracteres). Revisa que lo hayas copiado "
             f"entero y sin caracteres de más."
         ) from None
     return limpio
 
 
 def _validate(config: AppConfig) -> None:
-    """Chequeos de coherencia de la configuración, ANTES de conectarse a
-    nada. Todo lo que se valide acá es un error que, si no, aparecería
+    """Comprobaciones de coherencia de la configuración, ANTES de conectarse a
+    nada. Todo lo que se valide aquí es un error que, si no, aparecería
     mucho más tarde y disfrazado de otra cosa: un `buy_sol` en 0 se manda
-    igual a la Lightning API y vuelve como un rechazo genérico; un
+    de todos modos a la Lightning API y vuelve como un rechazo genérico; un
     `entry_dip_pct` de 100 deja el precio objetivo en 0 y el bot esperando
     para siempre sin ninguna señal de que nunca va a entrar; un
     `trailing_pct` de 100 pone el nivel de venta en 0 y desarma el
@@ -142,7 +143,7 @@ def _validate(config: AppConfig) -> None:
 
     Los errores duros levantan ValueError (run.py lo muestra y sale con
     código 1). Lo que es raro pero puede ser deliberado se avisa por log y
-    el bot arranca igual."""
+    el bot arranca de todos modos."""
     errores = []
 
     def positivo(nombre, valor, incluir_cero=False):
@@ -207,7 +208,7 @@ def _validate(config: AppConfig) -> None:
                        f"la orden entre a un precio muchísimo peor que el de referencia.")
     if config.live and config.buy_sol >= 1.0:
         logger.warning(f"MODO REAL con trade.buy_sol = {config.buy_sol} SOL por operación. "
-                       f"Confirmá que sea el monto que querés arriesgar.")
+                       f"Confirma que sea el importe que quieres arriesgar.")
 
 
 def load_config(path: str) -> AppConfig:
@@ -228,12 +229,12 @@ def load_config(path: str) -> AppConfig:
 
     config = AppConfig(**merged)
 
-    # BUGFIX: el .toml de ejemplo y los mensajes de error de acá abajo
+    # BUGFIX: el .toml de ejemplo y los mensajes de error de aquí abajo
     # siempre dijeron que la api_key también se podía definir con la
     # variable de entorno PUMPPORTAL_API_KEY (para no tener que escribirla
     # en el archivo), pero nunca se leía realmente -> quien confiara en
-    # esa opción se encontraba con "Falta la API key" igual. Si el .toml
-    # no trae una key, ahora sí se consulta la variable de entorno como
+    # esa opción se encontraba con "Falta la API key" de todos modos. Si
+    # el .toml no trae una key, ahora sí se consulta la variable de entorno como
     # fallback antes de fallar.
     if not config.api_key:
         config.api_key = os.environ.get("PUMPPORTAL_API_KEY", "")

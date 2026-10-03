@@ -112,7 +112,7 @@ def test_gana_el_pool_con_mas_lp_supply_sin_round_trips_extra():
 
 def test_se_descartan_los_pools_que_no_estan_denominados_en_sol():
     """El pool de USDC tiene más liquidez, pero el bot solo puede operar
-    contra SOL: elegirlo por lp_supply y recién después descubrir que no
+    contra SOL: elegirlo por lp_supply y solo después descubrir que no
     sirve dejaba al bot sin precio teniendo uno disponible."""
     accounts = [
         FakeKeyedAccount(POOL_A, build_pool_account_data(MINT, WSOL_MINT, 1_000)),
@@ -137,7 +137,7 @@ def test_layout_viejo_sin_coin_creator_se_parsea_igual():
 
 def test_cuenta_mas_corta_de_lo_esperado_no_rompe_la_seleccion():
     """Si un layout futuro deja una cuenta más corta, no se puede leer su
-    lp_supply -pero eso no debe tirar excepción ni descartar a los
+    lp_supply -pero eso no debe lanzar ninguna excepción ni descartar a los
     candidatos que sí se pueden leer."""
     accounts = [
         FakeKeyedAccount(POOL_A, bytes(40)),  # ilegible

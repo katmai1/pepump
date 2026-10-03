@@ -3,7 +3,7 @@ Test de regresión para PumpPortalClient._confirm_transaction_onchain:
 a propósito se conforma con CUALQUIER confirmation_status no-nulo,
 incluido "processed" (el nivel más laxo, casi instantáneo). Es una
 decisión consciente para no retrasar la apertura de la posición -ver
-pump.py:_fetch_actual_fill, que es quien absorbe el desfasaje que esto
+pump.py:_fetch_actual_fill, que es quien absorbe el desfase que esto
 puede causar contra getTransaction, con sus propios reintentos y sin
 bloquear la compra.
 """

@@ -117,7 +117,7 @@ async def test_sell_live_cae_a_estimado_si_no_hay_datos_reales():
 
     await executor.sell(pos, price=1.5, reason="trailing-stop")
 
-    assert pos.closed is True  # se cierra igual, con el estimado de siempre
+    assert pos.closed is True  # se cierra de todos modos, con el estimado de siempre
 
 
 async def test_sell_live_acepta_datos_reales_aunque_el_sol_neto_sea_negativo(caplog):

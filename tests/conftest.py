@@ -4,7 +4,7 @@ Fixtures y dobles de prueba (fakes/spies) compartidos por toda la suite.
 Los dobles de PumpPortalClient/TradeExecutor implementan a mano la misma
 interfaz que usa TrailingTakeProfitBot (connect_trade_stream,
 iter_trade_events, extract_price / buy, sell), para poder testear la
-orquestación de bot.py sin pegarle a la red real (websocket de PumpPortal,
+orquestación de bot.py sin tocar la red real (websocket de PumpPortal,
 Lightning API, RPC de Solana).
 """
 import asyncio

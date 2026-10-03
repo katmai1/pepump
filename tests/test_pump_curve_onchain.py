@@ -22,7 +22,7 @@ FAKE_MINT = "So11111111111111111111111111111111111111112"  # cualquier mint vál
 def _make_account_data(virtual_token_reserves: int, virtual_sol_reserves: int,
                         complete: bool, extra_bytes: int = 0) -> bytes:
     """Arma bytes crudos con el mismo layout que la cuenta real:
-    8 (discriminador, valor cualquiera acá) + u64 virtualTokenReserves +
+    8 (discriminador, valor cualquiera aquí) + u64 virtualTokenReserves +
     u64 virtualSolReserves + u64 realTokenReserves (0, no se usa) +
     u64 realSolReserves (0, no se usa) + u64 tokenTotalSupply (0, no se
     usa) + 1 byte complete + `extra_bytes` de relleno (simula los campos

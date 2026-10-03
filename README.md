@@ -4,8 +4,8 @@ Bot de *trailing take-profit* para un token de pump.fun / PumpSwap, operando
 vía la Lightning Transaction API de PumpPortal.
 
 ⚠️ Herramienta de trading, no consejo financiero. Las memecoins de pump.fun
-son extremadamente volátiles. Probá siempre primero con `live = false` y,
-después, con montos chicos.
+son extremadamente volátiles. Prueba siempre primero con `live = false` y,
+después, con importes pequeños.
 
 ## Requisitos
 
@@ -85,5 +85,5 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-No se pega a la red en ningún test: el websocket, la Lightning API y el RPC
+No se toca la red en ningún test: el websocket, la Lightning API y el RPC
 de Solana están todos mockeados.

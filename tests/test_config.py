@@ -131,7 +131,7 @@ def _example_keys() -> set:
 
 def test_example_toml_documenta_todos_los_campos_de_appconfig():
     """El .example es la única documentación de las opciones: si se agrega
-    un campo a AppConfig y no se documenta acá, nadie se entera de que
+    un campo a AppConfig y no se documenta aquí, nadie se entera de que
     existe (y el default queda enterrado en el código)."""
     declared = {f.name for f in dataclasses.fields(AppConfig)} - FIELDS_NOT_IN_TOML
     missing = sorted(declared - _example_keys())
@@ -196,7 +196,7 @@ def test_validate_mint_rechaza_direcciones_invalidas(malo):
 
 def test_validate_mint_mensaje_menciona_el_valor_recibido():
     """El error tiene que apuntar a la causa real. Antes un mint inválido
-    reventaba adentro del fallback on-chain y salía como 'no hay ninguna
+    reventaba dentro del fallback on-chain y salía como 'no hay ninguna
     fuente de precio disponible', que despista por completo."""
     with pytest.raises(ValueError, match="mint"):
         validate_mint("chirimoya")
@@ -278,7 +278,7 @@ def test_config_junta_todos_los_errores_en_un_solo_mensaje(tmp_path):
 
 
 def test_stall_timeout_corto_avisa_pero_no_falla(tmp_path, caplog):
-    """Es raro pero puede ser deliberado, así que arranca igual."""
+    """Es raro pero puede ser deliberado, así que arranca de todos modos."""
     path = write_toml(tmp_path, """
 [pumpportal]
 api_key = "abc"

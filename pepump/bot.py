@@ -27,12 +27,12 @@ _DIAGNOSTIC_REMINDER_SECONDS = 10.0
 # a llegar un trade real (ver _consume_trade_stream).
 _MAX_CURVE_STALLS_BEFORE_POLLING = 2
 
-# Mientras el chequeo temprano de existencia on-chain (ver
+# Mientras la comprobación temprana de existencia on-chain (ver
 # _confirm_mint_not_pumpfun / _get_reference_price) todavía no terminó,
 # cada espera de un trade del feed en vivo se corta en rebanadas de
-# esta duración en vez de esperar de una todo `live_feed_timeout_seconds`
-# -así, apenas ese chequeo confirma que el mint no es de pump.fun, el
-# bot aborta en el próximo ciclo del loop en vez de recién después de
+# esta duración en vez de esperar de golpe todo `live_feed_timeout_seconds`
+# -así, apenas esa comprobación confirma que el mint no es de pump.fun, el
+# bot aborta en el próximo ciclo del loop en vez de solo después de
 # los live_feed_timeout_seconds completos (pensados para tolerar
 # tokens de poco volumen, no para esto).
 _EXISTENCE_CHECK_POLL_SECONDS = 0.5
@@ -88,12 +88,12 @@ class TrailingTakeProfitBot:
         # Si _get_reference_price (o algo que llame desde ahí) ya
         # logueó un motivo específico para devolver None -mint que no es
         # de pump.fun, timeout total, fallback on-chain sin precio,
-        # conexión cortada, etc.-, se marca acá para que el caller en
+        # conexión cortada, etc.-, se marca aquí para que el caller en
         # run() NO agregue ENCIMA el mensaje genérico de "se cortó la
-        # conexión, verificá la dirección y la api_key": antes se
+        # conexión, verifica la dirección y la api_key": antes se
         # logueaban los dos, uno específico y después uno genérico que
         # podía contradecirlo (ej. "no es un token de pump.fun" seguido
-        # de "verificá la api_key"), muy confuso para el usuario.
+        # de "verifica la api_key"), muy confuso para el usuario.
         self._initial_price_failure_reason_logged = False
         # Stalls SEGUIDOS del feed en vivo con la bonding curve todavía
         # activa (ver _handle_feed_stall y _MAX_CURVE_STALLS_BEFORE_POLLING).
@@ -101,7 +101,7 @@ class TrailingTakeProfitBot:
         # Se activa con Ctrl+C (SIGINT) o SIGTERM (ver run()). NO se usa
         # el try/except KeyboardInterrupt clásico porque en asyncio esa
         # señal interrumpe el loop de eventos "por afuera" de la
-        # corrutina en ejecución, no adentro de ella -no hay garantía de
+        # corrutina en ejecución, no dentro de ella -no hay garantía de
         # que un try/except puesto en el código de la app la agarre. Con
         # loop.add_signal_handler() el apagado se coordina de forma
         # confiable con un asyncio.Event normal.
@@ -113,16 +113,17 @@ class TrailingTakeProfitBot:
         # carrera: execute_lightning_trade manda el POST real dentro de un
         # asyncio.to_thread, y cancelar la tarea que está esperando ese
         # await NO mata el hilo -el pedido HTTP ya en vuelo puede seguir
-        # llegando al server igual. Con este lock, si dos caminos intentan
-        # vender casi al mismo tiempo, el segundo espera, ve `pos.closed`
-        # ya en True (o el executor.sell tira porque no queda nada que
-        # vender) y no dispara un segundo pedido real.
+        # llegando al servidor de todos modos. Con este lock, si dos
+        # caminos intentan vender casi al mismo tiempo, el segundo espera,
+        # ve `pos.closed` ya en True (o el executor.sell lanza una excepción
+        # porque no queda nada que vender) y no dispara un segundo pedido
+        # real.
         self._sell_lock = asyncio.Lock()
 
     def _request_shutdown(self, sig_name: str) -> None:
         if self._shutdown_requested.is_set():
             # Segundo Ctrl+C mientras ya se está vendiendo/cerrando: no
-            # hacemos nada especial acá (no forzamos un corte abrupto),
+            # hacemos nada especial aquí (no forzamos un corte abrupto),
             # simplemente evitamos loguear el aviso de nuevo.
             return
         logger.warning(f"⚠️  {sig_name} recibido. Cerrando ordenadamente "
@@ -168,7 +169,7 @@ class TrailingTakeProfitBot:
         # de PumpPortal apenas conecta. Si algo revienta después de esto y
         # antes de que el finally pueda correr, la conexión queda
         # suscripta pero abandonada del lado del servidor (no se le avisa
-        # con un cierre prolijo de WebSocket, solo se corta el TCP cuando
+        # con un cierre limpio de WebSocket, solo se corta el TCP cuando
         # el proceso muere). Por eso TODO lo que dependa de self._ws vive
         # dentro de este try/finally, sin excepciones: así cualquier
         # crash -incluso uno inesperado que no previmos- cierra el socket
@@ -176,7 +177,7 @@ class TrailingTakeProfitBot:
         try:
             # BUGFIX: antes, si connect_trade_stream fallaba (red caída,
             # DNS, api_key rechazada al nivel de handshake, etc.), la
-            # excepción se escapaba sin capturar hasta afuera de run() ->
+            # excepción se escapaba sin capturar hasta fuera de run() ->
             # run.py solo atrapa KeyboardInterrupt, así que el bot moría
             # con un traceback crudo en vez de un mensaje claro. Ahora se
             # loguea el error y se sale ordenadamente (todavía no hay
@@ -196,15 +197,15 @@ class TrailingTakeProfitBot:
                 if self._shutdown_requested.is_set():
                     logger.info("Cancelado antes de abrir posición; no hay nada que vender.")
                 elif not self._initial_price_failure_reason_logged:
-                    # Solo llegamos acá si no se logueó ningún motivo
+                    # Solo llegamos aquí si no se logueó ningún motivo
                     # específico arriba (ver _initial_price_failure_reason_logged):
                     # un caso realmente no cubierto por los diagnósticos de
                     # _get_reference_price. Si ya se logueó un motivo
                     # puntual (mint que no es de pump.fun, timeout total,
-                    # fallback on-chain sin precio, etc.) NO lo repetimos acá
+                    # fallback on-chain sin precio, etc.) NO lo repetimos aquí
                     # con un mensaje genérico que podría contradecirlo.
                     logger.error("Se cortó la conexión con PumpPortal antes de recibir un trade con "
-                                 "precio. Verificá la dirección del token y la api_key, y volvé a intentar.")
+                                 "precio. Verifica la dirección del token y la api_key, y vuelve a intentar.")
                 return
 
             self.latest_price = initial_price
@@ -236,7 +237,7 @@ class TrailingTakeProfitBot:
             # executor.sell() en simultáneo para la misma posición hacia la
             # Lightning API. Ahora _wait_for_close_or_shutdown SOLO espera y
             # devuelve si hace falta vender; monitor_task y el status printer
-            # se cancelan acá ANTES de vender, así que cuando corre
+            # se cancelan aquí ANTES de vender, así que cuando corre
             # _sell_on_shutdown ya no hay nada más que pueda pisarle la venta.
             need_shutdown_sell = await self._wait_for_close_or_shutdown(monitor_task)
 
@@ -261,14 +262,14 @@ class TrailingTakeProfitBot:
                 self._pending_next_event_task = None
             if self._ws is not None:
                 # Un fallo al cerrar (socket ya roto del otro lado) no
-                # puede reventar el cierre del bot: si esto tira, la
+                # puede reventar el cierre del bot: si esto lanza, la
                 # excepción sale de run() por el finally y run.py -que
                 # solo atrapa KeyboardInterrupt- muere con un traceback
                 # crudo DESPUÉS de una operación que salió bien.
                 try:
                     await self._ws.close()
                 except Exception as e:
-                    logger.debug(f"No se pudo cerrar prolijamente el websocket: {e}")
+                    logger.debug(f"No se pudo cerrar limpiamente el websocket: {e}")
 
         logger.info("Bot finalizado.")
 
@@ -283,14 +284,14 @@ class TrailingTakeProfitBot:
         se moría con una excepción inesperada, nadie se enteraba: la
         tarea queda en estado "done con exception" sin que nada la
         espere -asyncio ni siquiera lo loguea hasta que la recolecta el
-        GC-, así que el bot se quedaba acá esperando para siempre un
+        GC-, así que el bot se quedaba aquí esperando para siempre un
         evento de cierre que ya no podía llegar, con SOL real
         comprometido y sin vigilar el precio. La única salida era un
         Ctrl+C a mano. Ahora la tarea de monitoreo también entra en la
         espera: si termina antes de que la posición se cierre, se
         loguea el motivo y se sale vendiendo, que es lo seguro.
 
-        A propósito NO vende acá adentro (ver BUGFIX en run()): solo
+        A propósito NO vende aquí dentro (ver BUGFIX en run()): solo
         espera y devuelve si hace falta que run() dispare la venta de
         cierre, para que run() pueda cancelar primero monitor_task/
         status_printer_loop y evitar que ese monitor dispare su propia
@@ -308,7 +309,7 @@ class TrailingTakeProfitBot:
         try:
             await asyncio.wait(esperando, return_when=asyncio.FIRST_COMPLETED)
         finally:
-            # OJO: monitor_task NO se cancela acá -de eso se encarga
+            # OJO: monitor_task NO se cancela aquí -de eso se encarga
             # run(), que lo cancela junto con el status printer ANTES de
             # disparar la venta de cierre (ver el BUGFIX de la doble venta).
             for t in (closed_task, shutdown_task):
@@ -339,13 +340,13 @@ class TrailingTakeProfitBot:
         """Intenta conseguir el precio MÁS actual posible (una consulta
         on-chain fresca si veníamos usando ese fallback; si no, el último
         precio que ya venía actualizando el feed en vivo, que está
-        prácticamente en tiempo real) y vende de una la posición
+        prácticamente en tiempo real) y vende de inmediato la posición
         abierta.
 
         Usa _sell_lock (ver __init__) para no pisarse con un _try_sell
         del monitor que haya quedado en vuelo. Revalida `position.closed`
         DESPUÉS de conseguir el lock: si _try_sell ya vendió mientras
-        esperábamos acá, no hace falta (ni corresponde) vender de nuevo."""
+        esperábamos aquí, no hace falta (ni corresponde) vender de nuevo."""
         async with self._sell_lock:
             if self.position is None or self.position.closed:
                 logger.info("No hay posición abierta; no hay nada que vender.")
@@ -353,14 +354,14 @@ class TrailingTakeProfitBot:
             price = await self._resolve_shutdown_price()
             if price is None or price <= 0:
                 logger.error("No se pudo determinar ningún precio para vender al cerrar. La posición "
-                             f"queda ABIERTA — revisala manualmente: https://pump.fun/{self.mint}")
+                             f"queda ABIERTA — revísala manualmente: https://pump.fun/{self.mint}")
                 return
             try:
                 await self.executor.sell(self.position, price, "cierre manual (Ctrl+C/SIGTERM)",
                                           pool_override=self._current_pool_override())
             except Exception as e:
                 logger.error(f"Falló la venta de cierre manual: {e}. La posición SIGUE ABIERTA — "
-                             f"revisala manualmente: https://pump.fun/{self.mint}")
+                             f"revísala manualmente: https://pump.fun/{self.mint}")
 
     async def _resolve_shutdown_price(self) -> Optional[float]:
         if self._onchain_source is not None:
@@ -387,7 +388,7 @@ class TrailingTakeProfitBot:
         fallback de PumpSwap para ESTA MISMA consulta y deja
         `self._onchain_source` en "pumpswap" para las próximas -mismo
         espíritu que _handle_feed_stall detectando una migración a
-        mitad de posición, pero acá para el caso en que ya veníamos
+        mitad de posición, pero aquí para el caso en que ya veníamos
         on-chain por bonding curve."""
         if self._onchain_source == "raydium-cpmm":
             cpmm = RaydiumCpmmOnChainClient(self.cfg.solana_rpc_url)
@@ -418,12 +419,12 @@ class TrailingTakeProfitBot:
 
         BUGFIX: antes, cuando ganaba el timeout, se cancelaba
         directamente la tarea que envolvía `self._trade_events.__anext__()`.
-        Cancelar esa tarea tira un CancelledError DENTRO del generador
+        Cancelar esa tarea lanza un CancelledError DENTRO del generador
         async en su punto de espera (ej. el `await websocket.recv()`
-        interno de iter_trade_events) -y como nada lo atrapa ahí adentro,
+        interno de iter_trade_events) -y como nada lo atrapa ahí dentro,
         el generador queda CERRADO para siempre: cualquier __anext__()
         posterior sobre el mismo generador devuelve StopAsyncIteration
-        de una, aunque la conexión siga perfectamente viva. Esto rompía
+        de inmediato, aunque la conexión siga perfectamente viva. Esto rompía
         en silencio cualquier código que esperara poder seguir
         escuchando el mismo feed después de un timeout (ver
         _get_reference_price reintentando tras confirmar 'sin pool', y
@@ -433,7 +434,7 @@ class TrailingTakeProfitBot:
         Ahora, si gana el timeout, NO se cancela la tarea: se guarda en
         self._pending_next_event_task para reutilizarla en la próxima
         llamada -mismo generador, mismo __anext__() en vuelo, sin
-        cortar nada-. Recién se cancela de verdad si gana el shutdown
+        cortar nada-. Solo se cancela de verdad si gana el shutdown
         (ahí sí termina todo)."""
         # BUGFIX (evento perdido tras un stall): si la tarea que quedó
         # pendiente de un timeout anterior YA terminó, su resultado es un
@@ -442,7 +443,7 @@ class TrailingTakeProfitBot:
         # descartaba y se creaba un __anext__() nuevo: ese trade se
         # perdía -y con él, una evaluación del trailing-stop y el reset
         # de self._curve_stalls-. Si terminó con excepción (conexión
-        # cerrada), .result() la propaga acá y el llamador reconecta, en
+        # cerrada), .result() la propaga aquí y el llamador reconecta, en
         # vez de quedar como "Task exception was never retrieved".
         pending = self._pending_next_event_task
         if pending is not None and pending.done() and not pending.cancelled():
@@ -501,7 +502,7 @@ class TrailingTakeProfitBot:
         target_price = reference_price * (1 - self.cfg.entry_dip_pct / 100.0)
         logger.info(f"Precio de referencia: {reference_price:.10f} SOL/token. Esperando una baja "
                     f"de {self.cfg.entry_dip_pct}% -> entra si el precio toca {target_price:.10f} "
-                    f"SOL/token o menos (sin timeout, cancelá con Ctrl+C si hace falta)...")
+                    f"SOL/token o menos (sin timeout, cancela con Ctrl+C si hace falta)...")
         return await self._wait_for_dip_entry(reference_price, target_price)
 
     async def _get_reference_price(self) -> Optional[float]:
@@ -526,7 +527,7 @@ class TrailingTakeProfitBot:
         `live_feed_timeout_seconds` para hacerla.
 
         En cualquier momento de esta espera, Ctrl+C/SIGTERM corta todo de
-        una y devuelve None (todavía no hay posición abierta, así que no
+        inmediato y devuelve None (todavía no hay posición abierta, así que no
         hay nada que vender).
         """
         logger.info("Esperando el primer trade en vivo del feed de PumpPortal (subscribe_trade) "
@@ -585,8 +586,8 @@ class TrailingTakeProfitBot:
                         return None
 
                     if existence_check_task is not None:
-                        # Todavía no se resolvió el chequeo temprano de
-                        # existencia: en vez de bloquearnos acá hasta
+                        # Todavía no se resolvió la comprobación temprana de
+                        # existencia: en vez de bloquearnos aquí hasta
                         # los live_feed_timeout_seconds completos,
                         # cortamos la espera en rebanadas cortas para
                         # poder revisarlo (arriba, al volver al inicio
@@ -648,7 +649,7 @@ class TrailingTakeProfitBot:
                         last_reminder = now
                         elapsed = now - start
                         logger.warning(f"[Feed en vivo] {elapsed:.0f}s esperando y todavía ni siquiera llegó "
-                                       f"el ack de suscripción. Revisá la conexión de red y que el mint sea correcto.")
+                                       f"el ack de suscripción. Revisa la conexión de red y que el mint sea correcto.")
         finally:
             if existence_check_task is not None and not existence_check_task.done():
                 existence_check_task.cancel()
@@ -658,7 +659,7 @@ class TrailingTakeProfitBot:
     def _log_mint_not_pumpfun_abort(self) -> None:
         """Único mensaje de error para el caso "este mint no es de
         pump.fun/PumpSwap" -antes se logueaba una vez en
-        _try_onchain_fallback (o en el chequeo temprano) Y OTRA VEZ acá,
+        _try_onchain_fallback (o en la comprobación temprana) Y OTRA VEZ aquí,
         con textos parecidos pero no idénticos, lo que se leía como dos
         errores mezclados para un solo problema."""
         logger.error(f"Abortando esta entrada: no hay de dónde sacar el precio de {self.mint} "
@@ -669,11 +670,11 @@ class TrailingTakeProfitBot:
                      f"no puede calcular su precio de entrada.")
 
     async def _confirm_mint_not_pumpfun(self) -> bool:
-        """Chequeo temprano y SIN efectos secundarios (no toca
+        """Comprobación temprana y SIN efectos secundarios (no toca
         self._onchain_source, a diferencia de _try_onchain_fallback):
         confirma lo antes posible si este mint NUNCA se lanzó en
         pump.fun, consultando en paralelo con la espera del feed en vivo
-        desde el arranque de _get_reference_price -en vez de recién
+        desde el arranque de _get_reference_price -en vez de solo
         después de `live_feed_timeout_seconds`, que existe para tolerar
         tokens de poco volumen y no tiene nada que ver con esta pregunta.
 
@@ -739,8 +740,8 @@ class TrailingTakeProfitBot:
             se lanzó en pump.fun (ej. un mint nativo de Raydium/
             Meteora/otro DEX). No tiene sentido seguir esperando el feed
             en vivo ni reintentar este fallback: nunca va a aparecer
-            nada acá. El llamador (_get_reference_price) debería
-            abortar de una en vez de esperar hasta el timeout.
+            nada aquí. El llamador (_get_reference_price) debería
+            abortar de inmediato en vez de esperar hasta el timeout.
           - price None, pool_confirmed_absent True, mint_not_pumpfun
             False: la bonding curve existe pero no dio un precio
             utilizable (ya completada y el pool de PumpSwap todavía no
@@ -751,7 +752,7 @@ class TrailingTakeProfitBot:
           - price None, pool_confirmed_absent False: la consulta de
             PumpSwap en sí no dio ninguna confirmación útil (se
             encontró un pool pero no se pudo leer, o falló la query) -
-            no hay nada más que probar acá, el llamador debe abortar en
+            no hay nada más que probar aquí, el llamador debe abortar en
             vez de reintentar a ciegas."""
         onchain = PumpSwapOnChainClient(self.cfg.solana_rpc_url)
         price, pool_confirmed_absent = await onchain.fetch_price_or_confirm_absent(self.mint)
@@ -796,9 +797,10 @@ class TrailingTakeProfitBot:
                 if cpmm_confirmed_absent and dlmm_confirmed_absent:
                     # Mensaje de error único para este caso: lo loguea el
                     # llamador (_get_reference_price._log_mint_not_pumpfun_abort),
-                    # no acá -de lo contrario saldrían dos ERROR casi
-                    # idénticos para un solo problema (este chequeo normalmente
-                    # ya lo detectó antes vía _confirm_mint_not_pumpfun).
+                    # no aquí -de lo contrario saldrían dos ERROR casi
+                    # idénticos para un solo problema (esta comprobación
+                    # normalmente ya lo detectó antes vía
+                    # _confirm_mint_not_pumpfun).
                     logger.debug(f"[On-chain] {self.mint} no tiene bonding curve de pump.fun, NI pool "
                                  f"de PumpSwap, NI pool de Raydium CPMM/Meteora DLMM utilizable (todas las consultas "
                                  f"confirmaron ausencia).")
@@ -810,7 +812,7 @@ class TrailingTakeProfitBot:
         """Sólo se llama cuando `entry_dip_pct` > 0 (ver _get_initial_price).
 
         Ya tenemos un precio de REFERENCIA (recién resuelto por
-        _get_reference_price) pero todavía NO compramos con él. Acá
+        _get_reference_price) pero todavía NO compramos con él. Aquí
         seguimos mirando el precio -por el mismo canal que produjo esa
         referencia: el feed en vivo ya suscripto, o polling on-chain si
         se resolvió por algún fallback (self._onchain_source)- hasta que
@@ -894,7 +896,7 @@ class TrailingTakeProfitBot:
                     raise
                 except Exception as e:
                     # StopAsyncIteration (cierre "limpio" del server) ya
-                    # entra por acá: es subclase de Exception. Solo se
+                    # entra por aquí: es subclase de Exception. Solo se
                     # distingue para el texto del log.
                     is_clean_close = isinstance(e, StopAsyncIteration)
                     logger.warning(f"[Feed en vivo] {'la conexión se cerró' if is_clean_close else f'conexión interrumpida ({e})'} "
@@ -907,7 +909,7 @@ class TrailingTakeProfitBot:
                                 pass
                         self._ws = await self.client.connect_trade_stream(self.mint)
                         self._trade_events = self.client.iter_trade_events(self._ws)
-                        # El generador viejo quedó abandonado de verdad acá
+                        # El generador viejo quedó abandonado de verdad aquí
                         # (nueva conexión, no un timeout) -cualquier tarea
                         # pendiente de su __anext__() ya no sirve.
                         if self._pending_next_event_task is not None:
@@ -1014,7 +1016,7 @@ class TrailingTakeProfitBot:
         momento de la entrada), subscribeTokenTrade simplemente deja de
         mandar trades para ese mint de forma silenciosa: el socket sigue
         abierto, no hay error ni cierre, así que ni el `except Exception`
-        de acá abajo ni el StopAsyncIteration se enteraban -el precio
+        de aquí abajo ni el StopAsyncIteration se enteraban -el precio
         quedaba pegado en el último valor para siempre y el status
         printer lo repetía sin parar, como si nada (exactamente el
         síntoma reportado: precio congelado en 0.0000032441 sin ningún
@@ -1089,9 +1091,9 @@ class TrailingTakeProfitBot:
         trade nuevo del feed en vivo, con la posición ya abierta.
         Confirma con consultas on-chain puntuales qué está pasando:
 
-          1. Primero chequea si hay un pool de PumpSwap con precio
+          1. Primero comprueba si hay un pool de PumpSwap con precio
              válido -es una migración real (no solo una pausa de
-             volumen). Si lo hay: aplica ese precio de una, marca
+             volumen). Si lo hay: aplica ese precio de inmediato, marca
              `_onchain_source = "pumpswap"` y corre el polling on-chain
              (_poll_onchain_price_loop) hasta que la posición se cierre
              -> devuelve True (el llamador debe dejar de esperar el
@@ -1108,7 +1110,7 @@ class TrailingTakeProfitBot:
              válido, lo aplicamos como red de seguridad (sin abandonar
              el feed en vivo: seguimos reintentando reconectar/recibir
              trades reales en el loop de _consume_trade_stream) ->
-             devuelve False igual, pero con self.latest_price ya
+             devuelve False de todos modos, pero con self.latest_price ya
              refrescado en vez de congelado.
 
           3. Si ni el pool ni la bonding curve dan nada legible ->
@@ -1248,7 +1250,7 @@ class TrailingTakeProfitBot:
         if pos is None or pos.closed:
             return
         # Movimiento de MERCADO desde la compra: es lo que miden los
-        # umbrales de acá abajo y lo que muestra pump.fun. El neto (con
+        # umbrales de aquí abajo y lo que muestra pump.fun. El neto (con
         # los costes de entrada) lo imprime el status printer aparte.
         pnl = pos.market_pnl_pct(price)
 
@@ -1258,7 +1260,7 @@ class TrailingTakeProfitBot:
         # precio de MERCADO al comprar), no contra `entry_price`. Con
         # datos reales de fill, entry_price es el precio EFECTIVO pagado
         # e incluye comisiones + priority fee + el rent de la ATA (sobre
-        # una compra de 0.05 SOL eso puede ser un 4-5%): usarlo acá
+        # una compra de 0.05 SOL eso puede ser un 4-5%): usarlo aquí
         # subiría de tapadillo el listón de activación y aflojaría el
         # stop-loss en esa misma proporción, cambiando la estrategia sin
         # que nadie lo haya pedido. El PnL sí usa entry_price -ver
@@ -1293,7 +1295,7 @@ class TrailingTakeProfitBot:
         devuelve error, o la tx confirma pero FALLA on-chain -p. ej. por
         slippage excedido-), executor.sell() ahora propaga la excepción a
         propósito en vez de marcar la posición como cerrada (ver BUGFIX en
-        executor.py). Acá la atajamos para que ese fallo:
+        executor.py). Aquí la atajamos para que ese fallo:
           - se loguee como lo que es (venta fallida), no como "conexión
             interrumpida" (que es lo que pasaría si se colara hasta el
             except genérico de _consume_trade_stream), y
@@ -1303,7 +1305,7 @@ class TrailingTakeProfitBot:
             la venta sola, sin intervención manual."""
         async with self._sell_lock:
             # Revalidamos DESPUÉS de conseguir el lock: si _sell_on_shutdown
-            # (u otra llamada) ya vendió mientras esperábamos acá, esto ya
+            # (u otra llamada) ya vendió mientras esperábamos aquí, esto ya
             # no corresponde -evita el segundo pedido real a la Lightning API.
             if pos.closed:
                 return

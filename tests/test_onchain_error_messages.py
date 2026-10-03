@@ -33,7 +33,7 @@ async def test_describe_onchain_error_incluye_causa_conocida_de_spl_token(monkey
     from pepump import pump as pump_module
 
     async def fake_fetch_logs(signature, rpc_url):
-        return []  # simulamos que no se pudieron obtener logs, igual debe decodificar el código
+        return []  # simulamos que no se pudieron obtener logs, pero debe decodificar el código de todos modos
 
     monkeypatch.setattr(pump_module, "_fetch_program_logs", fake_fetch_logs)
 
@@ -88,7 +88,7 @@ async def test_describe_onchain_error_mensaje_generico_si_no_hay_nada_util(monke
 
 async def test_describe_onchain_error_no_rompe_si_todo_falla(monkeypatch):
     """Si tanto la decodificación como la obtención de logs fallan (ej.
-    err no tiene la forma esperada, RPC caído), no debe tirar excepción
+    err no tiene la forma esperada, RPC caído), no debe lanzar ninguna excepción
     -debe caer en la razón genérica."""
     from pepump import pump as pump_module
 

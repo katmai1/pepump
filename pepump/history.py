@@ -5,7 +5,7 @@ Una única función, `append_closed_trade`, que agrega UNA fila por venta ya
 confirmada (real o simulada) a un archivo .csv. Se abre en modo append y se
 cierra en cada llamada -no se mantiene el archivo abierto entre ventas- para
 que cada fila quede persistida en el momento, sin depender de un flush/close
-prolijo al final: si el proceso se corta de golpe (Ctrl+C duro, crash, kill
+ordenado al final: si el proceso se corta de golpe (Ctrl+C duro, crash, kill
 -9), las ventas ya escritas no se pierden.
 """
 import csv
@@ -15,7 +15,7 @@ import os
 logger = logging.getLogger(__name__)
 
 # Orden fijo de columnas. Si se le agrega un campo nuevo a una fila en el
-# futuro, hay que agregarlo acá también (y el header de archivos .csv viejos
+# futuro, hay que agregarlo aquí también (y el header de archivos .csv viejos
 # va a quedar corto -no se migra automáticamente, hay que rotarlo a mano).
 CSV_FIELDS = [
     "closed_at",        # timestamp ISO-8601 (UTC) de cuándo se cerró la orden
@@ -37,9 +37,9 @@ def append_closed_trade(path: str, row: dict) -> None:
     primero si el archivo todavía no existe o está vacío.
 
     Nunca propaga excepciones: un problema de disco (permisos, ruta
-    inválida, disco lleno) no debe tirar abajo el bot ni, peor, hacer
+    inválida, disco lleno) no debe tumbar el bot ni, peor, hacer
     parecer que la VENTA en sí falló -la venta ya se ejecutó (o se simuló)
-    antes de llegar acá, así que como mucho se pierde el registro en el
+    antes de llegar aquí, así que como mucho se pierde el registro en el
     historial, nunca la operación. Solo se loguea como warning.
     """
     if not path:

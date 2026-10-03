@@ -30,7 +30,7 @@ buy_sol = 0.05
 # Slippage permitido, en porcentaje.
 slippage = 15
 
-# Priority fee / tip, en SOL. Subilo si las transacciones no entran rápido.
+# Priority fee / tip, en SOL. Súbelo si las transacciones no entran rápido.
 priority_fee = 0.00001
 
 # Pool/exchange: "pump", "raydium", "pump-amm", "launchlab", "raydium-cpmm", "bonk" o "auto".
@@ -49,11 +49,11 @@ initial_stop_pct = 25.0
 
 # Baja %% que se espera ANTES de comprar, medida desde el precio de
 # referencia (el primer precio que llega al arrancar el bot).
-# 0 (default)  = compra de una al precio de referencia (comportamiento normal).
+# 0 (default)  = compra al instante al precio de referencia (normal).
 # > 0 (ej. 5)  = NO compra en la referencia; espera a que el precio baje ese
-#                %% desde ahí (referencia * (1 - entry_dip_pct/100)) y recién
-#                ahí entra. Sin timeout: si el precio nunca baja tanto, el
-#                bot queda esperando indefinidamente (cancelá con Ctrl+C).
+#                %% desde ahí (referencia * (1 - entry_dip_pct/100)) y solo
+#                entonces entra. Sin timeout: si el precio nunca baja tanto, el
+#                bot queda esperando indefinidamente (cancela con Ctrl+C).
 entry_dip_pct = 0.0
 
 [pumpportal]

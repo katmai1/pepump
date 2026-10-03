@@ -1,5 +1,5 @@
 """
-Tests para la nueva opción `entry_dip_pct`: si es 0, comprar de una al
+Tests para la nueva opción `entry_dip_pct`: si es 0, comprar de inmediato al
 precio de referencia (comportamiento de siempre). Si es > 0, esperar a
 que el precio baje ese %% desde la referencia antes de comprar.
 """

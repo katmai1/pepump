@@ -4,8 +4,8 @@ Traducción de códigos de error on-chain a algo legible.
 Cuando una compra/venta revierte, el RPC solo devuelve algo como
 `InstructionError(3, Custom(6005))`. El número por sí solo no dice nada, y
 peor: el MISMO número significa cosas distintas según el programa que lo
-tiró (6005 es `BondingCurveComplete` en pump.fun pero `InvalidAdmin` en
-PumpSwap). Por eso acá hay una tabla POR PROGRAMA, y
+lanzó (6005 es `BondingCurveComplete` en pump.fun pero `InvalidAdmin` en
+PumpSwap). Por eso aquí hay una tabla POR PROGRAMA, y
 `failing_program_from_logs()` para saber cuál de ellas aplica leyendo la
 línea "Program <id> failed:" de los logs de la transacción.
 
@@ -14,7 +14,7 @@ https://github.com/pump-fun/pump-public-docs/tree/main/idl (`pump.json` y
 `pump_amm.json`), con los mensajes tal cual los define el programa -en
 inglés a propósito: así son greppables contra el IDL y contra cualquier
 explorer, sin una traducción propia que se desincronice-. Para
-regenerarlas, bajá esos dos .json y volcá su lista `errors`.
+regenerarlas, descarga esos dos .json y vuelca su lista `errors`.
 
 La de spl-token viene de `spl_token::error::TokenError`, que es estable y
 no cambia. Casi cualquier ruta de trading termina haciendo un CPI a
@@ -25,7 +25,7 @@ import re
 from typing import Optional
 
 # Anchor reserva los códigos custom a partir de 6000 para los errores
-# definidos por el programa; abajo de eso son errores de programas nativos
+# definidos por el programa; por debajo de eso son errores de programas nativos
 # (spl-token, system, etc.). Sirve como desempate cuando no se pudo
 # identificar el programa que falló.
 ANCHOR_ERROR_CODE_OFFSET = 6000
@@ -44,7 +44,7 @@ PROGRAM_NAMES = {
 
 _SPL_TOKEN_ERRORS = {
     0: "NotRentExempt: la cuenta quedaría por debajo del mínimo exento de rent",
-    1: "InsufficientFunds: fondos insuficientes para la transferencia (revisá el balance de SOL/WSOL o del token)",
+    1: "InsufficientFunds: fondos insuficientes para la transferencia (revisa el balance de SOL/WSOL o del token)",
     2: "InvalidMint",
     3: "MintMismatch: el mint de la cuenta no coincide con el esperado",
     4: "OwnerMismatch: la cuenta no pertenece al owner esperado",
@@ -226,7 +226,7 @@ _FAILED_PROGRAM_RE = re.compile(r"Program ([1-9A-HJ-NP-Za-km-z]{32,44}) failed")
 def failing_program_from_logs(logs) -> Optional[str]:
     """Devuelve el program id que revirtió, sacado de los logs de la
     transacción. Si hay varios (un CPI que falla hace fallar también al
-    programa que lo llamó), gana el PRIMERO: es el más adentro de la
+    programa que lo llamó), gana el PRIMERO: es el más interno de la
     cadena, o sea el que realmente originó el error. None si no matchea
     ninguna línea."""
     for line in logs or []:
@@ -240,7 +240,7 @@ def describe_custom_error(code: int, program_id: Optional[str] = None) -> Option
     """Traduce un código `Custom(N)` a "<programa> <Nombre>: <mensaje>".
 
     `program_id` es el que devolvió `failing_program_from_logs()`. Si no se
-    pudo identificar, se cae a una heurística por rango: abajo de 6000 solo
+    pudo identificar, se cae a una heurística por rango: por debajo de 6000 solo
     puede ser un programa nativo (spl-token es el candidato realista en un
     trade), y de 6000 para arriba es un error Anchor de ALGÚN programa que
     no podemos atribuir -así que se dice explícitamente en vez de adivinar
@@ -265,4 +265,4 @@ def describe_custom_error(code: int, program_id: Optional[str] = None) -> Option
         return None
 
     return (f"error Anchor {code} de un programa que no pude identificar "
-            f"(mirá los logs con -v o abrí el link de Solscan)")
+            f"(mira los logs con -v o abre el enlace de Solscan)")

@@ -10,7 +10,7 @@ Organización del código:
     - PumpPortalClient: se encarga ÚNICAMENTE de las peticiones (websocket
       de datos y Lightning Trading API). Con la Lightning API, PumpPortal
       firma y envía la transacción en su propio servidor: nosotros solo
-      mandamos la orden con nuestra API key, no necesitamos manejar la
+      mandamos la orden con nuestra API key, no necesitamos gestionar la
       clave privada localmente ni una librería de Solana.
     - TradeExecutor: decide y ejecuta compras/ventas, ya sea SIMULADAS o
       REALES, apoyándose en un PumpPortalClient. Mantiene el estado de la
@@ -46,8 +46,8 @@ requiere API key + wallet con al menos 0.02 SOL. Sin eso, el bot se queda
 esperando para siempre.
 
 ⚠️ Esto es una herramienta de trading, no un consejo financiero. Las memecoins
-de pump.fun son extremadamente volátiles y de altísimo riesgo. Probá siempre
-primero en modo simulado y con montos chicos.
+de pump.fun son extremadamente volátiles y de altísimo riesgo. Prueba siempre
+primero en modo simulado y con importes pequeños.
 
 Requisitos:
     pip install websockets requests
@@ -108,7 +108,7 @@ if __name__ == "__main__":
     try:
         config = load_config(args.config)
         # El mint viene SIEMPRE de la línea de comandos, nunca del .toml.
-        # Se normaliza y valida aqui para fallar rápido y con un mensaje
+        # Se normaliza y valida aquí para fallar rápido y con un mensaje
         # que apunte a la causa real -ver validate_mint en config.py.
         config.mint = validate_mint(args.mint)
     except FileNotFoundError:
@@ -116,7 +116,7 @@ if __name__ == "__main__":
         sys.exit(1)
     except ValueError as e:
         # tomllib.TOMLDecodeError también hereda de ValueError, así que un
-        # .toml mal formado cae aqui también (probado: da un mensaje claro).
+        # .toml mal formado cae aquí también (probado: da un mensaje claro).
         logger.error(f"ERROR de configuración: {e}")
         sys.exit(1)
    

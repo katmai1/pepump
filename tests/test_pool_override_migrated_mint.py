@@ -19,7 +19,7 @@ fallback de entrada como para cualquier venta posterior-, y NO pasar
 override (pool_override=None, se usa self.cfg.pool tal cual) mientras
 el feed en vivo sigue funcionando normalmente NI cuando
 _onchain_source es "bondingcurve" (el mint sigue en bonding curve, solo
-cambió de dónde sale el precio -overridear acá sería el mismo bug al
+cambió de dónde sale el precio -overridear aquí sería el mismo bug al
 revés, ver test_venta_con_bonding_curve_fallback_no_fuerza_pool_amm)."""
 import asyncio
 
@@ -89,7 +89,7 @@ def test_venta_con_bonding_curve_fallback_no_fuerza_pool_amm():
     bonding curve, solo cambió de dónde sale el precio -ver
     PumpCurveOnChainClient), NO hay que forzar pool="pump-amm": ese
     override es específico de un mint que sí migró a PumpSwap.
-    Forzarlo acá sería el mismo bug 6005/BondingCurveComplete que este
+    Forzarlo aquí sería el mismo bug 6005/BondingCurveComplete que este
     override existe para evitar, pero en la dirección contraria (mandar
     "pump-amm" para un mint que en realidad sigue en la bonding curve
     de pump.fun)."""

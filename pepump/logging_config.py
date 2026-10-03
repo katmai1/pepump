@@ -24,7 +24,7 @@ def setup_logging(level: int = logging.INFO) -> None:
     handler.setFormatter(formatter)
     root.addHandler(handler)
 
-    # websockets, httpx y httpcore son re-verbosos en INFO/DEBUG (loguean
+    # websockets, httpx y httpcore son muy verbosos en INFO/DEBUG (loguean
     # cada frame/request). Los bajamos a WARNING para no ensuciar la
     # salida del bot -pero SOLO si no estás en modo verbose (-v/DEBUG),
     # porque ahí sí queremos ver hasta el último detalle de conexión.

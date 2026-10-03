@@ -200,8 +200,8 @@ def test_fetch_actual_fill_none_si_mint_no_aparece_en_ningun_lado(monkeypatch):
 def test_fetch_actual_fill_reintenta_si_la_tx_todavia_no_esta_indexada(monkeypatch):
     """Caso real reportado: get_transaction devuelve resp.value=None las
     primeras veces (la tx confirmó pero el nodo RPC todavía no puede
-    servirla) y recién en el último intento aparece -_fetch_actual_fill
-    debe reintentar y devolver los datos reales, no rendirse de una."""
+    servirla) y solo en el último intento aparece -_fetch_actual_fill
+    debe reintentar y devolver los datos reales, no rendirse de inmediato."""
     resp = _make_resp(sol_delta_lamports=-50_500_000, pre_tokens=0.0, post_tokens=1_234.5)
     fake_client = FakeAsyncClient(resp=resp, fail_times=2)
     monkeypatch.setattr(pump_module, "AsyncClient", lambda url: fake_client)
@@ -233,7 +233,7 @@ def test_fetch_actual_fill_none_si_la_tx_nunca_aparece_tras_los_reintentos(monke
 def test_fetch_actual_fill_pasa_commitment_confirmed(monkeypatch):
     """get_transaction debe pedirse explícitamente con commitment=Confirmed
     -no depender del default del cliente (finalized), que tarda más y
-    empeora el desfasaje con _confirm_transaction_onchain."""
+    empeora el desfase con _confirm_transaction_onchain."""
     from solana.rpc.commitment import Confirmed
 
     resp = _make_resp(sol_delta_lamports=-50_500_000, pre_tokens=0.0, post_tokens=1_234.5)
@@ -302,7 +302,7 @@ def _tx_con_tipos_reales(pre_tokens, post_tokens, owner=REAL_WALLET):
 
 def test_fetch_actual_fill_funciona_con_los_tipos_reales_de_solders(monkeypatch):
     """El test de regresión del bug: con Pubkey (no str) tiene que leer
-    el fill igual. Antes devolvía None y el bot usaba el estimado."""
+    el fill de todos modos. Antes devolvía None y el bot usaba el estimado."""
     tx = _tx_con_tipos_reales(pre_tokens=None, post_tokens=1500.0)
     monkeypatch.setattr(pump_module, "AsyncClient", make_fake_async_client(tx))
 
@@ -316,7 +316,7 @@ def test_fetch_actual_fill_funciona_con_los_tipos_reales_de_solders(monkeypatch)
 def test_fetch_actual_fill_tolera_owner_ausente_si_hay_un_solo_balance(monkeypatch):
     """Algunos nodos no mandan `owner` en los token balances. Si hay UNA
     sola entrada para el mint, es la nuestra: descartar el fill real por
-    un campo opcional que el nodo omitió sería tirar el dato bueno."""
+    un campo opcional que el nodo omitió sería descartar el dato bueno."""
     tx = _tx_con_tipos_reales(pre_tokens=None, post_tokens=1500.0, owner=None)
     monkeypatch.setattr(pump_module, "AsyncClient", make_fake_async_client(tx))
 

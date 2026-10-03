@@ -41,7 +41,7 @@ class Position:
     # compra haya sido real.
     entry_is_real_fill: bool = False
     # time.time() del momento en que se abrió la posición (Position se crea
-    # recién al comprar -ver TradeExecutor.buy-, así que esto es "ahora"
+    # solo al comprar -ver TradeExecutor.buy-, así que esto es "ahora"
     # salvo que se pise explícitamente, como hacen los tests). Sirve para
     # calcular cuánto duró abierta la posición en el historial de CSV.
     opened_at: float = field(default_factory=time.time)
@@ -117,12 +117,12 @@ class TradeExecutor:
                 logger.info(f"[REAL] Compra CONFIRMADA on-chain. Respuesta: {result}")
             except Exception:
                 # execute_lightning_trade ahora confirma en cadena antes
-                # de devolver: si esto tira, es porque la orden fue
-                # rechazada de una, o la tx confirmó pero FALLÓ on-chain
+                # de devolver: si esto lanza, es porque la orden fue
+                # rechazada de inmediato, o la tx confirmó pero FALLÓ on-chain
                 # (p. ej. slippage excedido), o no confirmó a tiempo. En
                 # NINGUNO de esos casos hay que abrir una posición -no se
                 # compró nada de verdad-, así que propagamos el error y
-                # no seguimos de largo.
+                # no seguimos adelante.
                 logger.exception("[REAL] Error al comprar (la orden no se confirmó on-chain)")
                 raise
 
@@ -220,7 +220,7 @@ class TradeExecutor:
             actual_token_delta = result.get("actual_token_delta") if isinstance(result, dict) else None
             # La señal de que la venta se leyó bien es el delta de TOKENS
             # (negativo: salieron de la wallet). El delta de SOL no sirve
-            # como condición: en una posición chica que se hunde, las
+            # como condición: en una posición pequeña que se hunde, las
             # comisiones + priority fee pueden superar a lo que se recibe
             # y dejarlo en cero o negativo -y ahí caer al ESTIMADO es lo
             # peor que se puede hacer, porque el CSV registraría unos
@@ -235,10 +235,10 @@ class TradeExecutor:
                 else:
                     # Sin ingresos netos no hay "precio de salida" que
                     # tenga sentido: se deja el de mercado para el log/CSV
-                    # y el PnL igual sale de los SOL reales.
+                    # y el PnL sale de todos modos de los SOL reales.
                     logger.warning(f"[REAL] La venta de {position.mint} no dejó SOL neto positivo "
                                     f"({real_sol_received:.9f} SOL): las comisiones se comieron los "
-                                    f"ingresos. Se registra el PnL real igual.")
+                                    f"ingresos. Se registra el PnL real de todos modos.")
                     exit_price = price
                 real_fill = True
                 logger.info(f"[REAL] Datos REALES de la venta (de la tx confirmada, ya netos de fees): "

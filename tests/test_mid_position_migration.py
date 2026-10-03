@@ -24,7 +24,7 @@ async def _hanging_stream():
     en vivo yéndose en silencio tras la migración: el socket sigue
     'abierto' pero no llega nada más)."""
     await asyncio.Future()
-    yield {}  # pragma: no cover - nunca se llega acá
+    yield {}  # pragma: no cover - nunca se llega aquí
 
 
 class FakeOnChainClient:
@@ -44,7 +44,7 @@ class FakeOnChainClient:
 
 class FakeCurveOnChainClient:
     """Reemplaza PumpCurveOnChainClient en estos tests: devuelve
-    (price, complete, exists) fijos, sin pegarle a la red."""
+    (price, complete, exists) fijos, sin tocar la red."""
 
     def __init__(self, rpc_url, price=None, complete=False, exists=False):
         self.rpc_url = rpc_url
@@ -82,8 +82,8 @@ def test_migracion_a_mitad_de_posicion_pasa_a_polling_onchain(monkeypatch):
     fake_onchain = FakeOnChainClient(cfg.solana_rpc_url, [1.20, 1.30, 1.10])
     monkeypatch.setattr(bot_module, "PumpSwapOnChainClient", lambda rpc_url: fake_onchain)
     # No debería llegar a consultarse (el fake de PumpSwap ya da precio
-    # válido de una), pero lo dejamos parcheado igual para no pegarle a
-    # la red real si algo cambia.
+    # válido de inmediato), pero lo dejamos parcheado de todos modos para
+    # no tocar la red real si algo cambia.
     monkeypatch.setattr(bot_module, "PumpCurveOnChainClient",
                          lambda rpc_url: FakeCurveOnChainClient(rpc_url))
 

@@ -57,7 +57,7 @@ def test_append_creates_intermediate_directories(tmp_path):
 
 
 def test_empty_path_is_a_noop(tmp_path):
-    # No debe tirar ni crear nada raro; el caller (executor.py) usa esto
+    # No debe lanzar nada ni crear nada raro; el caller (executor.py) usa esto
     # para desactivar el historial con trade_history_csv = "".
     append_closed_trade("", _row())
     # Nada que assertear salvo que no explota.
@@ -66,7 +66,7 @@ def test_empty_path_is_a_noop(tmp_path):
 def test_append_does_not_raise_on_unwritable_path(tmp_path, monkeypatch, caplog):
     # Simula un error de disco (permisos, disco lleno, etc.): append_closed_trade
     # debe absorberlo y solo loguear un warning, nunca propagar la excepción
-    # -la venta ya se ejecutó antes de llegar acá, no puede "fallar" por esto.
+    # -la venta ya se ejecutó antes de llegar aquí, no puede "fallar" por esto.
     bad_path = str(tmp_path / "history.csv")
 
     def boom(*args, **kwargs):
