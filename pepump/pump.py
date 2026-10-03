@@ -204,7 +204,7 @@ def _extract_instruction_error(err) -> Optional[tuple]:
     tipo de error, versión distinta de solders, etc.) -nunca lanza
     excepción, esto es solo para dar un mensaje más claro, no crítico."""
     try:
-        from solders.transaction_status import (
+        from solders.transaction_status import ( # type: ignore
             TransactionErrorInstructionError,
             InstructionErrorCustom,
         )
