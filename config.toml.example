@@ -15,6 +15,9 @@ live = false
 # (venta confirmada, real o simulada): mint, precio de entrada/salida,
 # PnL %%, SOL recibidos, duración de la posición y motivo del cierre.
 # Se crea solo si no existe. "" desactiva el historial.
+# En Windows, usa barras normales ("C:/bots/historial.csv") o comillas
+# simples ('C:\bots\historial.csv'): en una cadena TOML con comillas
+# dobles, la barra invertida es un escape y da error de parseo.
 trade_history_csv = "trade_history.csv"
 
 # Cada cuántos segundos se imprime el estado de la posición (precio actual,

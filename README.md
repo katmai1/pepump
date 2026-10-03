@@ -47,6 +47,10 @@ python run.py -m <MINT> -v                  # logging en DEBUG
 `Ctrl+C` (o `SIGTERM`) hace un cierre ordenado: si hay una posición
 abierta, la vende al precio más actual posible antes de salir.
 
+En Windows funciona igual con `Ctrl+C` y `Ctrl+Pausa`, pero `SIGTERM` no
+se entrega nunca: `taskkill /F` mata el proceso en seco y la posición
+queda abierta. Ciérrala con `Ctrl+C`.
+
 ## Estrategia
 
 1. Se suscribe al feed de trades del mint **antes** de comprar y espera el

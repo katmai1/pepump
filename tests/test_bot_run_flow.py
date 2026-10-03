@@ -68,9 +68,9 @@ async def test_run_cancels_monitor_before_selling_on_shutdown():
     Se simula pidiendo shutdown inmediatamente después de la compra, con
     un stream de eventos que se queda "colgado" (nunca llega un segundo
     trade): si el bug siguiera presente, este test pasaría de todos
-    modos porque no hay una condición de carrera activa -lo importante aquí es que NO
-    haya ningún error/duplicado y que sell termine llamándose una sola
-    vez con el bot ya limpio.
+    modos porque no hay una condición de carrera activa -lo importante
+    aquí es que NO haya ningún error/duplicado y que sell termine
+    llamándose una sola vez con el bot ya limpio.
     """
     cfg = make_config(status_interval_seconds=999)
     events = [{"price": 1.0}]  # solo el trade inicial; el stream queda "abierto y en silencio"

@@ -98,13 +98,14 @@ class TrailingTakeProfitBot:
         # Stalls SEGUIDOS del feed en vivo con la bonding curve todavía
         # activa (ver _handle_feed_stall y _MAX_CURVE_STALLS_BEFORE_POLLING).
         self._curve_stalls = 0
-        # Se activa con Ctrl+C (SIGINT) o SIGTERM (ver run()). NO se usa
-        # el try/except KeyboardInterrupt clásico porque en asyncio esa
-        # señal interrumpe el loop de eventos "por afuera" de la
-        # corrutina en ejecución, no dentro de ella -no hay garantía de
-        # que un try/except puesto en el código de la app la agarre. Con
-        # loop.add_signal_handler() el apagado se coordina de forma
-        # confiable con un asyncio.Event normal.
+        # Se activa con Ctrl+C (SIGINT), SIGTERM o SIGBREAK (ver
+        # _install_shutdown_handlers). NO se usa el try/except
+        # KeyboardInterrupt clásico porque en asyncio esa señal
+        # interrumpe el loop de eventos "por afuera" de la corrutina en
+        # ejecución, no dentro de ella -no hay garantía de que un
+        # try/except puesto en el código de la app la agarre. Con un
+        # manejador de señales que solo marca este asyncio.Event, el
+        # apagado se coordina de forma confiable.
         self._shutdown_requested = asyncio.Event()
         # BUGFIX (doble venta): serializa CUALQUIER intento de venta de la
         # posición (ya sea por trailing-stop/stop-loss vía _try_sell, o por
@@ -119,6 +120,109 @@ class TrailingTakeProfitBot:
         # porque no queda nada que vender) y no dispara un segundo pedido
         # real.
         self._sell_lock = asyncio.Lock()
+
+    # Señales que disparan el cierre ordenado. SIGBREAK (Ctrl+Pausa) solo
+    # existe en Windows, así que se filtra con getattr: en Unix no está y
+    # la tupla se queda con SIGINT/SIGTERM.
+    _SHUTDOWN_SIGNALS = tuple(
+        sig for sig in (getattr(signal, "SIGINT", None),
+                        getattr(signal, "SIGTERM", None),
+                        getattr(signal, "SIGBREAK", None))
+        if sig is not None
+    )
+
+    def _install_shutdown_handlers(self, loop) -> list:
+        """Instala los manejadores de cierre ordenado y devuelve la lista
+        de funciones que los desinstalan (las llama el finally de run()).
+
+        Hay DOS caminos porque no existe uno que sirva en los dos
+        sistemas operativos:
+
+          1. `loop.add_signal_handler()` (Unix): el preferido. La señal
+             nunca pasa por un manejador de Python, así que no hay
+             ninguna ventana en la que llegue "por afuera" de la
+             corrutina en ejecución.
+
+          2. `signal.signal()` (Windows): add_signal_handler() es solo de
+             Unix y en Windows lanza NotImplementedError. BUGFIX: sin este
+             fallback no se instalaba NADA en Windows, así que
+             `_shutdown_requested` no se marcaba nunca: Ctrl+C subía como
+             KeyboardInterrupt, run.py lo atrapaba y el proceso terminaba
+             SIN VENDER la posición abierta -justo lo que el cierre
+             ordenado existe para evitar, y con SOL real de por medio-.
+             El manejador no toca el Event directamente (correría fuera
+             del loop de eventos, donde Event.set() no despierta a nadie):
+             hace `loop.call_soon_threadsafe`, que además despierta al
+             ProactorEventLoop -desde Python 3.8 las señales escriben en
+             el socket interno del loop, así que se atiende enseguida y no
+             al llegar el próximo trade del websocket.
+
+        OJO (Windows): SIGTERM se puede registrar pero el sistema no lo
+        entrega nunca; `taskkill /F` mata el proceso en seco, sin darle
+        oportunidad de vender. Ahí el cierre ordenado es Ctrl+C o
+        Ctrl+Pausa."""
+        restores = []
+        for sig in self._SHUTDOWN_SIGNALS:
+            restore = self._install_one_shutdown_handler(loop, sig)
+            if restore is not None:
+                restores.append(restore)
+        if not restores:
+            logger.warning("No se pudo instalar ningún manejador de señales en este sistema: el "
+                           "cierre ordenado NO va a funcionar y una posición abierta puede quedar "
+                           "SIN VENDER al salir. Ciérrala a mano si hace falta.")
+        return restores
+
+    def _install_one_shutdown_handler(self, loop, sig):
+        """Instala el manejador de UNA señal por el mejor camino
+        disponible (ver _install_shutdown_handlers). Devuelve la función
+        que lo desinstala, o None si no se pudo instalar por ninguno de
+        los dos caminos."""
+        try:
+            loop.add_signal_handler(sig, self._request_shutdown, sig.name)
+        except (NotImplementedError, RuntimeError):
+            pass  # Windows, o no estamos en el hilo principal -> camino 2.
+        else:
+            def _quitar_de_asyncio() -> None:
+                try:
+                    loop.remove_signal_handler(sig)
+                except Exception:
+                    pass
+            return _quitar_de_asyncio
+
+        sig_name = sig.name
+
+        def _manejador(_signum, _frame) -> None:
+            try:
+                loop.call_soon_threadsafe(self._request_shutdown, sig_name)
+            except RuntimeError:
+                # El loop ya se cerró (señal justo durante el apagado):
+                # no hay nada que coordinar, y propagar desde un
+                # manejador de señales solo ensuciaría la salida.
+                pass
+
+        try:
+            anterior = signal.signal(sig, _manejador)
+        except (ValueError, OSError, RuntimeError) as e:
+            # ValueError: no estamos en el hilo principal, o esta señal no
+            # existe en este sistema. El aviso global (si no se pudo
+            # instalar NINGUNA) lo da _install_shutdown_handlers.
+            logger.debug(f"No se pudo instalar manejador para {sig_name} en este sistema: {e}")
+            return None
+
+        logger.debug(f"Manejador de {sig_name} instalado vía signal.signal "
+                     f"(add_signal_handler no está disponible en este sistema).")
+
+        def _restaurar_anterior() -> None:
+            # signal.signal() devuelve None cuando el manejador previo no
+            # venía de Python: en ese caso no hay nada que restaurar, y
+            # pasarle None sería un TypeError.
+            if anterior is None:
+                return
+            try:
+                signal.signal(sig, anterior)
+            except Exception:
+                pass
+        return _restaurar_anterior
 
     def _request_shutdown(self, sig_name: str) -> None:
         if self._shutdown_requested.is_set():
@@ -143,27 +247,18 @@ class TrailingTakeProfitBot:
              mientras dure la posición,
           3. en paralelo corre la impresión periódica del %% de profit.
 
-        Ctrl+C (SIGINT) o SIGTERM en cualquier momento: si ya hay una
-        posición abierta, se vende al precio más actual posible antes de
-        salir (ver _sell_on_shutdown); si todavía no se compró nada,
-        simplemente corta la espera y termina sin vender nada.
+        Ctrl+C (SIGINT), SIGTERM o Ctrl+Pausa (SIGBREAK, solo Windows) en
+        cualquier momento: si ya hay una posición abierta, se vende al
+        precio más actual posible antes de salir (ver _sell_on_shutdown);
+        si todavía no se compró nada, simplemente corta la espera y
+        termina sin vender nada. Ver _install_shutdown_handlers para cómo
+        se engancha cada señal en Unix y en Windows.
         """
         logger.info(f"Siguiendo el token: {self.mint}")
         logger.debug(f"Suscribiéndose (subscribe_trade) al feed de trades de PumpPortal para {self.mint}...")
 
         loop = asyncio.get_running_loop()
-        signal_handlers_installed = []
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
-                loop.add_signal_handler(sig, self._request_shutdown, sig.name)
-                signal_handlers_installed.append(sig)
-            except (NotImplementedError, RuntimeError):
-                # Windows (ProactorEventLoop) no soporta add_signal_handler.
-                # Ctrl+C ahí cae al comportamiento default de Python
-                # (KeyboardInterrupt sin venta automática al cerrar).
-                logger.debug(f"No se pudo instalar manejador para {sig.name} en este sistema "
-                             f"(¿Windows?); el cierre ordenado con venta automática no va a "
-                             f"funcionar para esta señal.")
+        quitar_manejadores = self._install_shutdown_handlers(loop)
 
         # OJO: connect_trade_stream ya deja el subscribe MANDADO del lado
         # de PumpPortal apenas conecta. Si algo revienta después de esto y
@@ -252,11 +347,8 @@ class TrailingTakeProfitBot:
                 else:
                     logger.info("No hay posición abierta; no hay nada que vender.")
         finally:
-            for sig in signal_handlers_installed:
-                try:
-                    loop.remove_signal_handler(sig)
-                except Exception:
-                    pass
+            for quitar in quitar_manejadores:
+                quitar()
             if self._pending_next_event_task is not None:
                 self._pending_next_event_task.cancel()
                 self._pending_next_event_task = None
