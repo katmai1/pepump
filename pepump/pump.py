@@ -1,3 +1,4 @@
+import base64
 import requests
 import websockets
 import json
@@ -44,6 +45,156 @@ def _as_positive_float(value) -> Optional[float]:
     if not math.isfinite(number) or number <= 0:
         return None
     return number
+
+
+class RpcErrorResponse(RuntimeError):
+    """El nodo RPC contestó con un error JSON-RPC en vez de con datos."""
+
+
+def _rpc_value(resp, que: str):
+    """El `.value` de una respuesta de solana-py, pero traduciendo el
+    error del nodo a algo legible.
+
+    BUGFIX: estas respuestas NO siempre traen `.value`. Cuando el nodo
+    contesta con un error JSON-RPC, solana-py devuelve un objeto de
+    `solders.rpc.errors` (InvalidRequestMessage, etc.) que no tiene ese
+    campo, así que el `resp.value` de siempre reventaba con
+    "'InvalidRequestMessage' object has no attribute 'value'". El
+    `except Exception` del llamador logueaba ese AttributeError tal cual
+    y TAPABA el motivo real, que el nodo sí había explicado. Caso real:
+    Helius respondiendo "Too many accounts requested (10000001 pubkeys),
+    Please use getProgramAccountsV2 with pagination" a un
+    getProgramAccounts sobre el programa de PumpSwap -el bot solo decía
+    "no hay ninguna fuente de precio disponible" y abortaba la entrada,
+    sin ninguna pista de que el problema era el RPC."""
+    if hasattr(resp, "value"):
+        return resp.value
+    message = getattr(resp, "message", None) or repr(resp)
+    raise RpcErrorResponse(f"el RPC rechazó {que}: {message}")
+
+
+# Marcas en el mensaje de error con las que un proveedor está pidiendo la
+# variante paginada en vez del getProgramAccounts clásico.
+_NEEDS_GPA_V2_HINTS = ("getprogramaccountsv2", "pagination")
+# Cuentas por página al usar la V2 (10.000 es el máximo que acepta
+# Helius: con más responde "Pagination limit too large"), y techo de
+# páginas como red de seguridad para no quedar en un bucle infinito si un
+# nodo devolviera siempre la misma paginationKey.
+_GPA_V2_PAGE_LIMIT = 10_000
+_GPA_V2_MAX_PAGES = 200
+
+
+class _CuentaCruda:
+    """Cuenta de getProgramAccountsV2 con la MISMA forma que las que
+    devuelve solana-py (`.pubkey` y `.account.data`), para que el parseo
+    de los clientes de abajo funcione igual venga de donde venga."""
+
+    __slots__ = ("pubkey", "account")
+
+    class _Datos:
+        __slots__ = ("data",)
+
+        def __init__(self, data: bytes):
+            self.data = data
+
+    def __init__(self, pubkey: str, data: bytes):
+        self.pubkey = pubkey
+        self.account = self._Datos(data)
+
+
+async def _get_program_accounts(client: AsyncClient, rpc_url: str, program_id: Pubkey,
+                                 filters: list, que: str) -> list:
+    """getProgramAccounts con `filters`, cayendo a getProgramAccountsV2
+    (paginada) si el proveedor rechaza la clásica.
+
+    Algunos proveedores ya no sirven el getProgramAccounts estándar sobre
+    programas enormes. Helius responde "Too many accounts requested
+    (10000001 pubkeys), Please use getProgramAccountsV2 with pagination"
+    para el programa de PumpSwap, y lo decide por el tamaño del programa
+    ANTES de aplicar los memcmp, así que afinar los filtros no sirve de
+    nada: con el endpoint público pasa algo parecido (getProgramAccounts
+    directamente limitado). Sin este fallback, un RPC así dejaba al bot
+    sin NINGUNA forma de encontrar el pool.
+
+    La V2 es una extensión del proveedor, no RPC estándar de Solana, y
+    solana-py no la expone: se manda a mano con el mismo `requests` en un
+    thread que ya usa la Lightning API. El camino normal sigue siendo la
+    clásica -la V2 solo se intenta si la otra falla- para no romper los
+    RPC que no la tienen (nodo propio, endpoint público)."""
+    try:
+        resp = await client.get_program_accounts(program_id, encoding="base64", filters=filters)
+        return _rpc_value(resp, que) or []
+    except RpcErrorResponse as e:
+        if not any(hint in str(e).lower() for hint in _NEEDS_GPA_V2_HINTS):
+            raise
+        logger.debug(f"[On-chain] {e} -> reintento con getProgramAccountsV2 paginada.")
+
+    return await _get_program_accounts_v2(rpc_url, program_id, filters, que)
+
+
+async def _get_program_accounts_v2(rpc_url: str, program_id: Pubkey,
+                                    filters: list, que: str) -> list:
+    """getProgramAccountsV2 recorriendo TODAS las páginas (ver
+    _get_program_accounts, que es quien decide cuándo usar esto)."""
+    # OJO: la paginación recorre el conjunto CRUDO de cuentas del
+    # programa y aplica los filtros a cada página, así que una página
+    # vacía es normal y NO significa que se terminó -solo la ausencia de
+    # paginationKey marca el final. Comprobado contra Helius: la primera
+    # página vuelve vacía y el pool aparece en la segunda.
+    filtros_json = [{"memcmp": {"offset": f.offset, "bytes": f.bytes}} for f in filters]
+    cuentas: list = []
+    pagination_key = None
+
+    for _pagina in range(_GPA_V2_MAX_PAGES):
+        config = {"encoding": "base64", "limit": _GPA_V2_PAGE_LIMIT, "filters": filtros_json}
+        if pagination_key:
+            config["paginationKey"] = pagination_key
+        resp = await asyncio.to_thread(
+            requests.post, rpc_url,
+            json={"jsonrpc": "2.0", "id": 1, "method": "getProgramAccountsV2",
+                  "params": [str(program_id), config]},
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            raise RpcErrorResponse(f"el RPC devolvió {resp.status_code} en getProgramAccountsV2 "
+                                   f"({que}): {resp.text[:200]}")
+        body = resp.json()
+        if "error" in body:
+            raise RpcErrorResponse(f"el RPC rechazó getProgramAccountsV2 ({que}): "
+                                   f"{body['error'].get('message', body['error'])}")
+
+        # La V2 devuelve {"accounts": [...], "paginationKey": ..., "count": N};
+        # se acepta también una lista pelada por si otro proveedor la sirve así.
+        result = body.get("result") or {}
+        if isinstance(result, dict):
+            pagina = result.get("accounts") or []
+            pagination_key = result.get("paginationKey")
+        else:
+            pagina, pagination_key = result, None
+
+        for acc in pagina:
+            data = (acc.get("account") or {}).get("data")
+            # data = ["<base64>", "base64"]; si viniera en otro formato
+            # (jsonParsed) la saltamos en vez de reventar.
+            if not isinstance(data, list) or not data:
+                continue
+            try:
+                cuentas.append(_CuentaCruda(acc["pubkey"], base64.b64decode(data[0])))
+            except (KeyError, ValueError, TypeError):
+                continue
+
+        if not pagination_key:
+            return cuentas
+
+    # OJO: aquí se LANZA, no se devuelven las cuentas leídas hasta ahora.
+    # Un recorrido truncado no es una respuesta: el llamador interpreta
+    # "lista vacía" como `pool_confirmed_absent=True` -una confirmación
+    # de que el mint no tiene pool-, y con un barrido a medias eso sería
+    # mentira. Mejor un fallo explícito, que el llamador ya trata como
+    # "no se sabe" y reintenta, que una confirmación falsa.
+    raise RpcErrorResponse(f"getProgramAccountsV2 ({que}) no terminó de paginar en "
+                           f"{_GPA_V2_MAX_PAGES} páginas de {_GPA_V2_PAGE_LIMIT}; "
+                           f"no se puede dar la respuesta por completa")
 
 
 def _extract_instruction_error(err) -> Optional[tuple]:
@@ -669,7 +820,7 @@ class PumpCurveOnChainClient:
             pda = self._bonding_curve_address(mint)
             async with AsyncClient(self.rpc_url) as client:
                 resp = await client.get_account_info(pda, encoding="base64")
-                info = resp.value
+                info = _rpc_value(resp, f"la cuenta de bonding curve de {mint}")
                 if info is None:
                     logger.debug(f"[On-chain bonding curve] No existe cuenta de bonding curve para "
                                  f"{mint} ({pda}).")
@@ -799,7 +950,8 @@ class RaydiumCpmmOnChainClient:
                 cached = self._best_pool_by_mint.get(mint)
                 if cached is not None:
                     resp = await client.get_account_info(Pubkey.from_string(cached), encoding="base64")
-                    pool = self._parse_pool(resp.value.data if resp.value else None, mint)
+                    info = _rpc_value(resp, f"el pool {cached}")
+                    pool = self._parse_pool(info.data if info else None, mint)
                     if pool is not None:
                         best = await self._best_priced_pool(client, [(cached, pool)])
                         if best is not None:
@@ -830,13 +982,13 @@ class RaydiumCpmmOnChainClient:
         candidates = []
         program = Pubkey.from_string(self.PROGRAM_ID)
         for mint_0, mint_1 in ((mint, WSOL_MINT), (WSOL_MINT, mint)):
-            resp = await client.get_program_accounts(
-                program,
-                encoding="base64",
-                filters=[MemcmpOpts(offset=self._TOKEN_0_MINT_OFFSET, bytes=mint_0),
-                         MemcmpOpts(offset=self._TOKEN_1_MINT_OFFSET, bytes=mint_1)],
+            cuentas = await _get_program_accounts(
+                client, self.rpc_url, program,
+                [MemcmpOpts(offset=self._TOKEN_0_MINT_OFFSET, bytes=mint_0),
+                 MemcmpOpts(offset=self._TOKEN_1_MINT_OFFSET, bytes=mint_1)],
+                f"los pools de Raydium CPMM de {mint}",
             )
-            for acc in resp.value:
+            for acc in cuentas:
                 pool = self._parse_pool(getattr(getattr(acc, "account", None), "data", None), mint)
                 if pool is not None:
                     candidates.append((str(acc.pubkey), pool))
@@ -857,7 +1009,7 @@ class RaydiumCpmmOnChainClient:
         for i in range(0, len(vaults), self._MAX_ACCOUNTS_PER_CALL):
             resp = await client.get_multiple_accounts(vaults[i:i + self._MAX_ACCOUNTS_PER_CALL],
                                                       encoding="base64")
-            infos.extend(resp.value)
+            infos.extend(_rpc_value(resp, "los vaults de los pools") or [])
 
         best = None
         for idx, (address, pool) in enumerate(candidates):
@@ -998,7 +1150,8 @@ class MeteoraDlmmOnChainClient:
                 cached = self._best_pool_by_mint.get(mint)
                 if cached is not None:
                     resp = await client.get_account_info(Pubkey.from_string(cached), encoding="base64")
-                    pool = self._parse_pool(resp.value.data if resp.value else None, mint)
+                    info = _rpc_value(resp, f"el pool {cached}")
+                    pool = self._parse_pool(info.data if info else None, mint)
                     if pool is not None:
                         best = await self._best_priced_pool(client, mint, [(cached, pool)])
                         if best is not None:
@@ -1027,13 +1180,13 @@ class MeteoraDlmmOnChainClient:
         candidates = []
         program = Pubkey.from_string(self.PROGRAM_ID)
         for mint_x, mint_y in ((mint, WSOL_MINT), (WSOL_MINT, mint)):
-            resp = await client.get_program_accounts(
-                program,
-                encoding="base64",
-                filters=[MemcmpOpts(offset=self._TOKEN_X_MINT_OFFSET, bytes=mint_x),
-                         MemcmpOpts(offset=self._TOKEN_Y_MINT_OFFSET, bytes=mint_y)],
+            cuentas = await _get_program_accounts(
+                client, self.rpc_url, program,
+                [MemcmpOpts(offset=self._TOKEN_X_MINT_OFFSET, bytes=mint_x),
+                 MemcmpOpts(offset=self._TOKEN_Y_MINT_OFFSET, bytes=mint_y)],
+                f"los pools de Meteora DLMM de {mint}",
             )
-            for acc in resp.value:
+            for acc in cuentas:
                 pool = self._parse_pool(getattr(getattr(acc, "account", None), "data", None), mint)
                 if pool is not None:
                     candidates.append((str(acc.pubkey), pool))
@@ -1054,7 +1207,7 @@ class MeteoraDlmmOnChainClient:
         for i in range(0, len(accounts), self._MAX_ACCOUNTS_PER_CALL):
             resp = await client.get_multiple_accounts(accounts[i:i + self._MAX_ACCOUNTS_PER_CALL],
                                                       encoding="base64")
-            infos.extend(resp.value)
+            infos.extend(_rpc_value(resp, "las reservas de los pools") or [])
 
         mint_data = getattr(infos[0], "data", None)
         if mint_data is None or len(mint_data) <= self._MINT_DECIMALS_OFFSET:
@@ -1342,7 +1495,7 @@ class PumpSwapOnChainClient:
             [Pubkey.from_string(pool["base_vault"]), Pubkey.from_string(pool["quote_vault"])],
             commitment=Processed,
         )
-        infos = resp.value
+        infos = _rpc_value(resp, "los vaults del pool de PumpSwap")
         if not infos or len(infos) < 2 or infos[0] is None or infos[1] is None:
             return None
         balances = []
@@ -1388,12 +1541,11 @@ class PumpSwapOnChainClient:
         Ahora solo cuenta el pool cuyo `creator` es el pool-authority de
         pump.fun para este mint; si no hay ninguno, el mint se trata como
         "sin pool de PumpSwap"."""
-        resp = await client.get_program_accounts(
-            Pubkey.from_string(PUMPSWAP_PROGRAM_ID),
-            encoding="base64",
-            filters=[MemcmpOpts(offset=self._BASE_MINT_OFFSET, bytes=mint)],
+        accounts = await _get_program_accounts(
+            client, self.rpc_url, Pubkey.from_string(PUMPSWAP_PROGRAM_ID),
+            [MemcmpOpts(offset=self._BASE_MINT_OFFSET, bytes=mint)],
+            f"los pools de PumpSwap de {mint}",
         )
-        accounts = resp.value
         if not accounts:
             return None, None
 
