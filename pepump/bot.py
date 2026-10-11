@@ -428,6 +428,8 @@ class TrailingTakeProfitBot:
                              "supervisión.")
         return True
 
+    _SHUTDOWN_SELL_ATTEMPTS = 3
+
     async def _sell_on_shutdown(self) -> None:
         """Intenta conseguir el precio MÁS actual posible (una consulta
         on-chain fresca si veníamos usando ese fallback; si no, el último
@@ -443,17 +445,27 @@ class TrailingTakeProfitBot:
             if self.position is None or self.position.closed:
                 logger.info("No hay posición abierta; no hay nada que vender.")
                 return
-            price = await self._resolve_shutdown_price()
-            if price is None or price <= 0:
-                logger.error("No se pudo determinar ningún precio para vender al cerrar. La posición "
-                             f"queda ABIERTA — revísala manualmente: https://pump.fun/{self.mint}")
-                return
-            try:
-                await self.executor.sell(self.position, price, "cierre manual (Ctrl+C/SIGTERM)",
-                                          pool_override=self._current_pool_override())
-            except Exception as e:
-                logger.error(f"Falló la venta de cierre manual: {e}. La posición SIGUE ABIERTA — "
-                             f"revísala manualmente: https://pump.fun/{self.mint}")
+            # Se reintenta: al cerrar no hay "próximo precio" que dispare
+            # otro intento como en _try_sell, y un solo timeout de la
+            # Lightning API dejaba la posición abierta y el bot ya fuera.
+            for attempt in range(1, self._SHUTDOWN_SELL_ATTEMPTS + 1):
+                price = await self._resolve_shutdown_price()
+                if price is None or price <= 0:
+                    logger.error("No se pudo determinar ningún precio para vender al cerrar. La posición "
+                                 f"queda ABIERTA — revísala manualmente: https://pump.fun/{self.mint}")
+                    return
+                try:
+                    await self.executor.sell(self.position, price, "cierre manual (Ctrl+C/SIGTERM)",
+                                              pool_override=self._current_pool_override())
+                    return
+                except Exception as e:
+                    if attempt < self._SHUTDOWN_SELL_ATTEMPTS:
+                        logger.warning(f"Falló la venta de cierre manual (intento {attempt}/"
+                                       f"{self._SHUTDOWN_SELL_ATTEMPTS}): {e}. Reintentando...")
+                        continue
+                    logger.error(f"Falló la venta de cierre manual tras {attempt} intentos: {e}. "
+                                 f"La posición SIGUE ABIERTA — revísala manualmente: "
+                                 f"https://pump.fun/{self.mint}")
 
     async def _resolve_shutdown_price(self) -> Optional[float]:
         if self._onchain_source is not None:

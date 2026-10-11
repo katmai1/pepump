@@ -10,7 +10,7 @@ from typing import AsyncIterator, Optional
 
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.commitment import Confirmed, Processed
-from solana.rpc.types import MemcmpOpts
+from solana.rpc.types import MemcmpOpts, TokenAccountOpts
 from solders.pubkey import Pubkey  # type: ignore
 from solders.signature import Signature  # type: ignore
 
@@ -460,7 +460,7 @@ async def _fetch_actual_fill(signature: str, rpc_url: str, mint: str,
             if token_delta is None:
                 return None
 
-            return {"sol_delta": sol_delta, "token_delta": token_delta}
+            return {"sol_delta": sol_delta, "token_delta": token_delta, "wallet": wallet}
         except Exception as e:
             if attempt < max_attempts:
                 await asyncio.sleep(retry_delay_seconds)
@@ -469,6 +469,15 @@ async def _fetch_actual_fill(signature: str, rpc_url: str, mint: str,
                             f"(se va a usar el estimado como respaldo, tras {max_attempts} intentos): {e}")
             return None
     return None  # inalcanzable (el loop siempre retorna o sigue), queda por claridad
+
+
+class TradeOutcomeUnknown(RuntimeError):
+    """La orden pudo haber salido o no: el POST a la Lightning API se
+    cortó (timeout/conexión) después de mandarse, o la tx no confirmó a
+    tiempo. A diferencia de un rechazo explícito, aquí NO se puede
+    asumir que no pasó nada -PumpPortal puede haber firmado y enviado
+    la tx igual-, así que el llamador debe mirar la wallet on-chain
+    antes de decidir (ver TradeExecutor.sell)."""
 
 
 class PumpPortalClient:
@@ -490,6 +499,11 @@ class PumpPortalClient:
 
     def __init__(self, api_key: str = ""):
         self.api_key = api_key
+        # Dirección de la wallet asociada a la api_key. La Lightning API
+        # no la expone, así que se aprende del fee payer de la primera tx
+        # confirmada cuyo fill se pudo leer (normalmente la compra). Hace
+        # falta para get_wallet_token_balance.
+        self.wallet_address: Optional[str] = None
 
     # ---- Feed de precios (SOLO PumpPortal, subscribeTokenTrade) ---------- #
 
@@ -649,13 +663,24 @@ class PumpPortalClient:
         # requests.post es bloqueante; lo mandamos a un thread aparte para
         # no congelar el loop de asyncio (que sigue necesitando procesar
         # el feed de precios y demás mientras se manda la orden).
-        resp = await asyncio.to_thread(
-            requests.post,
-            f"{self.LIGHTNING_TRADE_URL}?api-key={self.api_key}",
-            headers={"Content-Type": "application/json"},
-            data=json.dumps(payload),
-            timeout=15,
-        )
+        try:
+            resp = await asyncio.to_thread(
+                requests.post,
+                f"{self.LIGHTNING_TRADE_URL}?api-key={self.api_key}",
+                headers={"Content-Type": "application/json"},
+                data=json.dumps(payload),
+                timeout=15,
+            )
+        except requests.exceptions.ConnectTimeout as e:
+            # Ni siquiera se conectó: el pedido nunca llegó a PumpPortal.
+            raise RuntimeError(f"No se pudo conectar con la Lightning API: {e}") from e
+        except requests.exceptions.RequestException as e:
+            # Timeout de lectura / conexión cortada con el pedido ya
+            # enviado: PumpPortal puede haber mandado la tx igual.
+            raise TradeOutcomeUnknown(
+                f"La Lightning API no respondió a la orden de {action} ({e}); "
+                f"no se sabe si la tx se envió"
+            ) from e
         if resp.status_code != 200:
             raise RuntimeError(f"Lightning API devolvió {resp.status_code}: {resp.text}")
 
@@ -680,12 +705,35 @@ class PumpPortalClient:
         # estimado como respaldo.
         fill = await _fetch_actual_fill(signature, solana_rpc_url, mint)
         if fill is not None:
+            self.wallet_address = fill["wallet"]
             data["actual_sol_delta"] = fill["sol_delta"]
             data["actual_token_delta"] = fill["token_delta"]
         else:
             logger.warning(f"[REAL] No se pudieron leer los datos reales de fill de la tx "
                             f"{signature}; se van a usar los valores estimados para esta operación.")
         return data
+
+    async def get_wallet_token_balance(self, mint: str, rpc_url: str) -> Optional[float]:
+        """Tokens de `mint` que tiene ahora mismo la wallet (suma de todas
+        sus token accounts de ese mint; 0.0 si no tiene ninguna). None si
+        todavía no se conoce la wallet o si falla la consulta."""
+        if not self.wallet_address:
+            return None
+        try:
+            async with AsyncClient(rpc_url) as client:
+                resp = await client.get_token_accounts_by_owner_json_parsed(
+                    Pubkey.from_string(self.wallet_address),
+                    TokenAccountOpts(mint=Pubkey.from_string(mint)),
+                    commitment=Confirmed,
+                )
+            total = 0.0
+            for acc in resp.value:
+                ui_amount = acc.account.data.parsed["info"]["tokenAmount"].get("uiAmount")
+                total += float(ui_amount) if ui_amount is not None else 0.0
+            return total
+        except Exception as e:
+            logger.debug(f"No se pudo consultar el saldo de {mint} en la wallet: {e}")
+            return None
 
     @staticmethod
     async def _confirm_transaction_onchain(signature: str, rpc_url: str,
@@ -713,7 +761,7 @@ class PumpPortalClient:
                         return  # processed/confirmed/finalized: ya sabemos que NO falló
 
                 if time.monotonic() >= deadline:
-                    raise RuntimeError(
+                    raise TradeOutcomeUnknown(
                         f"La transacción {signature} no confirmó en {timeout_seconds:.1f}s "
                         f"(puede seguir pendiente) — revisa https://solscan.io/tx/{signature}"
                     )

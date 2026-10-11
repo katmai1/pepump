@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import logging
 import time
@@ -5,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from pepump.history import append_closed_trade
+from pepump.pump import TradeOutcomeUnknown
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +175,24 @@ class TradeExecutor:
                          token_amount=token_amount, market_entry_price=price,
                          entry_is_real_fill=real_fill)
 
+    async def _tokens_gone_from_wallet(self, mint: str) -> bool:
+        """True si la wallet ya no tiene tokens de `mint`. Va mirando
+        durante tx_confirm_timeout_seconds porque una tx enviada justo
+        antes del timeout puede tardar unos segundos más en entrar. False
+        si quedan tokens al final o si no se puede consultar el saldo
+        (wallet todavía desconocida, RPC caído...): ante la duda, la
+        posición se sigue considerando abierta."""
+        deadline = time.monotonic() + self.cfg.tx_confirm_timeout_seconds
+        while True:
+            balance = await self.client.get_wallet_token_balance(mint, self.cfg.solana_rpc_url)
+            if balance is None:
+                return False
+            if balance <= 0:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(self.cfg.tx_confirm_poll_interval_seconds)
+
     async def sell(self, position: Position, price: float, reason: str,
                     pool_override: Optional[str] = None) -> None:
         # Valores ESTIMADOS a partir del precio de referencia -se usan
@@ -194,6 +214,25 @@ class TradeExecutor:
                     tx_confirm_poll_interval_seconds=self.cfg.tx_confirm_poll_interval_seconds,
                 )
                 logger.info(f"[REAL] Venta CONFIRMADA on-chain. Respuesta: {result}")
+            except TradeOutcomeUnknown as e:
+                # La orden pudo haber salido igual (timeout de la Lightning
+                # API o tx sin confirmar a tiempo). Antes esto se trataba
+                # como venta fallida aunque la tx hubiese entrado: el bot
+                # dejaba la posición "abierta" sin tokens reales detrás (y
+                # al reintentar, el "100%" fallaba por no quedar nada).
+                # Se mira la wallet: si ya no tiene tokens, la venta salió.
+                if not await self._tokens_gone_from_wallet(position.mint):
+                    logger.error(
+                        f"[REAL] Error al vender {position.mint}: {e}. Los tokens siguen en la "
+                        "wallet (o no se pudo comprobar): la posición SIGUE ABIERTA."
+                    )
+                    raise
+                logger.warning(
+                    f"[REAL] La Lightning API no confirmó la venta de {position.mint} ({e}), pero "
+                    "la wallet ya no tiene tokens de ese mint: la venta SÍ se ejecutó. Se registra "
+                    "con el PnL ESTIMADO (no hay firma de la que leer los datos reales)."
+                )
+                result = {}
             except Exception:
                 # BUGFIX: antes esta excepción se logueaba y se seguía de
                 # largo igual: la posición se marcaba `closed = True` y se

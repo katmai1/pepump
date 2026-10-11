@@ -169,3 +169,41 @@ async def test_failed_live_sell_does_not_append_to_history(tmp_path):
         await executor.sell(pos, price=1.3, reason="trailing-stop")
 
     assert not os.path.exists(history_path)
+
+
+class FakeClientWithBalance(FakeLightningClient):
+    def __init__(self, balances, **kwargs):
+        super().__init__(**kwargs)
+        self.balances = list(balances)
+
+    async def get_wallet_token_balance(self, mint, rpc_url):
+        return self.balances.pop(0) if len(self.balances) > 1 else self.balances[0]
+
+
+class FastConfirmConfig(DummyConfig):
+    tx_confirm_timeout_seconds = 0.05
+    tx_confirm_poll_interval_seconds = 0.01
+
+
+async def test_sell_live_unknown_outcome_but_tokens_gone_marks_closed():
+    from pepump.pump import TradeOutcomeUnknown
+    client = FakeClientWithBalance([10.0, 0.0], exc=TradeOutcomeUnknown("read timeout"))
+    executor = TradeExecutor(client=client, live=True, config=FastConfirmConfig())
+    pos = Position(mint="M", entry_price=1.0, sol_amount=0.05, token_amount=0.05)
+
+    await executor.sell(pos, price=1.2, reason="test")
+
+    assert pos.closed is True
+
+
+@pytest.mark.parametrize("balance", [10.0, None])
+async def test_sell_live_unknown_outcome_with_tokens_or_unknown_balance_stays_open(balance):
+    from pepump.pump import TradeOutcomeUnknown
+    client = FakeClientWithBalance([balance], exc=TradeOutcomeUnknown("read timeout"))
+    executor = TradeExecutor(client=client, live=True, config=FastConfirmConfig())
+    pos = Position(mint="M", entry_price=1.0, sol_amount=0.05, token_amount=0.05)
+
+    with pytest.raises(TradeOutcomeUnknown):
+        await executor.sell(pos, price=1.2, reason="test")
+
+    assert pos.closed is False
