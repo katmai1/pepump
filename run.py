@@ -65,7 +65,7 @@ import sys
 import time
 
 from pepump.config import load_config, validate_mint
-from pepump.pump import PumpPortalClient
+from pepump.pump import PumpPortalClient, TokenMetadataOnChainClient
 from pepump.executor import TradeExecutor
 from pepump.bot import TrailingTakeProfitBot
 from pepump.logging_config import setup_logging
@@ -126,7 +126,8 @@ if __name__ == "__main__":
     
     client = PumpPortalClient(api_key=config.api_key)
     executor = TradeExecutor(client=client, live=config.live, config=config)
-    bot = TrailingTakeProfitBot(client=client, executor=executor, config=config, panel=panel)
+    bot = TrailingTakeProfitBot(client=client, executor=executor, config=config, panel=panel,
+                                metadata_client=TokenMetadataOnChainClient(config.solana_rpc_url))
 
     try:
         asyncio.run(bot.run())

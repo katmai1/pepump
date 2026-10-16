@@ -51,7 +51,7 @@ class TrailingTakeProfitBot:
     lógica de trailing take-profit / stop-loss inicial.
     """
 
-    def __init__(self, client, executor, config, panel=None):
+    def __init__(self, client, executor, config, panel=None, metadata_client=None):
         self.client = client
         self.executor = executor
         self.mint = config.mint
@@ -124,6 +124,12 @@ class TrailingTakeProfitBot:
         # la salida no es una terminal (archivo, pipe, tests): entonces el
         # estado se loguea como una línea más, igual que siempre.
         self.panel = panel
+        # Nombre/símbolo del token, solo para mostrarlos (ver
+        # _load_token_name). None si no se pasó cliente (tests) o si
+        # todavía no llegaron / no se encontraron.
+        self._metadata_client = metadata_client
+        self.token_name: Optional[str] = None
+        self.token_symbol: Optional[str] = None
         self._update_panel_fixed()
 
     # Señales que disparan el cierre ordenado. SIGBREAK (Ctrl+Pausa) solo
@@ -260,6 +266,10 @@ class TrailingTakeProfitBot:
         se engancha cada señal en Unix y en Windows.
         """
         logger.info(f"Siguiendo el token: {self.mint}")
+        # En segundo plano: el nombre es solo informativo y no tiene por
+        # qué retrasar la conexión al feed ni la compra.
+        name_task = (asyncio.create_task(self._load_token_name())
+                     if self._metadata_client is not None else None)
         logger.debug(f"Suscribiéndose (subscribe_trade) al feed de trades de PumpPortal para {self.mint}...")
 
         loop = asyncio.get_running_loop()
@@ -352,6 +362,8 @@ class TrailingTakeProfitBot:
                 else:
                     logger.info("No hay posición abierta; no hay nada que vender.")
         finally:
+            if name_task is not None:
+                name_task.cancel()
             for quitar in quitar_manejadores:
                 quitar()
             if self._pending_next_event_task is not None:
@@ -1283,6 +1295,19 @@ class TrailingTakeProfitBot:
                      f"volumen, sigo esperando el feed en vivo.")
         return False
 
+    async def _load_token_name(self) -> None:
+        found = await self._metadata_client.fetch_name_symbol(self.mint)
+        if not found:
+            return
+        self.token_name, self.token_symbol = found
+        logger.info(f"Token: {self._token_label()}")
+        self._update_panel_fixed()
+
+    def _token_label(self) -> str:
+        if self.token_symbol and self.token_name and self.token_symbol != self.token_name:
+            return f"{self.token_name} (${self.token_symbol})"
+        return self.token_name or f"${self.token_symbol}"
+
     def _update_panel_fixed(self) -> None:
         """Bloque fijo del panel: todo lo que no cambia mientras corre el
         bot (y, una vez comprado, los niveles calculados desde la entrada)."""
@@ -1291,8 +1316,9 @@ class TrailingTakeProfitBot:
         cfg = self.cfg
         modo = "REAL" if cfg.live else "SIMULADO"
         priority_fee = f"{cfg.priority_fee:.9f}".rstrip("0").rstrip(".")
+        token = f" | {self._token_label()}" if (self.token_name or self.token_symbol) else ""
         lines = [
-            f" PePump | Modo {modo} | Mint {self.mint}",
+            f" PePump | Modo {modo}{token} | Mint {self.mint}",
             f" Compra {cfg.buy_sol} SOL | slippage {cfg.slippage}% | priority fee {priority_fee} SOL "
             f"| pool {cfg.pool}" + (f" | baja de entrada -{cfg.entry_dip_pct}%" if cfg.entry_dip_pct > 0 else ""),
         ]
