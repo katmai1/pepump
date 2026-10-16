@@ -126,14 +126,25 @@ class PanelAwareHandler(logging.StreamHandler):
             self.panel.draw()
 
 
-def create_panel(stream) -> Optional[StatusPanel]:
-    """StatusPanel si `stream` es una terminal que entiende ANSI, si no None."""
+def panel_unavailable_reason(stream) -> Optional[str]:
+    """None si `stream` es una terminal que entiende ANSI; si no, el
+    motivo, para avisarlo en el log en vez de desactivar el panel en
+    silencio."""
     try:
         is_tty = stream.isatty()
     except (AttributeError, ValueError):
-        return None
-    if not is_tty or os.environ.get("TERM") == "dumb":
-        return None
+        is_tty = False
+    if not is_tty:
+        return "la salida no es una terminal (¿redirigida a un archivo o a un pipe?)"
+    if os.environ.get("TERM") == "dumb":
+        return "TERM=dumb"
     if not _enable_windows_vt(stream):
+        return "la consola de Windows no admite códigos ANSI (modo VT)"
+    return None
+
+
+def create_panel(stream) -> Optional[StatusPanel]:
+    """StatusPanel si `stream` es una terminal que entiende ANSI, si no None."""
+    if panel_unavailable_reason(stream) is not None:
         return None
     return StatusPanel(stream)

@@ -2,7 +2,7 @@ import logging
 import sys
 from typing import Optional
 
-from pepump.dashboard import PanelAwareHandler, StatusPanel, create_panel
+from pepump.dashboard import PanelAwareHandler, StatusPanel, create_panel, panel_unavailable_reason
 
 
 def setup_logging(level: int = logging.INFO, panel: bool = True) -> Optional[StatusPanel]:
@@ -42,6 +42,7 @@ def setup_logging(level: int = logging.INFO, panel: bool = True) -> Optional[Sta
         pass
 
     status_panel = create_panel(sys.stdout) if panel else None
+    no_panel_reason = panel_unavailable_reason(sys.stdout) if panel and status_panel is None else None
     if status_panel is not None:
         handler = PanelAwareHandler(sys.stdout, status_panel)
     else:
@@ -52,6 +53,10 @@ def setup_logging(level: int = logging.INFO, panel: bool = True) -> Optional[Sta
     )
     handler.setFormatter(formatter)
     root.addHandler(handler)
+
+    if no_panel_reason:
+        logging.getLogger(__name__).info(f"Panel fijo desactivado: {no_panel_reason}. "
+                                         f"El estado se loguea como una línea más.")
 
     # websockets, httpx y httpcore son muy verbosos en INFO/DEBUG (loguean
     # cada frame/request). Los bajamos a WARNING para no ensuciar la
