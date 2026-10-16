@@ -1327,13 +1327,14 @@ class TrailingTakeProfitBot:
             lines.append(f" Activación +{cfg.activation_pct}% | trailing {cfg.trailing_pct}% "
                          f"| stop-loss inicial -{cfg.initial_stop_pct}%")
         else:
-            entry = pos.market_entry_price
             coste = f" | coste real {pos.entry_price:.10f}" if pos.entry_is_real_fill else ""
-            lines.append(f" Entrada {entry:.10f} SOL/token{coste}")
+            lines.append(f" Entrada {pos.market_entry_price:.10f} SOL/token{coste}")
+            entry = pos.strategy_entry_price(cfg.strategy_price_basis)
+            base = "precio real" if cfg.strategy_price_basis == "real" else "precio de mercado"
             lines.append(f" Activación +{cfg.activation_pct}% (>= {entry * (1 + cfg.activation_pct / 100.0):.10f}) "
                          f"| trailing {cfg.trailing_pct}% "
                          f"| stop-loss inicial -{cfg.initial_stop_pct}% "
-                         f"(<= {entry * (1 - cfg.initial_stop_pct / 100.0):.10f})")
+                         f"(<= {entry * (1 - cfg.initial_stop_pct / 100.0):.10f}) | sobre {base}")
         self.panel.set_fixed(lines)
 
     def _show_status(self, line: str) -> None:
@@ -1427,29 +1428,32 @@ class TrailingTakeProfitBot:
         pos = self.position
         if pos is None or pos.closed:
             return
-        # Movimiento de MERCADO desde la compra: es lo que miden los
-        # umbrales de aquí abajo y lo que muestra pump.fun. El neto (con
-        # los costes de entrada) lo imprime el status printer aparte.
-        pnl = pos.market_pnl_pct(price)
+        basis = self.cfg.strategy_price_basis
+        # % contra el mismo precio de entrada que usan los umbrales de
+        # aquí abajo: neto con "real", de mercado con "market".
+        pnl = pos.strategy_pnl_pct(price, basis)
+        entry = pos.strategy_entry_price(basis)
 
         # --- Caso 1: todavía no se armó el trailing-stop ------------------ #
         #
-        # OJO: los umbrales se comparan contra `market_entry_price` (el
-        # precio de MERCADO al comprar), no contra `entry_price`. Con
-        # datos reales de fill, entry_price es el precio EFECTIVO pagado
-        # e incluye comisiones + priority fee + el rent de la ATA (sobre
-        # una compra de 0.05 SOL eso puede ser un 4-5%): usarlo aquí
-        # subiría de tapadillo el listón de activación y aflojaría el
-        # stop-loss en esa misma proporción, cambiando la estrategia sin
-        # que nadie lo haya pedido. El PnL sí usa entry_price -ver
-        # Position.pnl_pct-, que es donde el coste real corresponde.
+        # Por defecto (strategy_price_basis = "real") los umbrales se
+        # comparan contra `entry_price`: con datos reales de fill es el
+        # precio EFECTIVO pagado e incluye comisiones + priority fee + el
+        # rent de la ATA (sobre una compra de 0.05 SOL eso puede ser un
+        # 4-5%). Así la activación pide ganancia REAL y el stop-loss corta
+        # por pérdida REAL, y el listón efectivo sobre el precio de mercado
+        # queda más alto (activación) y más cerca (stop-loss).
+        #
+        # Con "market" se comparan contra `market_entry_price` (el precio
+        # de MERCADO al comprar), como antes: los % coinciden con los de
+        # pump.fun y las comisiones no mueven los umbrales.
         if not pos.armed:
-            if price >= pos.market_entry_price * (1 + self.cfg.activation_pct / 100.0):
+            if price >= entry * (1 + self.cfg.activation_pct / 100.0):
                 pos.armed = True
                 pos.highest_price = price
                 logger.info(f"✅ Trailing-stop ARMADO. Precio actual {price:.10f} "
                             f"(PnL {pnl:+.2f}%). Máximo inicial registrado.")
-            elif price <= pos.market_entry_price * (1 - self.cfg.initial_stop_pct / 100.0):
+            elif price <= entry * (1 - self.cfg.initial_stop_pct / 100.0):
                 await self._try_sell(pos, price, "stop-loss inicial (nunca se activó el trailing)")
             return
 

@@ -59,6 +59,17 @@ initial_stop_pct = 25.0
 #                bot queda esperando indefinidamente (cancela con Ctrl+C).
 entry_dip_pct = 0.0
 
+# Contra qué precio de entrada se miden activation_pct e initial_stop_pct:
+# "real"   = el precio que pagaste DE VERDAD (incluye comisiones de pump.fun
+#            y PumpPortal, priority fee y rent de la cuenta de token), leído
+#            de la transacción de compra. +10% significa +10% de ganancia
+#            real. Con ~4% de costes de entrada, el mercado tiene que subir
+#            ~14% para armar el trailing, y el stop-loss salta antes.
+# "market" = el precio de mercado al comprar (el % que muestra pump.fun),
+#            sin contar costes. Es como funcionaba antes.
+# En modo simulado los dos son iguales (no hay comisiones reales).
+strategy_price_basis = "real"
+
 [pumpportal]
 # API key de PumpPortal. Se genera en pumpportal.fun y está asociada a una
 # wallet ya fondeada. ¡OBLIGATORIA siempre, aunque live = false! El bot usa

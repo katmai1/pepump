@@ -194,10 +194,49 @@ async def test_position_sin_precio_de_mercado_usa_el_de_entrada():
 
 
 # --------------------------------------------------------------------------- #
-# Los umbrales de la estrategia se miden contra el precio de MERCADO
+# Umbrales de la estrategia: precio REAL (default) o de MERCADO (opción)
 # --------------------------------------------------------------------------- #
 
-async def test_umbrales_se_miden_contra_el_precio_de_mercado_no_el_efectivo():
+async def test_por_defecto_la_activacion_se_mide_contra_el_precio_real():
+    """Default (strategy_price_basis = "real"): con un fill que salió un
+    5% por encima del mercado, +10% de mercado NO arma el trailing (solo
+    es +4,8% real); hace falta +15,5% de mercado (+10% real)."""
+    from pepump.bot import TrailingTakeProfitBot
+    from tests.conftest import make_config, FakeTradeStreamClient, SpyExecutor
+
+    cfg = make_config(activation_pct=10.0, initial_stop_pct=25.0)
+    assert cfg.strategy_price_basis == "real"
+    bot = TrailingTakeProfitBot(client=FakeTradeStreamClient(), executor=SpyExecutor(), config=cfg)
+    bot.position = Position(mint=cfg.mint, entry_price=1.05, sol_amount=0.0525,
+                            token_amount=0.05, market_entry_price=1.0,
+                            entry_is_real_fill=True)
+
+    await bot._on_price_update(1.10)
+    assert bot.position.armed is False
+
+    await bot._on_price_update(1.16)   # 1.16 / 1.05 = +10,5% real
+    assert bot.position.armed is True
+
+
+async def test_por_defecto_el_stop_loss_inicial_se_mide_contra_el_precio_real():
+    from pepump.bot import TrailingTakeProfitBot
+    from tests.conftest import make_config, FakeTradeStreamClient, SpyExecutor
+
+    cfg = make_config(activation_pct=10.0, initial_stop_pct=25.0)
+    spy = SpyExecutor()
+    bot = TrailingTakeProfitBot(client=FakeTradeStreamClient(), executor=spy, config=cfg)
+    bot.position = Position(mint=cfg.mint, entry_price=1.05, sol_amount=0.0525,
+                            token_amount=0.05, market_entry_price=1.0,
+                            entry_is_real_fill=True)
+
+    await bot._on_price_update(0.80)   # -20% de mercado, pero -23,8% real: todavía no
+    assert spy.sell_calls == 0
+
+    await bot._on_price_update(0.78)   # -25,7% real: ahora sí (con "market" sería solo -22%)
+    assert spy.sell_calls == 1
+
+
+async def test_opcion_market_umbrales_contra_el_precio_de_mercado():
     """Con un fill real caro (el precio efectivo queda un 5% por encima
     del de mercado), la activación del trailing tiene que dispararse al
     +10% sobre el precio de MERCADO. Si se midiera contra el efectivo
@@ -206,7 +245,7 @@ async def test_umbrales_se_miden_contra_el_precio_de_mercado_no_el_efectivo():
     from pepump.bot import TrailingTakeProfitBot
     from tests.conftest import make_config, FakeTradeStreamClient, SpyExecutor
 
-    cfg = make_config(activation_pct=10.0, initial_stop_pct=25.0)
+    cfg = make_config(activation_pct=10.0, initial_stop_pct=25.0, strategy_price_basis="market")
     bot = TrailingTakeProfitBot(client=FakeTradeStreamClient(), executor=SpyExecutor(), config=cfg)
     bot.position = Position(mint=cfg.mint, entry_price=1.05, sol_amount=0.0525,
                             token_amount=0.05, market_entry_price=1.0,
@@ -217,11 +256,11 @@ async def test_umbrales_se_miden_contra_el_precio_de_mercado_no_el_efectivo():
     assert bot.position.armed is True
 
 
-async def test_stop_loss_inicial_tambien_se_mide_contra_el_precio_de_mercado():
+async def test_opcion_market_stop_loss_contra_el_precio_de_mercado():
     from pepump.bot import TrailingTakeProfitBot
     from tests.conftest import make_config, FakeTradeStreamClient, SpyExecutor
 
-    cfg = make_config(activation_pct=10.0, initial_stop_pct=25.0)
+    cfg = make_config(activation_pct=10.0, initial_stop_pct=25.0, strategy_price_basis="market")
     spy = SpyExecutor()
     bot = TrailingTakeProfitBot(client=FakeTradeStreamClient(), executor=spy, config=cfg)
     bot.position = Position(mint=cfg.mint, entry_price=1.05, sol_amount=0.0525,

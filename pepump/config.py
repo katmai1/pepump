@@ -41,6 +41,16 @@ class AppConfig:
     # tanto, el bot se queda esperando indefinidamente -cancela con
     # Ctrl+C/SIGTERM si hace falta, no hay timeout para esto.
     entry_dip_pct: float = 0.0
+    # Contra qué precio de entrada se miden activation_pct e
+    # initial_stop_pct (ver ESTRATEGIA_BASES):
+    #   "real"   -> el precio EFECTIVO pagado (con comisiones, priority
+    #               fee y rent de la cuenta de token), leído de la tx de
+    #               compra confirmada. Es lo que de verdad ganas o pierdes.
+    #   "market" -> el precio de MERCADO al comprar (el que muestra
+    #               pump.fun), sin costes. Era el comportamiento anterior.
+    # Sin datos reales de fill (modo simulado, o si no se pudo leer la tx)
+    # los dos precios son el mismo y da igual.
+    strategy_price_basis: str = "real"
 
     # --- [pumpportal] ----------------------------------------------------- #
     api_key: str = ""  # también se puede definir con la variable de entorno PUMPPORTAL_API_KEY
@@ -100,6 +110,8 @@ class AppConfig:
 
 # Valores que la Lightning API de PumpPortal acepta en el campo `pool`.
 POOLS_VALIDOS = ("pump", "raydium", "pump-amm", "launchlab", "raydium-cpmm", "bonk", "auto")
+# Valores válidos de strategy.strategy_price_basis.
+ESTRATEGIA_BASES = ("real", "market")
 
 
 def validate_mint(mint: str) -> str:
@@ -167,6 +179,9 @@ def _validate(config: AppConfig) -> None:
     porcentaje_abierto("strategy.trailing_pct", config.trailing_pct)
     porcentaje_abierto("strategy.initial_stop_pct", config.initial_stop_pct)
     porcentaje_abierto("strategy.entry_dip_pct", config.entry_dip_pct, minimo_incluido=True)
+    if config.strategy_price_basis not in ESTRATEGIA_BASES:
+        errores.append(f"strategy.strategy_price_basis tiene que ser uno de {list(ESTRATEGIA_BASES)} "
+                       f"(está en {config.strategy_price_basis!r})")
 
     positivo("general.status_interval_seconds", config.status_interval_seconds)
     positivo("onchain.live_feed_timeout_seconds", config.live_feed_timeout_seconds)

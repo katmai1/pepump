@@ -71,6 +71,18 @@ class Position:
         de la estrategia)."""
         return (price / self.market_entry_price - 1.0) * 100.0
 
+    def strategy_entry_price(self, basis: str) -> float:
+        """Precio de entrada contra el que se miden los umbrales de la
+        estrategia (activación del trailing y stop-loss inicial), según
+        `strategy.strategy_price_basis`: "real" -> entry_price (lo que se
+        pagó de verdad), "market" -> market_entry_price."""
+        return self.market_entry_price if basis == "market" else self.entry_price
+
+    def strategy_pnl_pct(self, price: float, basis: str) -> float:
+        """El % que corresponde a strategy_entry_price: neto con "real",
+        de mercado con "market"."""
+        return self.market_pnl_pct(price) if basis == "market" else self.pnl_pct(price)
+
     def entry_cost_pct(self) -> float:
         """Cuánto por encima del precio de mercado te salió entrar, en %.
         0 si no hay datos reales de fill (ahí ambos precios son el
