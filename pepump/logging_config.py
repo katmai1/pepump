@@ -1,12 +1,19 @@
 import logging
 import sys
+from typing import Optional
+
+from pepump.dashboard import PanelAwareHandler, StatusPanel, create_panel
 
 
-def setup_logging(level: int = logging.INFO) -> None:
+def setup_logging(level: int = logging.INFO, panel: bool = True) -> Optional[StatusPanel]:
     """
     Configura el logging de toda la app (llamar UNA sola vez, al arrancar
     run.py). El resto de los módulos solo hace `logging.getLogger(__name__)`
     y no toca handlers ni formatters.
+
+    Devuelve el StatusPanel (panel fijo al pie, ver dashboard.py) si
+    `panel` es True y stdout es una terminal; si no, None y la salida es
+    la de siempre, línea a línea.
     """
     root = logging.getLogger()
     root.setLevel(level)
@@ -14,7 +21,7 @@ def setup_logging(level: int = logging.INFO) -> None:
     # Evita duplicar handlers si setup_logging() se llama más de una vez
     # (por ejemplo en tests).
     if root.handlers:
-        return
+        return None
 
     # Los logs llevan emoji (⚠️ del modo real, ⏱️ del estado, ✅/📈 del
     # trailing-stop). En Windows, cuando la salida NO es la consola
@@ -34,7 +41,11 @@ def setup_logging(level: int = logging.INFO) -> None:
         # Windows sobre consola también.
         pass
 
-    handler = logging.StreamHandler(sys.stdout)
+    status_panel = create_panel(sys.stdout) if panel else None
+    if status_panel is not None:
+        handler = PanelAwareHandler(sys.stdout, status_panel)
+    else:
+        handler = logging.StreamHandler(sys.stdout)
     formatter = logging.Formatter(
         fmt="[%(asctime)s][%(levelname)s]:\t %(message)s",
         datefmt="%H:%M:%S",
@@ -50,3 +61,5 @@ def setup_logging(level: int = logging.INFO) -> None:
         logging.getLogger("websockets").setLevel(logging.WARNING)
         logging.getLogger("httpx").setLevel(logging.WARNING)
         logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+    return status_panel

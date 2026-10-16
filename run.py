@@ -80,6 +80,8 @@ def parse_args():
     p.add_argument("-m", "--mint", type=str, required=True, help="Mint con el que se va a operar")
     p.add_argument("-c", "--config", default="config.toml", help="Ruta al archivo .toml de configuración (default: config.toml)")
     p.add_argument("-v", "--verbose", action="store_true", help="Logging en nivel DEBUG en vez de INFO")
+    p.add_argument("--no-panel", action="store_true",
+                   help="Sin panel fijo al pie: el estado se imprime como una línea de log más cada intervalo")
 
     return p.parse_args()
 
@@ -102,7 +104,7 @@ def show_header(live):
 # logica inicial
 if __name__ == "__main__":
     args = parse_args()
-    setup_logging(level=logging.DEBUG if args.verbose else logging.INFO)
+    panel = setup_logging(level=logging.DEBUG if args.verbose else logging.INFO, panel=not args.no_panel)
 
     
     try:
@@ -124,9 +126,12 @@ if __name__ == "__main__":
     
     client = PumpPortalClient(api_key=config.api_key)
     executor = TradeExecutor(client=client, live=config.live, config=config)
-    bot = TrailingTakeProfitBot(client=client, executor=executor, config=config)
+    bot = TrailingTakeProfitBot(client=client, executor=executor, config=config, panel=panel)
 
     try:
         asyncio.run(bot.run())
     except KeyboardInterrupt:
         logger.info("Interrumpido por el usuario.")
+    finally:
+        if panel is not None:
+            panel.close()

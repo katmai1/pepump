@@ -51,7 +51,7 @@ class TrailingTakeProfitBot:
     lógica de trailing take-profit / stop-loss inicial.
     """
 
-    def __init__(self, client, executor, config):
+    def __init__(self, client, executor, config, panel=None):
         self.client = client
         self.executor = executor
         self.mint = config.mint
@@ -120,6 +120,11 @@ class TrailingTakeProfitBot:
         # porque no queda nada que vender) y no dispara un segundo pedido
         # real.
         self._sell_lock = asyncio.Lock()
+        # Panel fijo al pie de la terminal (ver dashboard.py). None cuando
+        # la salida no es una terminal (archivo, pipe, tests): entonces el
+        # estado se loguea como una línea más, igual que siempre.
+        self.panel = panel
+        self._update_panel_fixed()
 
     # Señales que disparan el cierre ordenado. SIGBREAK (Ctrl+Pausa) solo
     # existe en Windows, así que se filtra con getattr: en Unix no está y
@@ -1050,7 +1055,7 @@ class TrailingTakeProfitBot:
         importante). Se cancela desde _wait_for_dip_entry apenas termina
         de esperar, sea porque compró, la cancelaron, o falló."""
         while True:
-            await asyncio.sleep(self.cfg.status_interval_seconds)
+            await asyncio.sleep(self._status_refresh_seconds())
             self._log_dip_wait_progress(target_price)
 
     def _log_dip_wait_progress(self, target_price: float) -> None:
@@ -1065,8 +1070,8 @@ class TrailingTakeProfitBot:
             # No debería pasar (ya se habría disparado la compra), pero
             # por las dudas no mostramos un "falta bajar" negativo.
             return
-        logger.info(f"⏳ Esperando la baja de entrada | precio actual {self.latest_price:.10f} "
-                    f"| objetivo {target_price:.10f} | falta bajar {falta_pct:.2f}% más")
+        self._show_status(f"⏳ Esperando la baja de entrada | precio actual {self.latest_price:.10f} "
+                          f"| objetivo {target_price:.10f} | falta bajar {falta_pct:.2f}% más")
 
     async def _poll_onchain_price_loop(self) -> None:
         """Reemplazo de _consume_trade_stream para cuando la posición se
@@ -1278,12 +1283,54 @@ class TrailingTakeProfitBot:
                      f"volumen, sigo esperando el feed en vivo.")
         return False
 
+    def _update_panel_fixed(self) -> None:
+        """Bloque fijo del panel: todo lo que no cambia mientras corre el
+        bot (y, una vez comprado, los niveles calculados desde la entrada)."""
+        if self.panel is None:
+            return
+        cfg = self.cfg
+        modo = "REAL" if cfg.live else "SIMULADO"
+        priority_fee = f"{cfg.priority_fee:.9f}".rstrip("0").rstrip(".")
+        lines = [
+            f" PePump | Modo {modo} | Mint {self.mint}",
+            f" Compra {cfg.buy_sol} SOL | slippage {cfg.slippage}% | priority fee {priority_fee} SOL "
+            f"| pool {cfg.pool}" + (f" | baja de entrada -{cfg.entry_dip_pct}%" if cfg.entry_dip_pct > 0 else ""),
+        ]
+        pos = self.position
+        if pos is None:
+            lines.append(f" Activación +{cfg.activation_pct}% | trailing {cfg.trailing_pct}% "
+                         f"| stop-loss inicial -{cfg.initial_stop_pct}%")
+        else:
+            entry = pos.market_entry_price
+            coste = f" | coste real {pos.entry_price:.10f}" if pos.entry_is_real_fill else ""
+            lines.append(f" Entrada {entry:.10f} SOL/token{coste}")
+            lines.append(f" Activación +{cfg.activation_pct}% (>= {entry * (1 + cfg.activation_pct / 100.0):.10f}) "
+                         f"| trailing {cfg.trailing_pct}% "
+                         f"| stop-loss inicial -{cfg.initial_stop_pct}% "
+                         f"(<= {entry * (1 - cfg.initial_stop_pct / 100.0):.10f})")
+        self.panel.set_fixed(lines)
+
+    def _show_status(self, line: str) -> None:
+        """Línea de estado periódica: con panel se reescribe en su sitio,
+        sin panel se loguea como siempre."""
+        if self.panel is not None:
+            self.panel.set_status(line)
+        else:
+            logger.info(line)
+
+    def _status_refresh_seconds(self) -> float:
+        # Con panel, reescribir no ensucia la pantalla, así que se refresca
+        # más seguido que el intervalo de log (que sigue valiendo sin panel).
+        if self.panel is not None:
+            return min(self.status_interval_seconds, 1.0)
+        return self.status_interval_seconds
+
     async def _status_printer_loop(self) -> None:
         """Imprime el %% de profit actual cada `status_interval_seconds`, sin
         depender de que lleguen nuevas operaciones del token en ese momento.
         Este es el ÚNICO lugar que imprime el estado de forma periódica."""
         while True:
-            await asyncio.sleep(self.status_interval_seconds)
+            await asyncio.sleep(self._status_refresh_seconds())
             if self.position is None or self.position.closed or self.latest_price is None:
                 continue
             pos = self.position
@@ -1301,8 +1348,8 @@ class TrailingTakeProfitBot:
                     if pos.entry_is_real_fill else "")
             if pos.armed:
                 stop_price = pos.highest_price * (1 - self.cfg.trailing_pct / 100.0)
-                logger.info(f"⏱️  [armado] precio {self.latest_price:.10f} | máximo {pos.highest_price:.10f} "
-                            f"| nivel de venta {stop_price:.10f} | mercado: {pnl:+.2f}%{neto}")
+                self._show_status(f"⏱️  [armado] precio {self.latest_price:.10f} | máximo {pos.highest_price:.10f} "
+                                  f"| nivel de venta {stop_price:.10f} | mercado: {pnl:+.2f}%{neto}")
             else:
                 # `entrada` es el precio de MERCADO contra el que se mide
                 # la activación; el precio EFECTIVO pagado (con
@@ -1310,9 +1357,9 @@ class TrailingTakeProfitBot:
                 # error ver el neto en negativo con el precio clavado en
                 # la entrada.
                 coste = (f" | coste real {pos.entry_price:.10f}" if pos.entry_is_real_fill else "")
-                logger.info(f"⏱️  [esperando activación +{self.cfg.activation_pct}%] "
-                            f"precio {self.latest_price:.10f} | entrada {pos.market_entry_price:.10f}"
-                            f"{coste} | mercado: {pnl:+.2f}%{neto}")
+                self._show_status(f"⏱️  [esperando activación +{self.cfg.activation_pct}%] "
+                                  f"precio {self.latest_price:.10f} | entrada {pos.market_entry_price:.10f}"
+                                  f"{coste} | mercado: {pnl:+.2f}%{neto}")
 
     def _current_pool_override(self) -> Optional[str]:
         """Si ya confirmamos -sea al entrar (_try_onchain_fallback) o a
@@ -1345,6 +1392,7 @@ class TrailingTakeProfitBot:
 
     async def _on_first_price(self, price: float) -> None:
         self.position = await self.executor.buy(self.mint, price, pool_override=self._current_pool_override())
+        self._update_panel_fixed()
         logger.info(f"Activación del trailing-stop: +{self.cfg.activation_pct}% "
                     f"| ancho del trailing una vez armado: {self.cfg.trailing_pct}% "
                     f"| stop-loss inicial (antes de armar): -{self.cfg.initial_stop_pct}%")
