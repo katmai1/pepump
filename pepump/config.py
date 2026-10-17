@@ -26,8 +26,16 @@ class AppConfig:
     # salir, lo que quede abierto se pierde de vista.
     state_db: str = "pepump.db"
 
+    # Máximo de posiciones activas a la vez (contando las retomadas). Abrir
+    # una más da error, venga de la web, de ctl.py o de -m.
+    max_open_positions: int = 10
+
     # --- [trade] ------------------------------------------------------- #
     buy_sol: float = 0.05
+    # Tope de SOL por posición: red de seguridad contra un error de dedo al
+    # abrir desde la web (10 en vez de 0.10). Ni el .toml ni la web pueden
+    # pedir una compra mayor. Solo se cambia editando el .toml.
+    max_buy_sol: float = 0.5
     slippage: float = 15.0
     priority_fee: float = 0.00001
     pool: str = "auto"  # ver POOLS_VALIDOS
@@ -180,6 +188,13 @@ def validate_config(config: AppConfig) -> None:
             errores.append(f"{nombre} tiene que estar en el rango {rango} (está en {valor})")
 
     positivo("trade.buy_sol", config.buy_sol)
+    positivo("trade.max_buy_sol", config.max_buy_sol)
+    if config.buy_sol and config.max_buy_sol and config.buy_sol > config.max_buy_sol:
+        errores.append(f"trade.buy_sol ({config.buy_sol} SOL) supera el máximo por posición "
+                       f"trade.max_buy_sol ({config.max_buy_sol} SOL)")
+    if not isinstance(config.max_open_positions, int) or config.max_open_positions < 1:
+        errores.append(f"general.max_open_positions tiene que ser un entero >= 1 "
+                       f"(está en {config.max_open_positions})")
     positivo("trade.slippage", config.slippage)
     positivo("trade.priority_fee", config.priority_fee, incluir_cero=True)
     if config.pool not in POOLS_VALIDOS:

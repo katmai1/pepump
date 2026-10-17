@@ -77,23 +77,41 @@ y lo mismo con el simulado.
 En Windows `Ctrl+C` y `Ctrl+Pausa` funcionan igual; `SIGTERM` no se
 entrega nunca.
 
-### Panel web
+### Panel web (el bot como servicio)
 
 ```bash
-python run.py -m <MINT1> -m <MINT2> --web          # http://127.0.0.1:8080
-python run.py -m <MINT> --web 9000                 # otro puerto
+python run.py --web                    # http://127.0.0.1:8080
+python run.py --web 9000               # otro puerto
+python run.py --web -m <MINT>          # y además abre esta posición al arrancar
 ```
 
-Muestra en vivo todas las posiciones (estado, precio, próximo nivel de
-activación o de venta, PnL), el detalle de cada una y los logs filtrables
-por token. Desde ahí se puede **cerrar** una posición (vende al precio
-actual, o cancela la entrada si todavía no compró) o cerrarlas todas,
-siempre con confirmación. Abrir posiciones desde la web llegará más
-adelante.
+Con `--web` el bot se queda en marcha aunque no haya posiciones (retoma las
+que quedaron abiertas) y todo se hace desde el navegador:
+
+- **Nueva posición:** eliges si es **simulada o real**, pegas el mint y
+  muestra qué token es (nombre, si sigue en la curva de pump.fun o ya
+  migró, precio actual) antes de comprar. El importe y los ajustes salen del
+  `.toml`; se pueden cambiar para esa posición en "Ajustes avanzados".
+  Siempre con confirmación (en rojo si es real).
+- **Cerrar** una posición (vende al precio actual, o cancela la entrada si
+  todavía no compró) o **cerrarlas todas**, también con confirmación.
+- En vivo: estado, precio, próximo nivel de activación o de venta, PnL,
+  detalle de cada posición, historial y logs filtrables por token.
+
+Solo se sale con `Ctrl+C` (sin vender, salvo `--sell-on-exit`).
+
+**Real o simulada, por posición:** `general.live` del `.toml` es solo el modo
+por defecto del formulario (y de `-m`). Cada posición lleva su modo, se
+marca con **REAL** en la tabla, y se retoma en ese modo al reiniciar. Las
+cifras de arriba nunca suman dinero real con simulado.
+
+**Límites de seguridad** (en el `.toml`, no se pueden cambiar desde la web):
+`max_buy_sol` (máximo por posición, 0.5 SOL por defecto) y
+`max_open_positions` (posiciones activas a la vez, 10 por defecto). Pasarse
+da error y no compra, venga la orden de la web, de `ctl.py` o de `-m`.
 
 Por defecto solo escucha en `127.0.0.1` (esta máquina). Para verlo desde
-la red local, `--web-host <IP de la máquina>` (o `0.0.0.0`). Cuando terminan
-todas las posiciones, el proceso sale y el panel se cierra con él.
+la red local, `--web-host <IP de la máquina>` (o `0.0.0.0`).
 
 **Contraseña (opcional):** `web_password` en la sección `[web]` del `.toml`,
 o la variable de entorno `PEPUMP_WEB_PASSWORD`. Sin ella, cualquiera que
@@ -108,6 +126,9 @@ Con el bot corriendo con `--web`:
 
 ```bash
 python ctl.py list                 # posiciones y su estado
+python ctl.py open <MINT>          # abrir con los ajustes del .toml
+python ctl.py open <MINT> --sol 0.1 --trailing 12   # ... o con otros
+python ctl.py open <MINT> --real   # con SOL real (o --sim); sin poner, general.live
 python ctl.py close 2              # cerrar la #2 (o: close <MINT>)
 python ctl.py close-all            # cerrar todas
 python ctl.py --url http://192.168.1.50:9000 list

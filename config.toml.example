@@ -26,6 +26,11 @@ trade_history_csv = "trade_history.csv"
 # entry_dip_pct > 0.
 status_interval_seconds = 5.0
 
+# Máximo de posiciones activas a la vez (contando las retomadas al
+# arrancar). Intentar abrir una más da error, venga de la web, de ctl.py o
+# de -m.
+max_open_positions = 10
+
 # Base de datos (SQLite) con el estado de las posiciones. Gracias a ella,
 # si el bot se para (Ctrl+C, un corte de luz, un cuelgue), al volver a
 # arrancarlo retoma las posiciones que quedaron abiertas, sin volver a
@@ -44,6 +49,12 @@ priority_fee = 0.00001
 
 # Pool/exchange: "pump", "raydium", "pump-amm", "launchlab", "raydium-cpmm", "bonk" o "auto".
 pool = "auto"
+
+# Tope de SOL por posición. Red de seguridad contra un error de dedo al
+# abrir desde la web (10 en vez de 0.10): ninguna compra puede superarlo, ni
+# desde la web, ni desde ctl.py, ni el buy_sol de este archivo. Solo se
+# cambia aquí, a propósito.
+max_buy_sol = 0.5
 
 [strategy]
 # Subida %% desde el precio de entrada necesaria para "armar" el trailing-stop.

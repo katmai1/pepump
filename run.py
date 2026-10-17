@@ -62,7 +62,6 @@ import argparse
 import asyncio
 import logging
 import sys
-import time
 
 from pepump.config import load_config, validate_mint
 from pepump.pump import PumpPortalClient, TokenMetadataOnChainClient
@@ -84,8 +83,8 @@ def parse_args():
     p.add_argument("-c", "--config", default="config.toml", help="Ruta al archivo .toml de configuración (default: config.toml)")
     p.add_argument("-v", "--verbose", action="store_true", help="Logging en nivel DEBUG en vez de INFO")
     p.add_argument("--web", nargs="?", type=int, const=8080, default=None, metavar="PUERTO",
-                   help="Arranca el panel web en http://127.0.0.1:PUERTO (default 8080). Desde la web "
-                        "se pueden ver y CERRAR posiciones")
+                   help="Arranca el panel web en http://127.0.0.1:PUERTO (default 8080) y deja el bot "
+                        "en marcha aunque no haya posiciones: se abren y cierran desde la web")
     p.add_argument("--web-host", default="127.0.0.1",
                    help="Interfaz donde escucha el panel web (default 127.0.0.1: solo esta máquina). "
                         "Con la IP de la red local (o 0.0.0.0) lo ve toda la red: conviene poner "
@@ -98,20 +97,24 @@ def parse_args():
 
     return p.parse_args()
 
-def show_header(live):
+def show_header(live, opening_now: bool):
     # Sin print(): todo sale por el mismo logger que el resto del bot, así
     # el banner queda en el archivo/redirección junto a las operaciones.
     # Las comillas del modo van en una variable aparte a propósito: un
     # f-string con comillas dobles anidadas solo compila en Python 3.12+
     # (PEP 701), y este proyecto arranca en 3.11 (tomllib).
+    # general.live es el modo POR DEFECTO de las posiciones nuevas: desde la
+    # web y ctl.py se elige en cada una. Las retomadas siguen en el suyo.
     modo = "REAL ⚠️" if live else "SIMULADO"
     logger.info("=" * 50)
-    logger.info(f"\t PePump | Modo {modo}")
+    logger.info(f"\t PePump | Modo por defecto: {modo}")
     logger.info("=" * 50)
-    if live:
-        logger.warning("⚠️  MODO REAL ACTIVADO (general.live = true en el .toml). Vas a operar con SOL real.")
-        logger.warning("    Presiona Ctrl+C ahora para detenerlo.")
-        time.sleep(3)
+    if live and opening_now:
+        logger.warning("⚠️  MODO REAL (general.live = true en el .toml): las posiciones de -m se abren con "
+                       "SOL real.")
+    elif live:
+        logger.warning("⚠️  general.live = true: las posiciones nuevas serán REALES por defecto (se puede "
+                       "elegir en cada una).")
 
 
 # logica inicial
@@ -157,7 +160,7 @@ if __name__ == "__main__":
         log_buffer = LogBuffer()
         logging.getLogger().addHandler(log_buffer)
 
-    show_header(config.live)
+    show_header(config.live, opening_now=bool(mints))
     # Después del banner, para que no quede enterrado arriba.
     if web_sock is not None and not is_loopback(args.web_host):
         if config.web_password:
@@ -203,7 +206,12 @@ if __name__ == "__main__":
             shown_host = "127.0.0.1" if args.web_host in ("0.0.0.0", "::") else args.web_host
             logger.info(f"Panel web: http://{shown_host}:{args.web}")
 
+        # Con --web el proceso es un servicio: sigue vivo sin posiciones
+        # (se abren desde la web) hasta que se pide salir.
+        salir = asyncio.Event()
+
         def on_signal(sig_name: str) -> None:
+            salir.set()
             if args.sell_on_exit:
                 manager.close_all(f"{sig_name} recibido")
             else:
@@ -215,9 +223,19 @@ if __name__ == "__main__":
                 if manager.get(mint) is not None and manager.get(mint).active:
                     logger.info(f"{mint} ya estaba abierta y se retomó: no se abre otra.")
                     continue
-                manager.open(mint)
+                try:
+                    manager.open(mint)
+                except ValueError as e:
+                    logger.error(f"No se abre {mint}: {e}")
+            if web is not None:
+                logger.info(f"Bot en marcha: abre y cierra posiciones desde el panel web. Ctrl+C "
+                            f"sale {'VENDIENDO todo' if args.sell_on_exit else 'sin vender'}.")
+                await salir.wait()
+                await manager.wait_all()
+                return
             if not manager.positions():
-                logger.info("No hay posiciones abiertas que retomar ni mints (-m) que abrir. Nada que hacer.")
+                logger.info("No hay posiciones abiertas que retomar ni mints (-m) que abrir. Nada que "
+                            "hacer. (Con --web el bot se queda en marcha y las abres desde la web.)")
                 return
             if retomadas and not mints:
                 logger.info(f"Retomadas {len(retomadas)} posiciones. Ctrl+C sale "

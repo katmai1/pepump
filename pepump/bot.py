@@ -142,6 +142,8 @@ class TrailingTakeProfitBot:
         # Precio objetivo de la baja de entrada (entry_dip_pct > 0), para
         # mostrarlo mientras se espera; None si no aplica o aún no se sabe.
         self._dip_target: Optional[float] = None
+        # Precio de referencia contra el que se calculó ese objetivo.
+        self._dip_reference: Optional[float] = None
         # BUGFIX (doble venta): serializa CUALQUIER intento de venta de la
         # posición (ya sea por trailing-stop/stop-loss vía _try_sell, o por
         # cierre manual vía _sell_on_shutdown). No alcanza con solo
@@ -693,6 +695,7 @@ class TrailingTakeProfitBot:
 
         target_price = reference_price * (1 - self.cfg.entry_dip_pct / 100.0)
         self._dip_target = target_price
+        self._dip_reference = reference_price
         logger.info(f"Precio de referencia: {reference_price:.10f} SOL/token. Esperando una baja "
                     f"de {self.cfg.entry_dip_pct}% -> entra si el precio toca {target_price:.10f} "
                     f"SOL/token o menos (sin timeout, cancela con Ctrl+C si hace falta)...")
@@ -1411,6 +1414,7 @@ class TrailingTakeProfitBot:
             # on-chain está dando el precio (ver _onchain_source).
             "price_source": self._onchain_source or "feed",
             "entry_target_price": self._dip_target,
+            "entry_reference_price": self._dip_reference,
             "settings": {
                 "buy_sol": cfg.buy_sol,
                 "slippage": cfg.slippage,

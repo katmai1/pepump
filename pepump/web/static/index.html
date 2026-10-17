@@ -4,6 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>PePump</title>
+  <!-- Sin esto el navegador pide /favicon.ico y deja un 404 en la consola. -->
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='%232a78d6'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -37,7 +39,7 @@
       <div class="tile">
         <div class="tile-label">Invertido en abiertas</div>
         <div class="tile-value" id="t-invested">—</div>
-        <div class="tile-sub">SOL</div>
+        <div class="tile-sub" id="t-invested-sub">SOL</div>
       </div>
       <div class="tile">
         <div class="tile-label">PnL abierto</div>
@@ -55,8 +57,9 @@
       <div class="card-head">
         <h2>Posiciones</h2>
         <button id="close-all" class="btn btn-danger-outline" type="button" disabled>Cerrar todas</button>
+        <button id="new-position" class="btn btn-primary" type="button">Nueva posición</button>
       </div>
-      <div id="empty" class="empty" hidden>No hay posiciones. Arráncalas con <code>python run.py -m &lt;MINT&gt; --web</code>.</div>
+      <div id="empty" class="empty" hidden>No hay posiciones. Abre una con <strong>Nueva posición</strong>.</div>
       <div class="table-wrap">
         <table id="positions" class="positions">
           <thead>
@@ -127,6 +130,65 @@
       <div id="logs" class="logs" role="log" aria-live="off"></div>
     </section>
   </main>
+
+  <dialog id="open-dialog" class="dialog dialog-wide" aria-labelledby="open-title">
+    <form id="open-form" novalidate>
+      <h2 id="open-title">Nueva posición</h2>
+      <fieldset class="mode-switch" id="f-mode">
+        <legend>Modo</legend>
+        <label><input type="radio" name="mode" value="sim"> Simulado</label>
+        <label class="real"><input type="radio" name="mode" value="real"> Real (SOL de verdad)</label>
+      </fieldset>
+      <div class="form-grid">
+        <label class="field field-full">
+          <span>Mint del token</span>
+          <input id="f-mint" name="mint" class="mono" autocomplete="off" spellcheck="false" required
+                 placeholder="Pega la dirección del token (…pump)">
+        </label>
+        <div id="f-preview" class="preview field-full" aria-live="polite" hidden></div>
+        <label class="field">
+          <span>SOL a invertir</span>
+          <input id="f-buy_sol" name="buy_sol" type="number" step="any" min="0" inputmode="decimal" required>
+          <small id="f-buy-hint" class="muted"></small>
+        </label>
+      </div>
+      <details class="advanced">
+        <summary>Ajustes avanzados</summary>
+        <div class="form-grid">
+          <label class="field"><span>Activación del trailing (+%)</span>
+            <input name="activation_pct" type="number" step="any" min="0" inputmode="decimal"></label>
+          <label class="field"><span>Trailing (% desde el máximo)</span>
+            <input name="trailing_pct" type="number" step="any" min="0" inputmode="decimal"></label>
+          <label class="field"><span>Stop-loss inicial (−%)</span>
+            <input name="initial_stop_pct" type="number" step="any" min="0" inputmode="decimal"></label>
+          <label class="field"><span>Baja de entrada (−%, 0 = comprar ya)</span>
+            <input name="entry_dip_pct" type="number" step="any" min="0" inputmode="decimal"></label>
+          <label class="field"><span>Slippage (%)</span>
+            <input name="slippage" type="number" step="any" min="0" inputmode="decimal"></label>
+          <label class="field"><span>Priority fee (SOL)</span>
+            <input name="priority_fee" type="number" step="any" min="0" inputmode="decimal"></label>
+          <label class="field"><span>Pool</span>
+            <select name="pool">
+              <option value="auto">auto</option><option value="pump">pump</option>
+              <option value="pump-amm">pump-amm</option><option value="raydium">raydium</option>
+              <option value="raydium-cpmm">raydium-cpmm</option><option value="launchlab">launchlab</option>
+              <option value="bonk">bonk</option>
+            </select></label>
+          <label class="field"><span>Umbrales contra</span>
+            <select name="strategy_price_basis">
+              <option value="real">coste real (con comisiones)</option>
+              <option value="market">precio de mercado</option>
+            </select></label>
+        </div>
+        <button id="f-reset" type="button" class="btn-ghost small">Volver a los valores del .toml</button>
+      </details>
+      <p id="open-error" class="form-error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <button type="button" class="btn" id="open-cancel">Cancelar</button>
+        <button type="submit" class="btn btn-primary" id="open-submit">Revisar y comprar…</button>
+      </div>
+    </form>
+  </dialog>
 
   <dialog id="confirm" class="dialog" aria-labelledby="confirm-title">
     <form method="dialog">

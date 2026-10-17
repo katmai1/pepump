@@ -202,11 +202,20 @@ async def test_real_con_tokens_se_retoma(store):
     await manager.aclose()
 
 
-async def test_no_mezcla_modos(store):
-    pos_id = _abierta(store, A, live=True)
-    manager, _, _ = make_manager(store)  # arranca en simulado
-    assert await manager.recover() == []
-    assert store.get(pos_id)["status"] == "open"  # queda pendiente para el modo real
+async def test_cada_posicion_se_retoma_en_su_modo(store):
+    """El modo es de cada posición: una REAL se retoma como real aunque
+    general.live diga simulado ahora (y al revés)."""
+    real = _abierta(store, A, live=True)
+    simulada = _abierta(store, B, live=False)
+    client = WalletClient(balances={A: 0.05}, wallet_address="W")
+    manager, _, _ = make_manager(store, client=client)  # general.live = False
+    retomadas = {m.id: m for m in await manager.recover()}
+    assert retomadas[real].config.live is True
+    assert retomadas[real].bot.snapshot()["live"] is True
+    assert retomadas[simulada].config.live is False
+    manager.stop_all("fin")
+    await asyncio.wait_for(manager.wait_all(), 5)
+    await manager.aclose()
 
 
 @pytest.mark.parametrize("live,balance,esperado", [

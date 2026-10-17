@@ -105,7 +105,7 @@ async def test_ajustes_por_posicion():
     assert managed.bot.snapshot()["settings"]["trailing_pct"] == 7.5
 
     with pytest.raises(ValueError, match="No se puede ajustar"):
-        manager.open(B, live=True)
+        manager.open(B, solana_rpc_url="http://otro-rpc")
     with pytest.raises(ValueError, match="trailing_pct"):
         manager.open(B, trailing_pct=150)
     with pytest.raises(ValueError, match="no es una dirección de mint"):
@@ -185,4 +185,85 @@ async def test_closable_y_close_all_sin_bloquear():
     manager.close_all("fin")
     await asyncio.wait_for(manager.wait_all(), 5)
     assert pb.task.done()
+    await manager.aclose()
+
+
+# --------------------------------------------------------------------------- #
+# Límites (paso 6: abrir desde la web)
+# --------------------------------------------------------------------------- #
+
+async def test_max_buy_sol_por_posicion():
+    manager, conns, _ = make_manager(max_buy_sol=0.5)
+    with pytest.raises(ValueError, match="max_buy_sol"):
+        manager.open(A, buy_sol=10)
+    assert manager.positions() == []
+    managed = manager.open(A, buy_sol=0.5)  # justo el máximo vale
+    manager.close_all("fin")
+    await asyncio.wait_for(manager.wait_all(), 5)
+    await manager.aclose()
+
+
+async def test_max_open_positions():
+    manager, conns, _ = make_manager(max_open_positions=1)
+    pa = manager.open(A)
+    with pytest.raises(ValueError, match="max_open_positions"):
+        manager.open(B)
+    manager.close(pa.id, "fin")
+    await asyncio.wait_for(pa.task, 5)
+    pb = manager.open(B)  # al cerrar la primera, hay hueco
+    manager.close_all("fin")
+    await asyncio.wait_for(manager.wait_all(), 5)
+    await manager.aclose()
+
+
+def test_defaults_para_el_formulario():
+    manager, _, _ = make_manager(buy_sol=0.07, max_buy_sol=0.3, max_open_positions=4)
+    d = manager.defaults()
+    assert d["settings"]["buy_sol"] == 0.07
+    assert d["max_buy_sol"] == 0.3 and d["max_open_positions"] == 4
+    assert d["active_positions"] == 0 and d["accepting_new"] is True
+
+
+async def test_preview(monkeypatch):
+    import pepump.manager as manager_module
+
+    class Curva:
+        def __init__(self, rpc): pass
+        async def fetch_price_or_status(self, mint):
+            return (None, True, True) if mint == B else (2e-7, False, True)
+
+    class Swap:
+        def __init__(self, rpc): pass
+        async def fetch_price_or_confirm_absent(self, mint):
+            return 3e-6, False
+
+    class Meta:
+        async def fetch_name_symbol(self, mint):
+            return ("Pepe Moon", "PEPEM")
+
+    monkeypatch.setattr(manager_module, "PumpCurveOnChainClient", Curva)
+    monkeypatch.setattr(manager_module, "PumpSwapOnChainClient", Swap)
+    manager, _, _ = make_manager()
+    manager.metadata_client = Meta()
+
+    p = await manager.preview(A)
+    assert (p["name"], p["symbol"], p["market"], p["price"]) == ("Pepe Moon", "PEPEM", "bondingcurve", 2e-7)
+    p = await manager.preview(B)  # curva completada -> PumpSwap
+    assert (p["market"], p["price"]) == ("pumpswap", 3e-6)
+    with pytest.raises(ValueError):
+        await manager.preview("no-es-un-mint")
+
+
+
+async def test_modo_por_posicion():
+    """Real o simulada se elige al abrir; el executor de cada posición
+    recibe su modo."""
+    manager, conns, executors = make_manager()  # general.live = False
+    real = manager.open(A, live=True)
+    simulada = manager.open(B)
+    assert real.config.live is True and simulada.config.live is False
+    assert real.bot.snapshot()["live"] is True
+    assert manager.defaults()["settings"]["live"] is False
+    manager.close_all("fin")
+    await asyncio.wait_for(manager.wait_all(), 5)
     await manager.aclose()

@@ -28,6 +28,7 @@ class FakeManaged:
     def __init__(self, snap):
         self.id = snap["id"]
         self.bot = FakeBot(snap)
+        self.config = type("Cfg", (), {"live": snap.get("live", False)})()
 
     @property
     def closable(self):
@@ -57,6 +58,25 @@ class FakeManager:
 
     def history(self, limit=100):
         return [{"id": 99, "mint": A, "status": "closed", "realized_pnl_pct": 12.5}][:limit]
+
+    def defaults(self):
+        return {"live": False, "settings": {"buy_sol": 0.05}, "max_buy_sol": 0.5,
+                "max_open_positions": 10, "active_positions": 1, "accepting_new": True}
+
+    async def preview(self, mint):
+        if mint == "malo":
+            raise ValueError("'malo' no es una dirección de mint válida")
+        self.previews = getattr(self, "previews", 0) + 1
+        return {"mint": mint, "name": "Pepe", "symbol": "PEPE", "market": "bondingcurve",
+                "price": 1e-7, "active_position": None}
+
+    def open(self, mint, **overrides):
+        if overrides.get("buy_sol", 0) > 0.5:
+            raise ValueError("trade.buy_sol (10.0 SOL) supera el máximo por posición")
+        self.opened = (mint, overrides)
+        snap = dict(SNAP, id=5, mint=mint)
+        self.snaps.append(snap)
+        return FakeManaged(snap)
 
     def close_all(self, reason="", block_new=True):
         self.close_all_calls.append((reason, block_new))
@@ -103,6 +123,17 @@ def test_la_pagina_y_los_estaticos():
     r = client.get("/")
     assert r.status_code == 200 and "<title>PePump</title>" in r.text
     assert client.get("/static/app.js").status_code == 200
+
+
+def test_los_estaticos_llevan_version_y_no_se_cachean_a_ciegas():
+    """Un app.js viejo en la caché del navegador con el HTML nuevo dejaba
+    botones sin hacer nada."""
+    import re
+    client, _ = make_client()
+    html = client.get("/").text
+    assert re.search(r'/static/app\.js\?v=\d+-\d+"', html)
+    assert re.search(r'/static/style\.css\?v=\d+-\d+"', html)
+    assert client.get("/static/app.js").headers["cache-control"] == "no-cache"
 
 
 def test_las_rutas_de_lectura_no_aceptan_ordenes():
@@ -294,3 +325,69 @@ async def test_logbuffer_descarta_si_un_cliente_no_lee():
     assert q.qsize() <= 3
     assert len(logs.entries()) == 10
     logs.unsubscribe(q)
+
+
+# --------------------------------------------------------------------------- #
+# Abrir posiciones (paso 6)
+# --------------------------------------------------------------------------- #
+
+def test_defaults():
+    client, _ = make_client()
+    assert client.get("/api/defaults").json()["max_buy_sol"] == 0.5
+
+
+def test_abrir_una_posicion():
+    client, _ = make_client()
+    r = client.post("/api/positions", headers=PAGE,
+                    json={"mint": A, "settings": {"buy_sol": 0.1, "trailing_pct": 12, "pool": "auto"}})
+    assert r.status_code == 200 and r.json()["id"] == 5
+    mint, overrides = client.manager.opened
+    assert mint == A
+    assert overrides == {"buy_sol": 0.1, "trailing_pct": 12.0, "pool": "auto"}
+
+
+def test_abrir_eligiendo_real_o_simulada():
+    client, _ = make_client()
+    r = client.post("/api/positions", headers=PAGE, json={"mint": A, "settings": {"live": True}})
+    assert r.status_code == 200
+    assert client.manager.opened[1] == {"live": True}
+    # Tiene que ser un booleano de verdad: ni "true" ni 1.
+    for malo in ("true", 1):
+        r = client.post("/api/positions", headers=PAGE, json={"mint": A, "settings": {"live": malo}})
+        assert r.status_code == 400
+
+
+def test_abrir_valida_lo_que_llega():
+    client, _ = make_client()
+    malos = [
+        {"settings": {}},                                       # sin mint
+        {"mint": A, "settings": {"api_key": "x"}},              # no ajustable por posición
+        {"mint": A, "settings": {"buy_sol": "mucho"}},          # no es un número
+        {"mint": A, "settings": {"buy_sol": True}},             # bool no cuenta como número
+        {"mint": A, "settings": {"pool": 3}},                   # pool tiene que ser texto
+    ]
+    for body in malos:
+        assert client.post("/api/positions", headers=PAGE, json=body).status_code == 400, body
+    # El límite lo aplica el gestor y el error llega legible.
+    r = client.post("/api/positions", headers=PAGE, json={"mint": A, "settings": {"buy_sol": 10}})
+    assert r.status_code == 400 and "máximo" in r.json()["detail"]
+    assert not hasattr(client.manager, "opened")
+
+
+def test_una_web_ajena_no_puede_abrir():
+    client, _ = make_client()
+    assert client.post("/api/positions", json={"mint": A}).status_code == 403
+    ajena = {"x-pepump": "1", "origin": "https://evil.example"}
+    assert client.post("/api/positions", headers=ajena, json={"mint": A}).status_code == 403
+    assert not hasattr(client.manager, "opened")
+
+
+def test_preview_con_cache_y_errores():
+    client, _ = make_client()
+    r = client.get("/api/preview", params={"mint": A}, headers=PAGE)
+    assert r.status_code == 200 and r.json()["symbol"] == "PEPE"
+    client.get("/api/preview", params={"mint": A}, headers=PAGE)
+    assert client.manager.previews == 1  # la segunda sale de la caché
+    assert client.get("/api/preview", params={"mint": "malo"}, headers=PAGE).status_code == 400
+    # Sin la cabecera del panel no se gasta RPC.
+    assert client.get("/api/preview", params={"mint": A}).status_code == 403

@@ -29,14 +29,16 @@ from pepump.config import AppConfig, validate_config, validate_mint
 from pepump.executor import Position, TradeExecutor
 from pepump.feed import SharedTradeFeed
 from pepump.log_context import enable_tags
+from pepump.pump import PumpCurveOnChainClient, PumpSwapOnChainClient
 from pepump.store import PositionStore
 
 logger = logging.getLogger(__name__)
 
-# Lo que se puede ajustar por posición al abrirla. El resto (RPC, api_key,
-# modo real/simulado, timeouts) es del proceso y sale siempre del .toml.
+# Lo que se puede ajustar por posición al abrirla, incluido si es REAL o
+# simulada (`live`; por defecto, general.live del .toml). El resto (RPC,
+# api_key, timeouts, límites) es del proceso y sale siempre del .toml.
 OVERRIDABLE_FIELDS = (
-    "buy_sol", "slippage", "priority_fee", "pool",
+    "live", "buy_sol", "slippage", "priority_fee", "pool",
     "entry_dip_pct", "activation_pct", "trailing_pct", "initial_stop_pct",
     "strategy_price_basis",
 )
@@ -99,10 +101,16 @@ class PositionManager:
         compra ocurre en segundo plano, cuando el bot consiga precio).
 
         Lanza ValueError si el mint no es válido, si ya hay una posición
-        activa de ese mint, si un ajuste no se puede cambiar por posición o
-        deja la config inválida, o si se está cerrando todo."""
+        activa de ese mint, si se llegó a max_open_positions, si un ajuste
+        no se puede cambiar por posición o deja la config inválida (p. ej.
+        buy_sol por encima de max_buy_sol), o si se está cerrando todo."""
         if self._closing_all:
             raise ValueError("Se están cerrando todas las posiciones; no se abren nuevas.")
+        activas = self.active_count()
+        if activas >= self.base_config.max_open_positions:
+            raise ValueError(f"Ya hay {activas} posiciones activas, el máximo "
+                             f"(general.max_open_positions = {self.base_config.max_open_positions}). "
+                             f"Cierra alguna o sube el límite en el .toml.")
         mint = validate_mint(mint)
         ocupada = self._active_for_mint(mint)
         if ocupada is not None:
@@ -247,10 +255,9 @@ class PositionManager:
         las retomadas. Sin store, no hace nada."""
         if self.store is None:
             return []
-        live = self.base_config.live
         rpc = self.base_config.solana_rpc_url
         wallet = self.store.get_meta("wallet_address")
-        if live and wallet and self.client is not None and not getattr(self.client, "wallet_address", None):
+        if wallet and self.client is not None and not getattr(self.client, "wallet_address", None):
             self.client.wallet_address = wallet
 
         for row in self.store.with_status("waiting_entry"):
@@ -260,11 +267,9 @@ class PositionManager:
         retomadas = []
         for row in self.store.with_status("buying", "open"):
             pos_id, mint = row["id"], row["mint"]
-            if row["live"] != live:
-                modo = "REAL" if row["live"] else "SIMULADO"
-                logger.warning(f"Posición #{pos_id} ({mint}) quedó abierta en modo {modo}: no se retoma "
-                               f"en este modo. Arranca en modo {modo} para retomarla.")
-                continue
+            # Cada posición se retoma en SU modo (real o simulada), sea cual
+            # sea general.live ahora.
+            live = row["live"]
             if self._active_for_mint(mint) is not None:
                 logger.error(f"Posición #{pos_id} ({mint}): ya hay otra activa de ese mint; no se retoma.")
                 continue
@@ -292,6 +297,7 @@ class PositionManager:
                                f"que haya de ese token.")
 
             settings = {k: v for k, v in row["settings"].items() if k in OVERRIDABLE_FIELDS}
+            settings["live"] = live
             cfg = dataclasses.replace(self.base_config, mint=mint, **settings)
             position = Position(mint=mint, entry_price=row["entry_price"], sol_amount=row["sol_amount"],
                                 token_amount=row["token_amount"], market_entry_price=row["market_entry_price"],
@@ -347,6 +353,61 @@ class PositionManager:
 
     def positions(self) -> List[ManagedPosition]:
         return list(self._positions.values())
+
+    def active_count(self) -> int:
+        return sum(1 for m in self._positions.values() if m.active)
+
+    def defaults(self) -> dict:
+        """Lo que necesita el formulario de "nueva posición": los ajustes
+        por defecto (del .toml) y los límites."""
+        cfg = self.base_config
+        return {
+            "live": cfg.live,
+            "settings": {k: getattr(cfg, k) for k in OVERRIDABLE_FIELDS},
+            "max_buy_sol": cfg.max_buy_sol,
+            "max_open_positions": cfg.max_open_positions,
+            "active_positions": self.active_count(),
+            "accepting_new": not self._closing_all,
+        }
+
+    async def preview(self, mint: str) -> dict:
+        """Qué es este mint, ANTES de comprar: nombre/símbolo, dónde cotiza
+        y a qué precio. Solo consultas baratas (getAccountInfo /
+        getMultipleAccounts). Lanza ValueError si el mint no es válido."""
+        mint = validate_mint(mint)
+        rpc = self.base_config.solana_rpc_url
+        out = {"mint": mint, "name": None, "symbol": None, "market": None, "price": None,
+               "active_position": None}
+        ocupada = self._active_for_mint(mint)
+        if ocupada is not None:
+            out["active_position"] = ocupada.id
+
+        async def nombre():
+            if self.metadata_client is None:
+                return None
+            try:
+                return await self.metadata_client.fetch_name_symbol(mint)
+            except Exception:
+                return None
+
+        async def mercado():
+            price, complete, exists = await PumpCurveOnChainClient(rpc).fetch_price_or_status(mint)
+            if exists and not complete and price:
+                return "bondingcurve", price
+            price, absent = await PumpSwapOnChainClient(rpc).fetch_price_or_confirm_absent(mint)
+            if price:
+                return "pumpswap", price
+            if exists is False and absent:
+                # Ni curva de pump.fun ni pool de PumpSwap: el bot todavía
+                # puede intentar Raydium CPMM / Meteora DLMM al entrar.
+                return "other", None
+            return "unknown", None
+
+        found, (market, price) = await asyncio.gather(nombre(), mercado())
+        if found:
+            out["name"], out["symbol"] = found
+        out["market"], out["price"] = market, price
+        return out
 
     def snapshot(self) -> List[dict]:
         return [{"id": m.id, **m.bot.snapshot()} for m in self._positions.values()]

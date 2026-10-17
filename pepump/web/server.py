@@ -10,6 +10,9 @@ intermedia.
   POST /api/logout
   GET  /api/state                     modo + todas las posiciones
   GET  /api/positions/{id}            una posición
+  GET  /api/defaults                  ajustes por defecto y límites (formulario)
+  GET  /api/preview?mint=...          qué es un mint antes de comprar
+  POST /api/positions                 abrir (comprar) una posición
   POST /api/positions/{id}/close      cerrar (vender) una posición
   POST /api/positions/close-all       cerrar todas
   GET  /api/logs                      últimos logs (?mint=...&after=<seq>&limit=...)
@@ -49,11 +52,11 @@ from urllib.parse import urlsplit
 
 import uvicorn
 from fastapi import Body, Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from pepump.manager import PositionManager
+from pepump.manager import OVERRIDABLE_FIELDS, PositionManager
 from pepump.web.logbuffer import LogBuffer
 
 logger = logging.getLogger(__name__)
@@ -68,6 +71,9 @@ CSRF_HEADER = "x-pepump"
 # Cierre del WebSocket por falta de sesión: el navegador vuelve a la
 # pantalla de contraseña en vez de reintentar.
 WS_CLOSE_UNAUTHORIZED = 4401
+# La vista previa de un mint se recuerda unos segundos: el formulario la
+# pide mientras escribes/pegas y cada una son consultas al RPC.
+PREVIEW_CACHE_SECONDS = 10.0
 # Cada cuánto mira cada WebSocket si el servidor se está apagando.
 _SHUTDOWN_CHECK_SECONDS = 0.2
 
@@ -176,7 +182,24 @@ def create_app(manager: PositionManager, logs: LogBuffer, *, live: bool,
 
     @app.get("/")
     async def index():
-        return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-store"})
+        # BUGFIX (botones que "no hacían nada" tras actualizar el bot): el
+        # HTML se servía siempre fresco, pero app.js/style.css no, y el
+        # navegador podía seguir usando una versión vieja de su caché que no
+        # casaba con el HTML nuevo. Ahora cada referencia lleva la versión
+        # del archivo (?v=...), así que al cambiar se piden de nuevo seguro.
+        html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+        for asset in ("app.js", "style.css"):
+            html = html.replace(f"/static/{asset}\"", f"/static/{asset}?v={_asset_version(asset)}\"")
+        return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+
+    @app.middleware("http")
+    async def no_cache_static(request: Request, call_next):
+        response = await call_next(request)
+        if request.url.path.startswith("/static/"):
+            # Que el navegador pregunte siempre si cambió (con ETag, sin
+            # volver a bajarlo si no): nunca un JS viejo.
+            response.headers["Cache-Control"] = "no-cache"
+        return response
 
     # --- sesión ----------------------------------------------------------- #
     @app.get("/api/session")
@@ -226,7 +249,62 @@ def create_app(manager: PositionManager, logs: LogBuffer, *, live: bool,
     async def get_history(limit: int = 100):
         return manager.history(limit=max(1, min(limit, 500)))
 
+    @app.get("/api/defaults", dependencies=lectura)
+    async def get_defaults():
+        return manager.defaults()
+
+    preview_cache: dict = {}  # mint -> (instante, resultado)
+
+    # Con la cabecera del panel aunque sea un GET: cada vista previa gasta
+    # consultas del RPC, y así una web ajena no puede ponerse a lanzarlas.
+    @app.get("/api/preview", dependencies=orden)
+    async def get_preview(mint: str):
+        mint = mint.strip()
+        cached = preview_cache.get(mint)
+        if cached is not None and time.monotonic() - cached[0] < PREVIEW_CACHE_SECONDS:
+            result = cached[1]
+        else:
+            try:
+                result = await manager.preview(mint)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            preview_cache[mint] = (time.monotonic(), result)
+            if len(preview_cache) > 200:
+                preview_cache.clear()
+        # La posición activa sí se mira siempre al momento.
+        managed = manager.get(result["mint"])
+        return {**result, "active_position": managed.id if managed is not None and managed.active else None}
+
     # --- órdenes ---------------------------------------------------------- #
+    @app.post("/api/positions", dependencies=orden)
+    async def open_position(request: Request, body: dict = Body(...)):
+        mint = body.get("mint")
+        settings = body.get("settings") or {}
+        if not isinstance(mint, str) or not isinstance(settings, dict):
+            raise HTTPException(status_code=400, detail="Falta el mint")
+        overrides = {}
+        for key, value in settings.items():
+            if key not in OVERRIDABLE_FIELDS:
+                raise HTTPException(status_code=400, detail=f"Ajuste desconocido: {key}")
+            if key == "live":
+                if not isinstance(value, bool):
+                    raise HTTPException(status_code=400, detail="live tiene que ser true o false")
+            elif key in ("pool", "strategy_price_basis"):
+                if not isinstance(value, str):
+                    raise HTTPException(status_code=400, detail=f"{key} tiene que ser texto")
+            elif isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise HTTPException(status_code=400, detail=f"{key} tiene que ser un número")
+            else:
+                value = float(value)
+            overrides[key] = value
+        try:
+            managed = manager.open(mint, **overrides)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        modo = "REAL" if managed.config.live else "simulada"
+        logger.info(f"Posición #{managed.id} ({modo}) abierta desde la web ({client_ip(request)}).")
+        return {"id": managed.id, **managed.bot.snapshot()}
+
     @app.post("/api/positions/close-all", dependencies=orden)
     async def close_all(request: Request):
         # block_new=False: el servicio sigue vivo y más adelante se podrán
@@ -296,6 +374,11 @@ def create_app(manager: PositionManager, logs: LogBuffer, *, live: bool,
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     return app
+
+
+def _asset_version(name: str) -> str:
+    stat = (STATIC_DIR / name).stat()
+    return f"{int(stat.st_mtime)}-{stat.st_size}"
 
 
 def _origin_ok(origin: Optional[str], host_header: str, allowed: list) -> bool:

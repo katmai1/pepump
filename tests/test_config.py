@@ -5,7 +5,7 @@ import tomllib
 
 import pytest
 
-from pepump.config import AppConfig, load_config, validate_mint
+from pepump.config import AppConfig, load_config, validate_config, validate_mint
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 CONFIG_SECTIONS = ("general", "trade", "strategy", "pumpportal", "onchain", "web")
@@ -314,3 +314,24 @@ api_key = "abc"
     with caplog.at_level(logging.WARNING):
         load_config(path)
     assert any("-m/--mint" in r.getMessage() for r in caplog.records)
+
+
+# --------------------------------------------------------------------------- #
+# Límites de seguridad (max_buy_sol / max_open_positions)
+# --------------------------------------------------------------------------- #
+
+def test_buy_sol_no_puede_superar_max_buy_sol():
+    with pytest.raises(ValueError, match="max_buy_sol"):
+        validate_config(AppConfig(buy_sol=1.0, max_buy_sol=0.5))
+    validate_config(AppConfig(buy_sol=0.5, max_buy_sol=0.5))  # igual vale
+
+
+@pytest.mark.parametrize("valor", [0, -1, 2.5])
+def test_max_open_positions_tiene_que_ser_entero_positivo(valor):
+    with pytest.raises(ValueError, match="max_open_positions"):
+        validate_config(AppConfig(max_open_positions=valor))
+
+
+def test_limites_por_defecto():
+    cfg = AppConfig()
+    assert cfg.max_buy_sol == 0.5 and cfg.max_open_positions == 10

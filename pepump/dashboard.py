@@ -187,7 +187,8 @@ def position_label(snap: dict) -> str:
 
 def position_row(snap: dict) -> str:
     """Una línea por posición para el panel con varias posiciones."""
-    partes = [f" #{snap['id']} {position_label(snap)}" + (" (retomada)" if snap.get("recovered") else "")]
+    partes = [f" #{snap['id']} {'[REAL] ' if snap.get('live') else ''}{position_label(snap)}"
+              + (" (retomada)" if snap.get("recovered") else "")]
     fase = _FASES.get(snap["phase"], snap["phase"])
     pos = snap.get("position")
     if pos is not None and snap["phase"] == "open":
@@ -271,9 +272,10 @@ class MultiPositionPanel:
             child = self._children[snaps[0]["id"]]
             self.panel.set_all(child.fixed, child.status)
             return
-        modo = "REAL" if self._live else "SIMULADO"
         activas = sum(1 for s in snaps if s["running"])
-        cabecera = [f" PePump | Modo {modo} | {len(snaps)} posiciones ({activas} activas) "
+        reales = sum(1 for s in snaps if s["running"] and s["live"])
+        modo = f"⚠️  {reales} REALES" if reales else "simulado"
+        cabecera = [f" PePump | {modo} | {len(snaps)} posiciones ({activas} activas) "
                     f"| {self.ctrl_c_hint}"]
         self.panel.set_all(cabecera + [position_row(s) for s in snaps], "")
 

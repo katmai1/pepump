@@ -1,6 +1,6 @@
 // Panel web de PePump. Recibe por WebSocket el estado de todas las
 // posiciones cada segundo y los logs en el momento en que salen; las
-// órdenes (cerrar una posición, cerrar todas) van por POST a /api.
+// órdenes (abrir una posición, cerrar una, cerrar todas) van por POST a /api.
 //
 // OJO: el nombre y el símbolo del token vienen de la metadata on-chain, que
 // escribe quien creó el token: todo texto se pone con textContent (nunca
@@ -8,6 +8,16 @@
 "use strict";
 
 const MAX_LOGS = 3000;
+
+// Cualquier fallo de la página se muestra en pantalla: un botón que "no hace
+// nada" sin explicación es lo peor que puede pasar en una app que compra.
+window.addEventListener("error", (e) => reportError(e.error || e.message));
+window.addEventListener("unhandledrejection", (e) => reportError(e.reason));
+function reportError(err) {
+  const msg = err && err.message ? err.message : String(err);
+  console.error(err);
+  try { toast(`Error en la página: ${msg}. Recarga (Ctrl+F5) y, si sigue, avisa.`, "error"); } catch { /* aún sin DOM */ }
+}
 
 const state = {
   live: null,
@@ -97,7 +107,13 @@ function statusOf(snap) {
   switch (snap.phase) {
     case "starting": return { icon: "◌", label: "Arrancando", tone: "accent" };
     case "connecting": return { icon: "◌", label: "Conectando", tone: "accent" };
-    case "waiting_entry": return { icon: "⏳", label: "Esperando entrada", tone: "accent" };
+    case "waiting_entry": {
+      // Con baja de entrada: cuánto le falta bajar al precio para comprar.
+      const missing = dipMissingPct(snap);
+      if (missing !== null) return { icon: "⏳", label: `Esperando baja · falta ${missing.toFixed(2)} %`, tone: "accent" };
+      if (snap.entry_target_price) return { icon: "⏳", label: "Esperando baja", tone: "accent" };
+      return { icon: "⏳", label: "Esperando primer precio", tone: "accent" };
+    }
     case "buying": return { icon: "◐", label: "Comprando", tone: "accent" };
     case "open":
       return pos && pos.armed
@@ -108,6 +124,13 @@ function statusOf(snap) {
     case "stopped": return { icon: "■", label: "Terminada sin posición", tone: "" };
     default: return { icon: "·", label: snap.phase, tone: "" };
   }
+}
+
+// Cuánto (%) tiene que bajar todavía el precio para tocar el objetivo de la
+// baja de entrada. null si no hay baja o todavía no hay precio.
+function dipMissingPct(snap) {
+  if (snap.position || !snap.entry_target_price || !snap.latest_price) return null;
+  return Math.max(0, (1 - snap.entry_target_price / snap.latest_price) * 100);
 }
 
 // Valor de la posición si se vendiera ahora al precio actual, menos lo que
@@ -154,39 +177,65 @@ function el(tag, attrs = {}, ...children) {
   return node;
 }
 
+// Cada posición es REAL o simulada (se elige al abrirla). La etiqueta de
+// arriba avisa si hay alguna real activa.
 function renderMode() {
   const badge = document.getElementById("mode");
   if (state.live === null) return;
+  const reales = state.positions.filter((p) => p.live && p.running).length;
   badge.hidden = false;
-  badge.textContent = state.live ? "⚠ MODO REAL" : "Simulado";
-  badge.classList.toggle("live", state.live);
-  document.title = state.live ? "PePump · REAL" : "PePump · simulado";
+  badge.textContent = reales ? `⚠ ${reales} ${reales === 1 ? "posición REAL" : "posiciones REALES"}` : "Simulado";
+  badge.title = `Modo por defecto de las posiciones nuevas: ${state.live ? "REAL" : "simulado"} (general.live)`;
+  badge.classList.toggle("live", reales > 0);
+  document.title = reales ? `PePump · ${reales} REAL` : "PePump";
 }
 
-function renderTiles() {
-  const ps = state.positions;
-  const running = ps.filter((p) => p.running).length;
+function money(ps) {
   const open = ps.filter((p) => p.position && !p.position.closed);
   const closed = ps.filter((p) => p.position && p.position.closed);
-
-  document.getElementById("t-active").textContent = String(running);
-  document.getElementById("t-active-sub").textContent = `de ${ps.length} en esta sesión`;
-
-  const invested = open.reduce((acc, p) => acc + p.position.sol_amount, 0);
-  document.getElementById("t-invested").textContent = open.length ? fmtSol(invested) : "—";
-
   const pnls = open.map(openPnlSol).filter((x) => x !== null);
-  const openPnl = pnls.reduce((a, b) => a + b, 0);
-  const tOpen = document.getElementById("t-open-pnl");
-  tOpen.textContent = pnls.length ? fmtSolSigned(openPnl) : "—";
-  tOpen.className = `tile-value ${pnls.length ? toneClass(openPnl) : ""}`;
+  return {
+    open: open.length,
+    closed: closed.length,
+    invested: open.length ? open.reduce((a, p) => a + p.position.sol_amount, 0) : null,
+    openPnl: pnls.length ? pnls.reduce((a, b) => a + b, 0) : null,
+    realized: closed.length ? closed.reduce((a, p) => a + (p.position.realized_pnl_sol || 0), 0) : null,
+  };
+}
 
-  const realized = closed.reduce((acc, p) => acc + (p.position.realized_pnl_sol || 0), 0);
-  const tReal = document.getElementById("t-realized");
-  tReal.textContent = closed.length ? fmtSolSigned(realized) : "—";
-  tReal.className = `tile-value ${closed.length ? toneClass(realized) : ""}`;
-  document.getElementById("t-realized-sub").textContent =
-    `SOL, ${closed.length} ${closed.length === 1 ? "cerrada" : "cerradas"}`;
+function setTile(id, value, text, sub) {
+  const node = document.getElementById(id);
+  node.textContent = text;
+  node.className = `tile-value ${value === null ? "" : toneClass(value)}`;
+  document.getElementById(`${id}-sub`).textContent = sub;
+}
+
+// El dinero real y el simulado NUNCA se suman: las cifras grandes son de las
+// posiciones reales (si hay alguna en la sesión) y lo simulado va aparte.
+function renderTiles() {
+  const ps = state.positions;
+  const real = money(ps.filter((p) => p.live));
+  const sim = money(ps.filter((p) => !p.live));
+  const hayReal = ps.some((p) => p.live);
+  const main = hayReal ? real : sim;
+  const other = hayReal ? sim : null;
+  const etiqueta = hayReal ? "reales" : "simuladas";
+  const aparte = (v, fmt) => (other && v !== null ? ` · simulado: ${fmt(v)}` : "");
+
+  const running = ps.filter((p) => p.running);
+  const nReal = running.filter((p) => p.live).length;
+  document.getElementById("t-active").textContent = String(running.length);
+  document.getElementById("t-active-sub").textContent =
+    running.length
+      ? `${nReal} ${nReal === 1 ? "real" : "reales"} · ${running.length - nReal} ${running.length - nReal === 1 ? "simulada" : "simuladas"}`
+      : `de ${ps.length} en esta sesión`;
+
+  setTile("t-invested", null, main.invested === null ? "—" : fmtSol(main.invested),
+          `SOL, ${etiqueta}${aparte(other && other.invested, fmtSol)}`);
+  setTile("t-open-pnl", main.openPnl, main.openPnl === null ? "—" : fmtSolSigned(main.openPnl),
+          `SOL ${etiqueta}, si se vendiera ahora${aparte(other && other.openPnl, fmtSolSigned)}`);
+  setTile("t-realized", main.realized, main.realized === null ? "—" : fmtSolSigned(main.realized),
+          `SOL ${etiqueta}, ${main.closed} ${main.closed === 1 ? "cerrada" : "cerradas"}${aparte(other && other.realized, fmtSolSigned)}`);
 }
 
 function renderTable(now) {
@@ -217,6 +266,7 @@ function renderTable(now) {
       el("td", { dataset: { label: "Token" } },
         el("div", { class: "token" },
           el("span", { class: "token-name" }, tokenTitle(snap),
+            snap.live ? el("span", { class: "tag-pill real", title: "Posición con SOL real" }, "REAL") : null,
             snap.recovered ? el("span", { class: "tag-pill", title: "Retomada de una ejecución anterior del bot" }, "retomada") : null),
           // Sin símbolo todavía, el título ya ES el mint acortado.
           tokenTitle(snap) === shortMint(snap.mint) ? null : el("span", { class: "token-mint" }, shortMint(snap.mint)))),
@@ -292,11 +342,14 @@ function toast(message, kind = "") {
 }
 
 // Diálogo de confirmación: resuelve true si se confirma.
-function confirmDialog(title, bodyNodes, okLabel) {
+function confirmDialog(title, bodyNodes, okLabel, danger = true) {
   const dialog = document.getElementById("confirm");
   document.getElementById("confirm-title").textContent = title;
   document.getElementById("confirm-body").replaceChildren(...bodyNodes);
-  document.getElementById("confirm-ok").textContent = okLabel;
+  const okButton = document.getElementById("confirm-ok");
+  okButton.textContent = okLabel;
+  okButton.classList.toggle("btn-danger", danger);
+  okButton.classList.toggle("btn-primary", !danger);
   return new Promise((resolve) => {
     dialog.addEventListener("close", () => resolve(dialog.returnValue === "ok"), { once: true });
     dialog.returnValue = "cancel";
@@ -312,8 +365,8 @@ function facts(pairs) {
   return dl;
 }
 
-function realWarning(text) {
-  return state.live ? el("p", { class: "warn-real" }, `⚠ MODO REAL: ${text}`) : null;
+function realWarning(isReal, text) {
+  return isReal ? el("p", { class: "warn-real" }, `⚠ REAL: ${text}`) : null;
 }
 
 async function closePosition(id) {
@@ -331,7 +384,7 @@ async function closePosition(id) {
         ["PnL mercado", fmtPct(pos.market_pnl_pct), toneClass(pos.market_pnl_pct)],
         ["PnL si se vende ahora", `${fmtSolSigned(pnlSol)} SOL`, toneClass(pnlSol)],
       ]),
-      realWarning("se vende de verdad, con SOL real."),
+      realWarning(snap.live, "se vende de verdad, con SOL real."),
     ].filter(Boolean), "Vender ahora");
   } else {
     ok = await confirmDialog(`¿Cancelar #${snap.id} ${tokenTitle(snap)}?`, [
@@ -360,7 +413,8 @@ async function closeAll() {
       ...(esperando ? [["Se cancelan", `${esperando} esperando entrada`]] : []),
       ...(pnls.length ? [["PnL si se vende ahora", `${fmtSolSigned(pnl)} SOL`, toneClass(pnl)]] : []),
     ]),
-    realWarning("se vende todo de verdad, con SOL real."),
+    realWarning(targets.some((p) => p.live),
+                `${targets.filter((p) => p.live).length} de ellas son REALES y se venden de verdad.`),
   ].filter(Boolean), "Cerrar todas");
   if (!ok) return;
   try {
@@ -369,6 +423,218 @@ async function closeAll() {
   } catch (err) {
     toast(`No se pudieron cerrar: ${err.message}`, "error");
   }
+}
+
+// --------------------------------------------------------- nueva posición
+
+const NUMERIC_FIELDS = ["buy_sol", "activation_pct", "trailing_pct", "initial_stop_pct",
+                        "entry_dip_pct", "slippage", "priority_fee"];
+const TEXT_FIELDS = ["pool", "strategy_price_basis"];
+let defaults = null;
+let previewSeq = 0;
+let previewData = null;
+
+const openForm = () => document.getElementById("open-form");
+const field = (name) => openForm().elements[name];
+
+function fillDefaults() {
+  for (const name of [...NUMERIC_FIELDS, ...TEXT_FIELDS]) field(name).value = defaults.settings[name];
+  field("mode").value = defaults.settings.live ? "real" : "sim";
+  updateModeUI();
+}
+
+const chosenReal = () => field("mode").value === "real";
+
+// Que se note en todo el formulario que la compra va a ser con SOL real.
+function updateModeUI() {
+  const real = chosenReal();
+  document.getElementById("open-dialog").classList.toggle("is-real", real);
+  document.getElementById("open-title").textContent = real ? "Nueva posición · REAL" : "Nueva posición · simulada";
+  const submit = document.getElementById("open-submit");
+  submit.textContent = real ? "Revisar y comprar con SOL real…" : "Revisar y comprar (simulado)…";
+  submit.classList.toggle("btn-danger", real);
+  submit.classList.toggle("btn-primary", !real);
+}
+
+async function openNewPosition() {
+  try {
+    defaults = await api("/api/defaults");
+  } catch (err) {
+    toast(`No se pudo abrir el formulario: ${err.message}`, "error");
+    return;
+  }
+  const form = openForm();
+  form.reset();
+  fillDefaults();
+  field("buy_sol").max = defaults.max_buy_sol;
+  document.getElementById("f-buy-hint").textContent = `Máximo ${defaults.max_buy_sol} SOL por posición (max_buy_sol)`;
+  document.getElementById("open-error").hidden = true;
+  document.getElementById("f-preview").hidden = true;
+  previewData = null;
+  form.querySelector("details").open = false;
+  document.getElementById("open-dialog").showModal();
+  field("mint").focus();
+}
+
+function showOpenError(message) {
+  const box = document.getElementById("open-error");
+  box.textContent = message;
+  box.hidden = !message;
+}
+
+const MARKETS = {
+  bondingcurve: "En la curva de pump.fun",
+  pumpswap: "Migrado a PumpSwap",
+  other: "No está en pump.fun ni en PumpSwap: se intentará Raydium CPMM / Meteora DLMM",
+  unknown: "No se pudo comprobar dónde cotiza (¿RPC?)",
+};
+
+function renderPreview(p, error) {
+  const box = document.getElementById("f-preview");
+  box.hidden = false;
+  box.className = "preview field-full";
+  if (error) {
+    box.classList.add("bad");
+    box.replaceChildren(el("span", {}, error));
+    return;
+  }
+  if (!p) {
+    box.replaceChildren(el("span", { class: "p-meta" }, "Comprobando el token…"));
+    return;
+  }
+  const name = p.name && p.symbol ? `${p.name} ($${p.symbol})` : p.symbol ? `$${p.symbol}` : p.name || "Sin nombre on-chain";
+  const parts = [el("span", { class: "p-name" }, name),
+                 el("span", { class: "p-meta" }, MARKETS[p.market] || p.market)];
+  if (p.price) parts.push(el("span", { class: "p-meta" }, `Precio ahora: ${fmtPrice(p.price)} SOL/token`));
+  if (p.active_position) {
+    box.classList.add("bad");
+    parts.push(el("span", {}, `Ya hay una posición activa de este token (#${p.active_position}).`));
+  } else if (p.market === "other" || p.market === "unknown") {
+    box.classList.add("warn");
+  }
+  box.replaceChildren(...parts);
+}
+
+let previewTimer = null;
+function onMintInput() {
+  clearTimeout(previewTimer);
+  previewData = null;
+  const mint = field("mint").value.trim();
+  field("mint").removeAttribute("aria-invalid");
+  if (mint.length < 32) {
+    document.getElementById("f-preview").hidden = true;
+    return;
+  }
+  renderPreview(null);
+  // Espera a que termines de pegar/escribir: cada consulta gasta RPC.
+  previewTimer = setTimeout(async () => {
+    const seq = ++previewSeq;
+    try {
+      const p = await api(`/api/preview?mint=${encodeURIComponent(mint)}`);
+      if (seq !== previewSeq) return;
+      previewData = p;
+      renderPreview(p);
+    } catch (err) {
+      if (seq !== previewSeq) return;
+      field("mint").setAttribute("aria-invalid", "true");
+      renderPreview(null, err.message);
+    }
+  }, 400);
+}
+
+function readSettings() {
+  const settings = {};
+  for (const name of NUMERIC_FIELDS) {
+    const raw = field(name).value.trim().replace(",", ".");
+    const value = Number(raw);
+    if (raw === "" || !isFinite(value)) throw new Error(`Revisa el campo "${field(name).closest("label").querySelector("span").textContent}".`);
+    // Solo se manda lo que cambia respecto al .toml.
+    if (value !== defaults.settings[name]) settings[name] = value;
+  }
+  for (const name of TEXT_FIELDS) {
+    if (field(name).value !== defaults.settings[name]) settings[name] = field(name).value;
+  }
+  // El modo se manda SIEMPRE: que no dependa de qué ponga el .toml.
+  settings.live = chosenReal();
+  return settings;
+}
+
+async function submitNewPosition(e) {
+  e.preventDefault();
+  try {
+    await doSubmitNewPosition();
+  } catch (err) {
+    console.error(err);
+    showOpenError(`Error inesperado: ${err && err.message ? err.message : err}`);
+    document.getElementById("open-submit").disabled = false;
+  }
+}
+
+async function doSubmitNewPosition() {
+  showOpenError("");
+  const mint = field("mint").value.trim();
+  if (!mint) {
+    showOpenError("Falta el mint.");
+    field("mint").focus();
+    return;
+  }
+  let settings;
+  try {
+    settings = readSettings();
+  } catch (err) {
+    showOpenError(err.message);
+    return;
+  }
+  const buySol = settings.buy_sol ?? defaults.settings.buy_sol;
+  if (buySol <= 0 || buySol > defaults.max_buy_sol) {
+    showOpenError(`El importe tiene que estar entre 0 y ${defaults.max_buy_sol} SOL (max_buy_sol).`);
+    field("buy_sol").focus();
+    return;
+  }
+  if (previewData && previewData.active_position) {
+    showOpenError(`Ya hay una posición activa de este token (#${previewData.active_position}).`);
+    return;
+  }
+
+  const s = { ...defaults.settings, ...settings };
+  const p = previewData;
+  const tokenName = p && (p.symbol ? `$${p.symbol}` : p.name);
+  const isReal = settings.live;
+  const ok = await confirmDialog(`${isReal ? "COMPRA REAL: " : "Simulada: "}¿comprar ${buySol} SOL de ${tokenName || shortMint(mint)}?`, [
+    facts([
+      ["Token", p ? `${p.name || "—"}${p.symbol ? ` ($${p.symbol})` : ""}` : shortMint(mint)],
+      ["Mint", shortMint(mint)],
+      ["Dónde", p ? (MARKETS[p.market] || p.market) : "sin comprobar"],
+      ...(p && p.price ? [["Precio ahora", `${fmtPrice(p.price)} SOL/token`]] : []),
+      ["Modo", isReal ? "REAL (SOL de verdad)" : "simulado (no se compra nada)", isReal ? "down" : ""],
+      ["Compra", `${buySol} SOL`],
+      ["Entrada", s.entry_dip_pct > 0 ? `cuando baje un ${s.entry_dip_pct} %` : "al primer precio"],
+      ["Estrategia", `activa +${s.activation_pct} % · trailing ${s.trailing_pct} % · stop −${s.initial_stop_pct} %`],
+    ]),
+    realWarning(isReal, `se compra de verdad, con ${buySol} SOL reales de tu wallet.`),
+  ].filter(Boolean), isReal ? "Comprar con SOL real" : "Comprar (simulado)", isReal);
+  if (!ok) return;
+
+  const submit = document.getElementById("open-submit");
+  submit.disabled = true;
+  try {
+    const res = await api("/api/positions", { method: "POST", body: { mint, settings } });
+    document.getElementById("open-dialog").close();
+    toast(`Posición #${res.id} abierta. Comprará en cuanto haya precio.`);
+  } catch (err) {
+    showOpenError(err.message);
+  } finally {
+    submit.disabled = false;
+  }
+}
+
+function renderNewButton() {
+  const button = document.getElementById("new-position");
+  const activas = state.positions.filter((p) => p.running || (p.position && !p.position.closed)).length;
+  const max = defaults ? defaults.max_open_positions : null;
+  const full = max !== null && activas >= max;
+  button.disabled = full;
+  button.title = full ? `Límite de ${max} posiciones activas (max_open_positions)` : "";
 }
 
 function kv(label, value, opts = {}) {
@@ -400,12 +666,19 @@ function renderDetail() {
   const items = [
     kv("Mint", link, { mono: true }),
     kv("Estado", `${st.icon} ${st.label}`),
-    kv("Modo", snap.live ? "REAL" : "Simulado"),
+    kv("Modo", snap.live ? "REAL (SOL de verdad)" : "Simulado", { tone: snap.live ? "down" : "" }),
     ...(snap.recovered ? [kv("Origen", "Retomada de una ejecución anterior")] : []),
     kv("Fuente del precio", snap.price_source === "feed" ? "Feed en vivo (PumpPortal)" : `On-chain (${snap.price_source})`),
     kv("Precio actual", fmtPrice(snap.latest_price)),
   ];
-  if (snap.entry_target_price && !pos) items.push(kv("Objetivo de entrada", fmtPrice(snap.entry_target_price)));
+  if (snap.entry_target_price && !pos) {
+    const missing = dipMissingPct(snap);
+    items.push(
+      kv(`Referencia (baja de ${snap.settings.entry_dip_pct} %)`, fmtPrice(snap.entry_reference_price)),
+      kv("Compra cuando el precio llegue a", fmtPrice(snap.entry_target_price)),
+      kv("Le falta bajar", missing === null ? "—" : `${missing.toFixed(2)} %`),
+    );
+  }
   if (snap.end_reason) items.push(kv("Motivo de fin", snap.end_reason));
   if (snap.close_reason) items.push(kv("Cierre pedido", snap.close_reason));
 
@@ -528,7 +801,7 @@ async function loadHistory() {
       el("td", { dataset: { label: "#" } }, `#${r.id}`),
       el("td", { dataset: { label: "Token" } },
         el("div", { class: "token" },
-          el("span", { class: "token-name" }, title, r.live ? el("span", { class: "tag-pill" }, "real") : null),
+          el("span", { class: "token-name" }, title, r.live ? el("span", { class: "tag-pill real" }, "REAL") : null),
           title === shortMint(r.mint) ? null : el("span", { class: "token-mint" }, shortMint(r.mint)))),
       el("td", { dataset: { label: "Resultado" } }, HISTORY_STATUS[r.status] || r.status),
       el("td", { class: `num ${toneClass(r.realized_pnl_pct)}`, dataset: { label: "PnL" } }, fmtPct(r.realized_pnl_pct)),
@@ -554,6 +827,7 @@ function render() {
   renderTiles();
   if (!pointerDown) renderTable(now);
   document.getElementById("close-all").disabled = !state.positions.some(closable);
+  renderNewButton();
   renderDetail();
   renderLogFilterOptions();
 }
@@ -634,7 +908,10 @@ async function start() {
   try {
     const s = await api("/api/session");
     if (s.auth_required && !s.authenticated) showLogin();
-    else showApp(s.auth_required);
+    else {
+      showApp(s.auth_required);
+      api("/api/defaults").then((d) => { defaults = d; renderNewButton(); }).catch(() => {});
+    }
   } catch (err) {
     setConn("down", "Sin conexión");
     setTimeout(start, 3000);
@@ -650,6 +927,7 @@ document.getElementById("login-form").addEventListener("submit", async (e) => {
     await api("/api/login", { method: "POST", body: { password: input.value } });
     input.value = "";
     showApp(true);
+    api("/api/defaults").then((d) => { defaults = d; renderNewButton(); }).catch(() => {});
   } catch (err) {
     error.textContent = err.message;
     error.hidden = false;
@@ -687,6 +965,14 @@ document.querySelector("#positions tbody").addEventListener("click", (e) => {
 });
 document.getElementById("detail-actions").addEventListener("click", onActionClick);
 document.getElementById("close-all").addEventListener("click", closeAll);
+document.getElementById("new-position").addEventListener("click", openNewPosition);
+document.getElementById("open-form").addEventListener("submit", submitNewPosition);
+// El aviso de error es del último intento: se quita en cuanto tocas algo.
+document.getElementById("open-form").addEventListener("input", () => showOpenError(""));
+document.getElementById("open-cancel").addEventListener("click", () => document.getElementById("open-dialog").close());
+document.getElementById("f-mint").addEventListener("input", onMintInput);
+document.getElementById("f-reset").addEventListener("click", fillDefaults);
+document.getElementById("f-mode").addEventListener("change", updateModeUI);
 for (const id of ["positions", "detail"]) {
   const zone = document.getElementById(id);
   zone.addEventListener("pointerdown", () => { pointerDown = true; });
