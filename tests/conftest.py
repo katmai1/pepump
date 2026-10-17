@@ -20,7 +20,11 @@ def make_config(**overrides) -> AppConfig:
     """AppConfig real (no un mock) con overrides puntuales, para que los
     tests de bot.py usen exactamente los mismos defaults/campos que la
     app real y no se desincronicen si se agrega un campo nuevo."""
-    cfg = AppConfig(mint="TestMint1111111111111111111111111111111111", api_key="dummy-key")
+    # RPC local que no existe: la conexión se rechaza al instante. Los tests
+    # nunca deben llegar a mainnet (lentos, no deterministas, y gastan cupo
+    # de un RPC real); los que necesitan respuestas on-chain usan dobles.
+    cfg = AppConfig(mint="TestMint1111111111111111111111111111111111", api_key="dummy-key",
+                    solana_rpc_url="http://127.0.0.1:9")
     for k, v in overrides.items():
         setattr(cfg, k, v)
     return cfg

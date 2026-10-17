@@ -68,6 +68,8 @@ CSRF_HEADER = "x-pepump"
 # Cierre del WebSocket por falta de sesión: el navegador vuelve a la
 # pantalla de contraseña en vez de reintentar.
 WS_CLOSE_UNAUTHORIZED = 4401
+# Cada cuánto mira cada WebSocket si el servidor se está apagando.
+_SHUTDOWN_CHECK_SECONDS = 0.2
 
 
 def is_loopback(host: str) -> bool:
@@ -144,6 +146,10 @@ class WebAuth:
 def create_app(manager: PositionManager, logs: LogBuffer, *, live: bool,
                allowed_hosts: Optional[list] = None, password: str = "") -> FastAPI:
     app = FastAPI(title="PePump", docs_url=None, redoc_url=None, openapi_url=None)
+    # Al apagar (WebPanel.stop) se marca esto y cada WebSocket se cierra
+    # solo, de forma ordenada, antes de que uvicorn pare.
+    app.state.shutting_down = asyncio.Event()
+    app.state.ws_open = 0
     allowed = allowed_hosts or ["127.0.0.1", "localhost"]
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed)
     auth = WebAuth(password)
@@ -249,16 +255,23 @@ def create_app(manager: PositionManager, logs: LogBuffer, *, live: bool,
             await websocket.close(code=WS_CLOSE_UNAUTHORIZED)
             return
         queue = logs.subscribe()
+        app.state.ws_open += 1
         try:
             await websocket.send_text(json.dumps({
                 "type": "hello", "state": state(), "logs": logs.entries(limit=INITIAL_LOGS),
             }))
             next_state = time.monotonic() + STATE_INTERVAL_SECONDS
             while True:
-                timeout = max(0.0, next_state - time.monotonic())
+                if app.state.shutting_down.is_set():
+                    # 1001 = "going away": el navegador reintenta solo.
+                    await websocket.close(code=1001)
+                    return
+                timeout = min(max(0.0, next_state - time.monotonic()), _SHUTDOWN_CHECK_SECONDS)
                 try:
                     entry = await asyncio.wait_for(queue.get(), timeout=timeout)
                 except asyncio.TimeoutError:
+                    if time.monotonic() < next_state:
+                        continue  # solo tocaba mirar si se está apagando
                     # La sesión puede caducar (o cerrarse) con el WebSocket abierto.
                     if not auth.is_valid(websocket.cookies.get(SESSION_COOKIE)):
                         await websocket.close(code=WS_CLOSE_UNAUTHORIZED)
@@ -272,7 +285,13 @@ def create_app(manager: PositionManager, logs: LogBuffer, *, live: bool,
                 await websocket.send_text(json.dumps({"type": "logs", "logs": batch}))
         except (WebSocketDisconnect, RuntimeError):
             pass
+        except asyncio.CancelledError:
+            # uvicorn cancela a la fuerza lo que siga abierto al apagar (si
+            # el cierre ordenado no llegó a tiempo). No es un error: sin
+            # esto, uvicorn lo registra como "Exception in ASGI application".
+            pass
         finally:
+            app.state.ws_open -= 1
             logs.unsubscribe(queue)
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -322,6 +341,7 @@ class WebPanel:
     """El servidor web corriendo como una tarea más del loop."""
 
     def __init__(self, app: FastAPI, sock: socket.socket):
+        self._app = app
         config = uvicorn.Config(app, log_config=None, log_level="warning", access_log=False,
                                 lifespan="off")
         self._server = _EmbeddedServer(config)
@@ -334,6 +354,12 @@ class WebPanel:
     async def stop(self) -> None:
         if self._task is None:
             return
+        # Primero, que cada WebSocket abierto se cierre de forma ordenada
+        # (ver el bucle de /ws); hasta 2 s, por si alguno está enviando.
+        self._app.state.shutting_down.set()
+        deadline = time.monotonic() + 2.0
+        while self._app.state.ws_open > 0 and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
         self._server.should_exit = True
         # Las conexiones WebSocket abiertas no terminan solas: sin esto,
         # uvicorn esperaría a que el navegador las cierre.

@@ -39,10 +39,19 @@ async def test_close_vende_con_el_motivo_pedido():
     assert executor.last_sell_reason == "cierre manual (cerrado desde la web)"
 
 
+class _FeedEnSilencio(FakeTradeStreamClient):
+    """Conexión abierta que no entrega nada (el FakeTradeStreamClient base
+    cierra el stream en cuanto agota sus eventos)."""
+
+    async def iter_trade_events(self, ws):
+        await asyncio.Event().wait()
+        yield  # pragma: no cover
+
+
 async def test_close_antes_de_comprar_no_compra():
     # Sin eventos: el bot se queda esperando el primer precio.
     cfg = make_config(status_interval_seconds=999)
-    client = FakeTradeStreamClient(events_by_connection=[[]])
+    client = _FeedEnSilencio()
     executor = SpyExecutor()
     bot = TrailingTakeProfitBot(client=client, executor=executor, config=cfg)
 

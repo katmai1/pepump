@@ -1,20 +1,19 @@
 """
-Tests para PumpSwapOnChainClient._find_pool_address.
+Tests para PumpSwapOnChainClient._find_pool: el pool OFICIAL de migración
+de un mint de pump.fun en PumpSwap.
 
-BUGFIX: cuando el getProgramAccounts devolvía más de un pool para el mismo
-mint, la selección del "mejor" llamaba a fetch_pool_state() por cada
-candidato -y esa función hace su PROPIO getAccountInfo. O sea: un
-round-trip de RPC extra por candidato, justo en el camino que ya es el que
-se come el rate limit del RPC. El account data crudo ya viene en
-`acc.account.data` del mismo getProgramAccounts, así que ahora se parsea
-localmente, sin llamadas extra.
+BUGFIX (429 Too Many Requests del RPC): antes se buscaba con un
+getProgramAccounts sobre todo el programa de PumpSwap -la consulta más
+cara de Solana, con un cupo propio muy bajo en los RPC- en cada
+comprobación de migración y en cada ciclo de polling. Ahora la dirección
+del pool oficial se CALCULA (es un PDA) y basta un getAccountInfo.
 """
 import asyncio
 
 import pytest
 from solders.pubkey import Pubkey
 
-from pepump.pump import WSOL_MINT, PumpSwapOnChainClient
+from pepump.pump import PUMPSWAP_PROGRAM_ID, WSOL_MINT, PumpSwapOnChainClient
 
 OTRO_QUOTE_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"  # USDC
 
@@ -43,134 +42,102 @@ def build_pool_account_data(base_mint: str, quote_mint: str, lp_supply: int,
     return data
 
 
-class FakeAccount:
-    def __init__(self, data):
+class FakeAccountInfo:
+    def __init__(self, data: bytes, owner: str = PUMPSWAP_PROGRAM_ID):
         self.data = data
+        self.owner = Pubkey.from_string(owner)
 
 
-class FakeKeyedAccount:
-    def __init__(self, pubkey: str, data: bytes):
-        self.pubkey = Pubkey.from_string(pubkey)
-        self.account = FakeAccount(data)
-
-
-class FakeProgramAccountsResp:
+class FakeResp:
     def __init__(self, value):
         self.value = value
 
 
 class SpyRpcClient:
-    """Cuenta las llamadas de RPC para poder afirmar que la selección de
-    candidatos no dispara ninguna de más."""
+    """Solo responde getAccountInfo; cualquier getProgramAccounts revienta
+    (es justo lo que ya no se tiene que usar)."""
 
-    def __init__(self, accounts):
-        self._accounts = accounts
-        self.get_program_accounts_calls = 0
-        self.get_account_info_calls = 0
+    def __init__(self, account: FakeAccountInfo = None):
+        self.account = account
+        self.get_account_info_calls = []
 
-    async def get_program_accounts(self, program_id, encoding=None, filters=None):
-        self.get_program_accounts_calls += 1
-        return FakeProgramAccountsResp(self._accounts)
+    async def get_account_info(self, pubkey, encoding=None, commitment=None):
+        self.get_account_info_calls.append(str(pubkey))
+        return FakeResp(self.account)
 
-    async def get_account_info_json_parsed(self, pubkey, commitment=None):
-        self.get_account_info_calls += 1
-        raise AssertionError("no debería hacer falta ninguna lectura extra de cuenta")
+    async def get_program_accounts(self, *a, **kw):
+        raise AssertionError("ya no se usa getProgramAccounts para PumpSwap")
 
 
-POOL_A = "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1"
-POOL_B = "7YHm6t1LqL9PDkVv8h8ZKmMdMx3oRpQwPMHhz9YR5YQd"
 MINT = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
 
 
-def _find(accounts):
-    client = SpyRpcClient(accounts)
+def _find(account):
+    client = SpyRpcClient(account)
     onchain = PumpSwapOnChainClient("http://fake-rpc")
-    address = asyncio.run(onchain._find_pool_address(client, MINT))
-    return address, client
+    return asyncio.run(onchain._find_pool(client, MINT)), client
 
 
-def test_un_solo_pool_se_devuelve_directo_sin_leer_nada_mas():
-    accounts = [FakeKeyedAccount(POOL_A, build_pool_account_data(MINT, WSOL_MINT, 1000))]
-    address, client = _find(accounts)
-
-    assert address == POOL_A
-    assert client.get_account_info_calls == 0
-
-
-def test_gana_el_pool_con_mas_lp_supply_sin_round_trips_extra():
-    """Antes esto costaba un getAccountInfo por candidato."""
-    accounts = [
-        FakeKeyedAccount(POOL_A, build_pool_account_data(MINT, WSOL_MINT, 1_000)),
-        FakeKeyedAccount(POOL_B, build_pool_account_data(MINT, WSOL_MINT, 9_999_999)),
-    ]
-    address, client = _find(accounts)
-
-    assert address == POOL_B
-    assert client.get_program_accounts_calls == 1
-    assert client.get_account_info_calls == 0
+# Pools oficiales REALES de mainnet (leídos de transacciones de PumpSwap y
+# comprobados: creator = pool-authority de pump.fun, index 0, quote WSOL).
+@pytest.mark.parametrize("mint,pool", [
+    ("HzR1r6Dtf5NMdTxtwc9TnT3YtTsi4ho6dSmnwzAFpump", "2fwA8jvv6neYiT15RbzmLDcSFEq13oLegE4WVGYzxycx"),
+    ("14qsVuH4ZLX1xprZotj5Q8ShT1FfJXhPVKoa4jK8pump", "HzPzT2G4fo93ztoTxLGhQiyDvJk2Ph6qgX5HWjnFtLnv"),
+])
+def test_canonical_pool_address_coincide_con_pools_reales(mint, pool):
+    assert PumpSwapOnChainClient.canonical_pool_address(mint) == pool
 
 
-def test_se_descartan_los_pools_que_no_estan_denominados_en_sol():
-    """El pool de USDC tiene más liquidez, pero el bot solo puede operar
-    contra SOL: elegirlo por lp_supply y solo después descubrir que no
-    sirve dejaba al bot sin precio teniendo uno disponible."""
-    accounts = [
-        FakeKeyedAccount(POOL_A, build_pool_account_data(MINT, WSOL_MINT, 1_000)),
-        FakeKeyedAccount(POOL_B, build_pool_account_data(MINT, OTRO_QUOTE_MINT, 9_999_999)),
-    ]
-    address, _ = _find(accounts)
+def test_un_solo_getaccountinfo_a_la_direccion_calculada():
+    (address, pool), client = _find(FakeAccountInfo(build_pool_account_data(MINT, WSOL_MINT, 1_000)))
+    expected = PumpSwapOnChainClient.canonical_pool_address(MINT)
+    assert address == expected
+    assert pool is not None and pool["quote_mint"] == WSOL_MINT
+    assert client.get_account_info_calls == [expected]
 
-    assert address == POOL_A
+
+def test_si_la_cuenta_no_existe_no_hay_pool():
+    """El mint no migró (o nunca fue de pump.fun): confirmación limpia."""
+    (address, pool), _ = _find(None)
+    assert (address, pool) == (None, None)
+
+
+def test_sin_pool_confirma_ausencia_en_fetch():
+    client = SpyRpcClient(None)
+
+    class _Ctx:
+        async def __aenter__(self):
+            return client
+
+        async def __aexit__(self, *a):
+            return False
+
+    import pepump.pump as pump_module
+    original = pump_module.AsyncClient
+    pump_module.AsyncClient = lambda url: _Ctx()
+    try:
+        price, absent = asyncio.run(PumpSwapOnChainClient("http://fake-rpc").fetch_price_or_confirm_absent(MINT))
+    finally:
+        pump_module.AsyncClient = original
+    assert price is None and absent is True
+
+
+def test_cuenta_de_otro_mint_no_se_usa():
+    otro = "So11111111111111111111111111111111111111112"
+    (address, pool), _ = _find(FakeAccountInfo(build_pool_account_data(otro, WSOL_MINT, 1_000)))
+    assert address is not None and pool is None
+
+
+def test_cuenta_que_no_es_del_programa_no_se_usa():
+    data = build_pool_account_data(MINT, WSOL_MINT, 1_000)
+    (address, pool), _ = _find(FakeAccountInfo(data, owner="11111111111111111111111111111111"))
+    assert address is not None and pool is None
 
 
 def test_layout_viejo_sin_coin_creator_se_parsea_igual():
-    """PumpSwapPoolStateOld no trae coin_creator, pero los offsets hasta
-    lp_supply son idénticos."""
-    accounts = [
-        FakeKeyedAccount(POOL_A, build_pool_account_data(MINT, WSOL_MINT, 10, con_coin_creator=False)),
-        FakeKeyedAccount(POOL_B, build_pool_account_data(MINT, WSOL_MINT, 20, con_coin_creator=False)),
-    ]
-    address, _ = _find(accounts)
-
-    assert address == POOL_B
-
-
-def test_cuenta_mas_corta_de_lo_esperado_no_rompe_la_seleccion():
-    """Si un layout futuro deja una cuenta más corta, no se puede leer su
-    lp_supply -pero eso no debe lanzar ninguna excepción ni descartar a los
-    candidatos que sí se pueden leer."""
-    accounts = [
-        FakeKeyedAccount(POOL_A, bytes(40)),  # ilegible
-        FakeKeyedAccount(POOL_B, build_pool_account_data(MINT, WSOL_MINT, 500)),
-    ]
-    address, _ = _find(accounts)
-
-    assert address == POOL_B
-
-
-WALLET_CUALQUIERA = "9UqBvwTW1WU3e5TTEtSqY7SBcRgN89qZeCiMH8ag1JR7"
-
-
-def test_se_ignoran_los_pools_que_no_son_el_oficial_de_migracion():
-    """Caso real (Dz9mQ9...bonk, token de bonk.fun): un pool de PumpSwap
-    creado a mano por una wallet cualquiera daba un precio inventado y la
-    Lightning API rechazaba la compra con "Pool account not found"."""
-    accounts = [
-        FakeKeyedAccount(POOL_A, build_pool_account_data(MINT, WSOL_MINT, 100, creator=WALLET_CUALQUIERA)),
-    ]
-    address, _ = _find(accounts)
-
-    assert address is None
-
-
-def test_el_pool_oficial_gana_aunque_haya_uno_no_oficial_con_mas_liquidez():
-    accounts = [
-        FakeKeyedAccount(POOL_A, build_pool_account_data(MINT, WSOL_MINT, 9_999_999, creator=WALLET_CUALQUIERA)),
-        FakeKeyedAccount(POOL_B, build_pool_account_data(MINT, WSOL_MINT, 1_000)),
-    ]
-    address, _ = _find(accounts)
-
-    assert address == POOL_B
+    data = build_pool_account_data(MINT, WSOL_MINT, 1_000, con_coin_creator=False)
+    (address, pool), _ = _find(FakeAccountInfo(data))
+    assert pool is not None
 
 
 def test_canonical_pool_creator_coincide_con_el_pda_real():
@@ -178,11 +145,6 @@ def test_canonical_pool_creator_coincide_con_el_pda_real():
     mint = "Dz9mQ9NzkBcCsuGPFJ3r1bS4wgqKMHBPiVuniW8Mbonk"
     assert (PumpSwapOnChainClient.canonical_pool_creator(mint)
             == "HCbKYZiFNfjTY5UtBBX2ETak9FFnTQ9KE1pGUH2HkTvv")
-
-
-def test_sin_pools_devuelve_none():
-    address, _ = _find([])
-    assert address is None
 
 
 @pytest.mark.parametrize("lp_supply", [0, 1, 2**63])

@@ -1559,77 +1559,68 @@ class PumpSwapOnChainClient:
         address, _pool = await self._find_pool(client, mint)
         return address
 
-    async def _find_pool(self, client: AsyncClient, mint: str) -> tuple[Optional[str], Optional[dict]]:
-        """getProgramAccounts sobre el programa de PumpSwap, filtrando por
-        `base_mint == mint` con un memcmp en el offset exacto del struct.
-        Si hay varios pools para el mismo mint (raro, pero el struct
-        soporta `index`), nos quedamos con el de mayor `lp_supply` (el
-        pool "real" con liquidez, no uno vacío/de prueba).
-
-        Devuelve (dirección del pool, campos ya parseados de su cuenta
-        -ver _parse_pool), para no tener que volver a leer on-chain una
-        cuenta que este mismo getProgramAccounts ya trajo entera.
-
-        BUGFIX: la selección entre candidatos llamaba a fetch_pool_state()
-        por cada uno, y esa función hace su PROPIO getAccountInfo -o sea,
-        un round-trip de RPC extra por candidato, justo en el camino que
-        ya es el que se come el rate limit. El account data crudo ya viene
-        en `acc.account.data` de este mismo getProgramAccounts, así que
-        ahora se parsea localmente: cero llamadas extra. De paso se
-        descartan aquí los pools que no están denominados en SOL, en vez de
-        elegir el de mayor liquidez y solo después descubrir que no
-        sirve.
-
-        BUGFIX: cualquiera puede crear un pool de PumpSwap para cualquier
-        mint -incluidos tokens de bonk.fun/LaunchLab que nunca pasaron por
-        pump.fun-. Esos pools de relleno (lp_supply de 100, reservas
-        ridículas) daban un precio de referencia inventado, el bot
-        forzaba pool="pump-amm" y la Lightning API respondía "Pool account
-        not found", porque solo rutea contra el pool oficial de migración.
-        Ahora solo cuenta el pool cuyo `creator` es el pool-authority de
-        pump.fun para este mint; si no hay ninguno, el mint se trata como
-        "sin pool de PumpSwap"."""
-        accounts = await _get_program_accounts(
-            client, self.rpc_url, Pubkey.from_string(PUMPSWAP_PROGRAM_ID),
-            [MemcmpOpts(offset=self._BASE_MINT_OFFSET, bytes=mint)],
-            f"los pools de PumpSwap de {mint}",
+    @classmethod
+    def canonical_pool_address(cls, mint: str) -> str:
+        """Dirección del pool OFICIAL de migración de pump.fun en PumpSwap,
+        calculada sin consultar nada: es el PDA ["pool", index (u16 LE, 0),
+        creator, base_mint, quote_mint] del programa de PumpSwap, con
+        creator = canonical_pool_creator(mint) y quote = WSOL. Verificado
+        contra pools reales de mainnet (ver tests)."""
+        pda, _bump = Pubkey.find_program_address(
+            [b"pool", (0).to_bytes(2, "little"),
+             bytes(Pubkey.from_string(cls.canonical_pool_creator(mint))),
+             bytes(Pubkey.from_string(mint)),
+             bytes(Pubkey.from_string(WSOL_MINT))],
+            Pubkey.from_string(PUMPSWAP_PROGRAM_ID),
         )
-        if not accounts:
+        return str(pda)
+
+    async def _find_pool(self, client: AsyncClient, mint: str) -> tuple[Optional[str], Optional[dict]]:
+        """Pool oficial de migración de `mint` en PumpSwap: (dirección,
+        campos ya parseados -ver _parse_pool-), (None, None) si no existe
+        (el mint no migró, o nunca fue de pump.fun), o (dirección, None) si
+        existe pero no se puede usar.
+
+        BUGFIX (429 Too Many Requests): antes se buscaba con un
+        getProgramAccounts sobre TODO el programa de PumpSwap, filtrando
+        por base_mint. Es la consulta más cara de Solana y los RPC le dan
+        un cupo propio muy bajo (en Helius, el plan gratis se agota
+        enseguida), y se repetía en cada comprobación de migración (cada
+        stall_timeout_seconds sin trades, por posición) y en cada ciclo del
+        polling on-chain de un token ya migrado. Con varias posiciones de
+        poco volumen a la vez, el RPC empezaba a responder 429.
+
+        Como solo cuenta el pool OFICIAL (ver el BUGFIX de abajo), su
+        dirección se puede calcular (canonical_pool_address) y basta un
+        getAccountInfo, que es de las consultas más baratas.
+
+        BUGFIX (anterior, se mantiene): cualquiera puede crear un pool de
+        PumpSwap para cualquier mint -incluidos tokens de bonk.fun/LaunchLab
+        que nunca pasaron por pump.fun-. Esos pools de relleno (lp_supply de
+        100, reservas ridículas) daban un precio de referencia inventado, el
+        bot forzaba pool="pump-amm" y la Lightning API respondía "Pool
+        account not found", porque solo rutea contra el pool oficial de
+        migración. Solo se usa el pool cuyo `creator` es el pool-authority
+        de pump.fun para este mint, que es exactamente el que da el PDA."""
+        address = self.canonical_pool_address(mint)
+        resp = await client.get_account_info(Pubkey.from_string(address), encoding="base64")
+        info = _rpc_value(resp, f"el pool oficial de PumpSwap de {mint}")
+        if info is None:
             return None, None
 
-        canonical_creator = self.canonical_pool_creator(mint)
-        best_pubkey = None
-        best_data = None
-        best_lp_supply = -1
-        descartados_por_quote = 0
-        descartados_no_oficiales = 0
-        for acc in accounts:
-            data = getattr(getattr(acc, "account", None), "data", None)
-            if self._pool_creator(data) != canonical_creator:
-                descartados_no_oficiales += 1
-                continue
-            quote_mint = self._pool_quote_mint(data)
-            if quote_mint is not None and quote_mint != WSOL_MINT:
-                descartados_por_quote += 1
-                continue
-            lp_supply = self._pool_lp_supply(data)
-            if lp_supply is None:
-                # Cuenta más corta de lo esperado (¿layout nuevo?): no la
-                # descartamos, pero solo la usamos si no hay nada mejor.
-                lp_supply = 0
-            if lp_supply > best_lp_supply:
-                best_lp_supply = lp_supply
-                best_pubkey = str(acc.pubkey)
-                best_data = data
-
-        if descartados_no_oficiales:
-            logger.debug(f"[On-chain PumpSwap] {len(accounts)} pools para {mint}; "
-                         f"{descartados_no_oficiales} descartados por no ser el pool oficial de "
-                         f"migración de pump.fun.")
-        if descartados_por_quote:
-            logger.debug(f"[On-chain PumpSwap] {len(accounts)} pools para {mint}; "
-                         f"{descartados_por_quote} descartados por no estar denominados en SOL.")
-        return best_pubkey, self._parse_pool(best_data)
+        data = bytes(info.data)
+        owner = str(getattr(info, "owner", PUMPSWAP_PROGRAM_ID))
+        if owner != PUMPSWAP_PROGRAM_ID:
+            logger.warning(f"[On-chain PumpSwap] La cuenta {address} no es del programa de PumpSwap "
+                           f"(owner {owner}); no la uso.")
+            return address, None
+        base_mint = (str(Pubkey.from_bytes(data[self._BASE_MINT_OFFSET:self._BASE_MINT_OFFSET + 32]))
+                     if len(data) >= self._BASE_MINT_OFFSET + 32 else None)
+        if base_mint != mint or self._pool_creator(data) != self.canonical_pool_creator(mint):
+            logger.warning(f"[On-chain PumpSwap] El pool {address} no corresponde a {mint} "
+                           f"(¿cambió el layout?); no lo uso.")
+            return address, None
+        return address, self._parse_pool(data)
 
 # Programa de Metaplex Token Metadata (constante pública, no cambia).
 TOKEN_METADATA_PROGRAM_ID = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
