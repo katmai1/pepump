@@ -55,6 +55,12 @@ class AppConfig:
     # --- [pumpportal] ----------------------------------------------------- #
     api_key: str = ""  # también se puede definir con la variable de entorno PUMPPORTAL_API_KEY
 
+    # --- [web] -------------------------------------------------------------- #
+    # Contraseña del panel web (--web). Opcional: vacía, el panel no pide
+    # nada. También se puede definir con la variable de entorno
+    # PEPUMP_WEB_PASSWORD.
+    web_password: str = ""
+
     # --- [onchain] ---------------------------------------------------------- #
     # Cuántos segundos esperar el precio por el feed en vivo de PumpPortal
     # (subscribeTokenTrade) ANTES de recurrir al fallback on-chain de
@@ -235,7 +241,7 @@ def load_config(path: str) -> AppConfig:
 
     valid_keys = {f.name for f in fields(AppConfig)}
     merged: dict = {}
-    for section_name in ("general", "trade", "strategy", "pumpportal", "onchain"):
+    for section_name in ("general", "trade", "strategy", "pumpportal", "onchain", "web"):
         section = raw.get(section_name, {})
         unknown = set(section) - valid_keys
         if unknown:
@@ -251,6 +257,9 @@ def load_config(path: str) -> AppConfig:
     # esa opción se encontraba con "Falta la API key" de todos modos. Si
     # el .toml no trae una key, ahora sí se consulta la variable de entorno como
     # fallback antes de fallar.
+    if not config.web_password:
+        config.web_password = os.environ.get("PEPUMP_WEB_PASSWORD", "")
+
     if not config.api_key:
         config.api_key = os.environ.get("PUMPPORTAL_API_KEY", "")
     config.api_key = config.api_key.strip()

@@ -165,3 +165,24 @@ async def test_panel_con_una_posicion_es_el_de_siempre_y_con_varias_una_fila_cad
     multi.refresh()
     assert all("cerrada" in ln for ln in fake.fixed[1:])
     await manager.aclose()
+
+
+async def test_closable_y_close_all_sin_bloquear():
+    manager, conns, executors = make_manager()
+    pa = await _abrir_y_comprar(manager, conns, A)
+    assert pa.closable
+
+    assert manager.close_all("desde la web", block_new=False) == 1
+    assert not pa.closable  # ya pedido
+    # Un segundo "cerrar todas" no vuelve a pedir nada.
+    assert manager.close_all("otra vez", block_new=False) == 0
+    await asyncio.wait_for(pa.task, 5)
+    assert not pa.closable  # terminó
+    assert executors[A].sell_calls == 1
+
+    # El servicio sigue aceptando posiciones nuevas.
+    pb = manager.open(B)
+    manager.close_all("fin")
+    await asyncio.wait_for(manager.wait_all(), 5)
+    assert pb.task.done()
+    await manager.aclose()

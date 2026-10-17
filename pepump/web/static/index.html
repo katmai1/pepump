@@ -11,9 +11,23 @@
     <div class="brand">PePump</div>
     <span id="mode" class="badge" hidden></span>
     <span id="conn" class="conn" data-state="connecting"><span class="dot" aria-hidden="true"></span><span class="conn-label">Conectando…</span></span>
+    <button id="logout" class="btn-ghost small" type="button" hidden>Salir</button>
   </header>
 
-  <main>
+  <!-- Solo si hay web_password en el .toml -->
+  <section id="login" class="login" hidden>
+    <form id="login-form" class="card login-card">
+      <h1>PePump</h1>
+      <!-- Solo para que los gestores de contraseñas la asocien a algo. -->
+      <input type="text" name="username" autocomplete="username" value="pepump" hidden>
+      <label for="login-password">Contraseña del panel</label>
+      <input id="login-password" type="password" autocomplete="current-password" required autofocus>
+      <p id="login-error" class="form-error" role="alert" hidden></p>
+      <button type="submit" class="btn btn-primary">Entrar</button>
+    </form>
+  </section>
+
+  <main id="app" hidden>
     <section class="tiles" aria-label="Resumen">
       <div class="tile">
         <div class="tile-label">Posiciones activas</div>
@@ -40,7 +54,7 @@
     <section class="card">
       <div class="card-head">
         <h2>Posiciones</h2>
-        <span class="muted small">Solo lectura: abrir y cerrar llega en el siguiente paso.</span>
+        <button id="close-all" class="btn btn-danger-outline" type="button" disabled>Cerrar todas</button>
       </div>
       <div id="empty" class="empty" hidden>No hay posiciones. Arráncalas con <code>python run.py -m &lt;MINT&gt; --web</code>.</div>
       <div class="table-wrap">
@@ -56,6 +70,7 @@
               <th class="num">PnL mercado</th>
               <th class="num">PnL neto</th>
               <th class="num">Tiempo</th>
+              <th><span class="sr-only">Acciones</span></th>
             </tr>
           </thead>
           <tbody></tbody>
@@ -66,6 +81,7 @@
     <section id="detail" class="card" hidden>
       <div class="card-head">
         <h2 id="detail-title">Detalle</h2>
+        <span id="detail-actions"></span>
         <button id="detail-close" class="btn-ghost" type="button" aria-label="Cerrar detalle">✕</button>
       </div>
       <div class="detail-grid" id="detail-body"></div>
@@ -88,6 +104,19 @@
       <div id="logs" class="logs" role="log" aria-live="off"></div>
     </section>
   </main>
+
+  <dialog id="confirm" class="dialog" aria-labelledby="confirm-title">
+    <form method="dialog">
+      <h2 id="confirm-title"></h2>
+      <div id="confirm-body" class="dialog-body"></div>
+      <div class="dialog-actions">
+        <button value="cancel" class="btn" type="submit">Volver</button>
+        <button value="ok" id="confirm-ok" class="btn btn-danger" type="submit"></button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toasts" class="toasts" aria-live="polite"></div>
 
   <script src="/static/app.js"></script>
 </body>

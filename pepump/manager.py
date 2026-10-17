@@ -45,6 +45,11 @@ class ManagedPosition:
     task: asyncio.Task
 
     @property
+    def closable(self) -> bool:
+        """Se le puede pedir el cierre: el bot corre y nadie lo pidió ya."""
+        return not self.task.done() and not self.bot.snapshot()["close_requested"]
+
+    @property
     def active(self) -> bool:
         """Sigue "ocupando" su mint: el bot corre, o terminó dejando la
         posición abierta (venta de cierre fallida -> los tokens siguen en
@@ -131,12 +136,21 @@ class PositionManager:
         self._notify()
         return managed
 
-    def close_all(self, reason: str = "cierre de todas las posiciones") -> None:
-        self._closing_all = True
+    def close_all(self, reason: str = "cierre de todas las posiciones", block_new: bool = True) -> int:
+        """Pide el cierre de todas las posiciones que siguen corriendo y
+        devuelve cuántas eran. `block_new` impide abrir posiciones nuevas
+        desde ese momento: es lo que corresponde al apagar el proceso
+        (Ctrl+C), no a un "cerrar todas" desde la web, tras el que el
+        servicio sigue vivo."""
+        if block_new:
+            self._closing_all = True
+        pedidas = 0
         for managed in list(self._positions.values()):
-            if not managed.task.done():
+            if managed.closable:
                 managed.bot.close(reason)
+                pedidas += 1
         self._notify()
+        return pedidas
 
     async def wait_all(self) -> None:
         """Espera a que terminen TODOS los bots, incluidos los que se abran

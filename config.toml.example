@@ -125,3 +125,14 @@ entry_wait_timeout_seconds = 60.0
 # por slippage excedido).
 tx_confirm_timeout_seconds = 30.0
 tx_confirm_poll_interval_seconds = 2.0
+
+[web]
+# Contraseña del panel web (python run.py ... --web). OPCIONAL: vacía, el
+# panel no pide nada. Si la pones, hay que entrar con ella para verlo y
+# para cerrar posiciones.
+# Ojo: desde la web se pueden CERRAR posiciones (vender). Sin contraseña y
+# con el panel abierto a la red (--web-host 192.168.x.x o 0.0.0.0),
+# cualquiera en esa red puede hacerlo.
+# Si la dejas vacía aquí, también se busca la variable de entorno
+# PEPUMP_WEB_PASSWORD (más seguro que dejarla escrita en este archivo).
+web_password = ""

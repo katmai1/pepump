@@ -8,7 +8,7 @@ import pytest
 from pepump.config import AppConfig, load_config, validate_mint
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-CONFIG_SECTIONS = ("general", "trade", "strategy", "pumpportal", "onchain")
+CONFIG_SECTIONS = ("general", "trade", "strategy", "pumpportal", "onchain", "web")
 # `mint` es el único campo de AppConfig que NO va en el .toml: siempre
 # llega por la línea de comandos (-m/--mint, required en run.py).
 FIELDS_NOT_IN_TOML = {"mint"}

@@ -67,13 +67,35 @@ python run.py -m <MINT> --web 9000                 # otro puerto
 
 Muestra en vivo todas las posiciones (estado, precio, próximo nivel de
 activación o de venta, PnL), el detalle de cada una y los logs filtrables
-por token. Por ahora es **solo lectura**: no compra ni vende nada.
+por token. Desde ahí se puede **cerrar** una posición (vende al precio
+actual, o cancela la entrada si todavía no compró) o cerrarlas todas,
+siempre con confirmación. Abrir posiciones desde la web llegará más
+adelante.
 
-Solo escucha en `127.0.0.1` (esta máquina). `--web-host 0.0.0.0` lo abre a
-la red, pero todavía no tiene contraseña: para verlo desde otro equipo es
-más seguro un túnel SSH (`ssh -L 8080:127.0.0.1:8080 tu-servidor`) o
-Tailscale. Cuando terminan todas las posiciones, el proceso sale y el
-panel se cierra con él.
+Por defecto solo escucha en `127.0.0.1` (esta máquina). Para verlo desde
+la red local, `--web-host <IP de la máquina>` (o `0.0.0.0`). Cuando terminan
+todas las posiciones, el proceso sale y el panel se cierra con él.
+
+**Contraseña (opcional):** `web_password` en la sección `[web]` del `.toml`,
+o la variable de entorno `PEPUMP_WEB_PASSWORD`. Sin ella, cualquiera que
+llegue al puerto puede cerrar posiciones; si el panel escucha en la red sin
+contraseña, el bot lo avisa al arrancar. La web va por HTTP sin cifrar: en
+una red que no sea de confianza, mejor Tailscale o un túnel SSH
+(`ssh -L 8080:127.0.0.1:8080 tu-servidor`).
+
+### Desde otra consola
+
+Con el bot corriendo con `--web`:
+
+```bash
+python ctl.py list                 # posiciones y su estado
+python ctl.py close 2              # cerrar la #2 (o: close <MINT>)
+python ctl.py close-all            # cerrar todas
+python ctl.py --url http://192.168.1.50:9000 list
+```
+
+Pide confirmación (`-y` para saltarla) y, si el panel tiene contraseña, la
+toma de `PEPUMP_WEB_PASSWORD` o la pregunta.
 
 ## Estrategia
 

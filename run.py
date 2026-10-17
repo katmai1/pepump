@@ -84,10 +84,12 @@ def parse_args():
     p.add_argument("-c", "--config", default="config.toml", help="Ruta al archivo .toml de configuración (default: config.toml)")
     p.add_argument("-v", "--verbose", action="store_true", help="Logging en nivel DEBUG en vez de INFO")
     p.add_argument("--web", nargs="?", type=int, const=8080, default=None, metavar="PUERTO",
-                   help="Arranca el panel web (solo lectura) en http://127.0.0.1:PUERTO (default 8080)")
+                   help="Arranca el panel web en http://127.0.0.1:PUERTO (default 8080). Desde la web "
+                        "se pueden ver y CERRAR posiciones")
     p.add_argument("--web-host", default="127.0.0.1",
                    help="Interfaz donde escucha el panel web (default 127.0.0.1: solo esta máquina). "
-                        "0.0.0.0 lo expone a toda la red: NO lo hagas sin saber quién puede entrar")
+                        "Con la IP de la red local (o 0.0.0.0) lo ve toda la red: conviene poner "
+                        "web_password en el .toml")
     p.add_argument("--no-panel", action="store_true",
                    help="Sin panel fijo al pie: el estado se imprime como una línea de log más cada intervalo")
 
@@ -149,14 +151,20 @@ if __name__ == "__main__":
         except OSError as e:
             logger.error(f"No se pudo abrir el panel web en {args.web_host}:{args.web}: {e}")
             sys.exit(1)
-        if not is_loopback(args.web_host):
-            logger.warning(f"⚠️  El panel web escucha en {args.web_host}: cualquiera que llegue a esa "
-                           f"dirección ve tus posiciones (todavía no tiene contraseña). Para verlo "
-                           f"desde otro equipo es más seguro un túnel SSH o Tailscale.")
         log_buffer = LogBuffer()
         logging.getLogger().addHandler(log_buffer)
 
     show_header(config.live)
+    # Después del banner, para que no quede enterrado arriba.
+    if web_sock is not None and not is_loopback(args.web_host):
+        if config.web_password:
+            logger.warning(f"Panel web abierto a la red ({args.web_host}) con contraseña. Va por HTTP "
+                           f"sin cifrar: en una red que no sea de confianza, mejor Tailscale o un túnel SSH.")
+        else:
+            logger.warning(f"⚠️  Panel web abierto a la red ({args.web_host}) SIN contraseña: cualquiera "
+                           f"que llegue a esa dirección puede ver y CERRAR (vender) tus posiciones. "
+                           f"Para pedir contraseña: web_password en [web] del .toml, o la variable de "
+                           f"entorno PEPUMP_WEB_PASSWORD.")
 
     client = PumpPortalClient(api_key=config.api_key)
 
@@ -171,7 +179,8 @@ if __name__ == "__main__":
         if web_sock is not None:
             from pepump.web.server import WebPanel, allowed_hosts_for, create_app
             app = create_app(manager, log_buffer, live=config.live,
-                             allowed_hosts=allowed_hosts_for(args.web_host))
+                             allowed_hosts=allowed_hosts_for(args.web_host),
+                             password=config.web_password)
             web = WebPanel(app, web_sock)
             web.start()
             shown_host = "127.0.0.1" if args.web_host in ("0.0.0.0", "::") else args.web_host
