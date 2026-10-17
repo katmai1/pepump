@@ -241,11 +241,17 @@ function renderTiles() {
           `SOL ${etiqueta}, ${main.closed} ${main.closed === 1 ? "cerrada" : "cerradas"}${aparte(other && other.realized, fmtSolSigned)}`);
 }
 
+// Sigue en la página principal: el bot corre, o terminó dejando la posición
+// abierta (venta fallida, hay que revisarla). Las cerradas o canceladas
+// pasan al historial.
+const isActive = (snap) => snap.running || Boolean(snap.position && !snap.position.closed);
+
 function renderTable(now) {
   const tbody = document.querySelector("#positions tbody");
   const rows = [];
+  const visibles = state.positions.filter(isActive);
   // Más recientes arriba.
-  for (const snap of [...state.positions].reverse()) {
+  for (const snap of [...visibles].reverse()) {
     const pos = snap.position;
     const st = statusOf(snap);
     const lvl = nextLevel(snap);
@@ -298,8 +304,8 @@ function renderTable(now) {
     const target = focusedAction ? row?.querySelector(`[data-action="${focusedAction}"]`) : row;
     (target || row)?.focus();
   }
-  document.getElementById("empty").hidden = state.positions.length > 0;
-  document.getElementById("positions").hidden = state.positions.length === 0;
+  document.getElementById("empty").hidden = visibles.length > 0;
+  document.getElementById("positions").hidden = visibles.length === 0;
 }
 
 // ---------------------------------------------------------------- órdenes
@@ -501,6 +507,7 @@ const BUY_OVERHEAD_SOL = 0.004;
 const fmtWalletSol = (sol) => sol.toFixed(9);
 
 let walletEvents = null; // firma de las compras/ventas reales ya vistas
+let finishedIds = null; // ids de las posiciones de la sesión que ya terminaron
 
 // fresh: sin la caché del servidor (tras una compra/venta, o a mano).
 async function loadWallet({ fresh = false, notify = false } = {}) {
@@ -703,7 +710,7 @@ async function doSubmitNewPosition() {
 
 function renderNewButton() {
   const button = document.getElementById("new-position");
-  const activas = state.positions.filter((p) => p.running || (p.position && !p.position.closed)).length;
+  const activas = state.positions.filter(isActive).length;
   const max = defaults ? defaults.max_open_positions : null;
   const full = max !== null && activas >= max;
   button.disabled = full;
@@ -719,7 +726,7 @@ function kv(label, value, opts = {}) {
 
 function renderDetail() {
   const box = document.getElementById("detail");
-  const snap = state.positions.find((p) => p.id === state.selectedId);
+  const snap = state.positions.find((p) => p.id === state.selectedId && isActive(p));
   if (!snap) {
     box.hidden = true;
     return;
@@ -954,6 +961,10 @@ function applyState(s) {
     .map((p) => `${p.id}:${p.position.closed ? "c" : "o"}`).join(",");
   if (walletEvents !== null && firma !== walletEvents) loadWallet({ fresh: true });
   walletEvents = firma;
+  // Una posición terminó: pasa al historial; si se está mirando, se recarga.
+  const terminadas = s.positions.filter((p) => !isActive(p)).map((p) => p.id).join(",");
+  if (finishedIds !== null && terminadas !== finishedIds && state.view === "history") loadHistory();
+  finishedIds = terminadas;
   serverOffset = s.server_time - Date.now() / 1000;
   render();
 }
