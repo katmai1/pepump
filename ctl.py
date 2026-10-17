@@ -4,7 +4,7 @@ Controla un PePump que ya está corriendo con --web, desde otra consola:
     python ctl.py list                 # posiciones y su estado
     python ctl.py open <MINT>          # abrir (comprar) con los ajustes del .toml
     python ctl.py open <MINT> --sol 0.1 --trailing 12
-    python ctl.py open <MINT> --real   # con SOL real (o --sim); sin poner, el del .toml
+    python ctl.py open <MINT> --real   # con SOL real; sin --real, simulada
     python ctl.py close 2              # cerrar (vender) la #2
     python ctl.py close <MINT>         # ... o por mint
     python ctl.py close-all            # cerrar todas
@@ -55,7 +55,7 @@ def parse_args():
     modo = op.add_mutually_exclusive_group()
     modo.add_argument("--real", dest="live", action="store_true", default=None,
                       help="Compra con SOL REAL")
-    modo.add_argument("--sim", dest="live", action="store_false", help="Posición simulada")
+    modo.add_argument("--sim", dest="live", action="store_false", help="Posición simulada (por defecto)")
     close = sub.add_parser("close", help="Cierra (vende) una posición")
     close.add_argument("ref", help="Número de la posición (#) o su mint")
     sub.add_parser("close-all", help="Cierra todas las posiciones activas")
@@ -142,7 +142,8 @@ def main():
                     if getattr(args, campo) is not None}
         if args.pool:
             settings["pool"] = args.pool
-        live = defaults["settings"]["live"] if args.live is None else args.live
+        # Igual que en la web: simulada salvo que se pida --real a propósito.
+        live = bool(args.live)
         settings["live"] = live
         r = s.get(f"{url}/api/preview", params={"mint": args.mint}, timeout=30)
         if r.status_code != 200:

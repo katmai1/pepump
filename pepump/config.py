@@ -66,6 +66,11 @@ class AppConfig:
 
     # --- [pumpportal] ----------------------------------------------------- #
     api_key: str = ""  # también se puede definir con la variable de entorno PUMPPORTAL_API_KEY
+    # Dirección PÚBLICA de la wallet asociada a la api_key (opcional). La API
+    # de PumpPortal no la da: sin esto, el bot solo la conoce tras la primera
+    # compra real. Con ella, la web muestra el saldo desde el arranque y se
+    # comprueba que haya SOL antes de cada compra real.
+    wallet_address: str = ""
 
     # --- [web] -------------------------------------------------------------- #
     # Contraseña del panel web (--web). Opcional: vacía, el panel no pide
@@ -216,6 +221,13 @@ def validate_config(config: AppConfig) -> None:
     positivo("onchain.tx_confirm_timeout_seconds", config.tx_confirm_timeout_seconds)
     positivo("onchain.tx_confirm_poll_interval_seconds", config.tx_confirm_poll_interval_seconds)
 
+    if config.wallet_address:
+        try:
+            validate_mint(config.wallet_address)  # misma validación: pubkey base58
+        except ValueError:
+            errores.append(f"pumpportal.wallet_address no es una dirección válida de Solana "
+                           f"({config.wallet_address!r})")
+
     if not str(config.solana_rpc_url).startswith(("http://", "https://")):
         errores.append(f"onchain.solana_rpc_url tiene que ser una URL http(s) "
                        f"(está en {config.solana_rpc_url!r})")
@@ -282,6 +294,7 @@ def load_config(path: str) -> AppConfig:
     if not config.api_key:
         config.api_key = os.environ.get("PUMPPORTAL_API_KEY", "")
     config.api_key = config.api_key.strip()
+    config.wallet_address = config.wallet_address.strip()
 
     if not config.api_key:
         raise ValueError(

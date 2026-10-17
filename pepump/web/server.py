@@ -10,6 +10,8 @@ intermedia.
   POST /api/logout
   GET  /api/state                     modo + todas las posiciones
   GET  /api/positions/{id}            una posición
+  GET  /api/positions/{id}/prices     precios para el gráfico (?after=<ts>)
+  GET  /api/wallet                    dirección y saldo de SOL de la wallet
   GET  /api/defaults                  ajustes por defecto y límites (formulario)
   GET  /api/preview?mint=...          qué es un mint antes de comprar
   POST /api/positions                 abrir (comprar) una posición
@@ -188,7 +190,7 @@ def create_app(manager: PositionManager, logs: LogBuffer, *, live: bool,
         # casaba con el HTML nuevo. Ahora cada referencia lleva la versión
         # del archivo (?v=...), así que al cambiar se piden de nuevo seguro.
         html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
-        for asset in ("app.js", "style.css"):
+        for asset in ("app.js", "chart.js", "style.css"):
             html = html.replace(f"/static/{asset}\"", f"/static/{asset}?v={_asset_version(asset)}\"")
         return HTMLResponse(html, headers={"Cache-Control": "no-store"})
 
@@ -240,6 +242,19 @@ def create_app(manager: PositionManager, logs: LogBuffer, *, live: bool,
         if managed is None:
             raise HTTPException(status_code=404, detail="No existe esa posición")
         return {"id": managed.id, **managed.bot.snapshot()}
+
+    @app.get("/api/positions/{pos_id}/prices", dependencies=lectura)
+    async def get_prices(pos_id: int, after: float = 0.0, max_points: int = 1500):
+        managed = manager.get(pos_id)
+        if managed is None:
+            raise HTTPException(status_code=404, detail="No existe esa posición")
+        points = [p for p in managed.bot.price_history if p[0] > after]
+        return {"points": downsample(points, max(50, min(max_points, 5000)))}
+
+    @app.get("/api/wallet", dependencies=lectura)
+    async def get_wallet(fresh: bool = False):
+        # fresh=1 (al pulsar sobre el saldo): sin la caché de 20 s.
+        return await manager.wallet_info(max_age=0 if fresh else 20.0)
 
     @app.get("/api/logs", dependencies=lectura)
     async def get_logs(mint: Optional[str] = None, after: int = 0, limit: int = 500):
@@ -297,7 +312,13 @@ def create_app(manager: PositionManager, logs: LogBuffer, *, live: bool,
             else:
                 value = float(value)
             overrides[key] = value
+        defaults = manager.defaults()["settings"]
+        live = overrides.get("live", defaults["live"])
         try:
+            if live:
+                # Saldo fresco antes de una compra REAL (ver check_funds).
+                await manager.check_funds(overrides.get("buy_sol", defaults["buy_sol"]),
+                                          overrides.get("priority_fee", defaults["priority_fee"]))
             managed = manager.open(mint, **overrides)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
@@ -374,6 +395,27 @@ def create_app(manager: PositionManager, logs: LogBuffer, *, live: bool,
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     return app
+
+
+def downsample(points: list, max_points: int) -> list:
+    """Reduce una serie (ts, precio) a ~max_points para el gráfico SIN
+    perder picos: por cada tramo se quedan su mínimo y su máximo (en orden
+    de tiempo), además del primer y el último punto de la serie."""
+    if len(points) <= max_points:
+        return [list(p) for p in points]
+    buckets = max(1, max_points // 2)
+    size = len(points) / buckets
+    out = [list(points[0])]
+    for i in range(buckets):
+        chunk = points[int(i * size):int((i + 1) * size)]
+        if not chunk:
+            continue
+        lo = min(chunk, key=lambda p: p[1])
+        hi = max(chunk, key=lambda p: p[1])
+        for p in sorted({lo, hi}, key=lambda p: p[0]):
+            out.append(list(p))
+    out.append(list(points[-1]))
+    return out
 
 
 def _asset_version(name: str) -> str:

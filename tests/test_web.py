@@ -28,6 +28,7 @@ class FakeManaged:
     def __init__(self, snap):
         self.id = snap["id"]
         self.bot = FakeBot(snap)
+        self.bot.price_history = [(100.0 + i, 1.0 + i) for i in range(10)]
         self.config = type("Cfg", (), {"live": snap.get("live", False)})()
 
     @property
@@ -60,8 +61,19 @@ class FakeManager:
         return [{"id": 99, "mint": A, "status": "closed", "realized_pnl_pct": 12.5}][:limit]
 
     def defaults(self):
-        return {"live": False, "settings": {"buy_sol": 0.05}, "max_buy_sol": 0.5,
+        return {"live": False, "settings": {"live": False, "buy_sol": 0.05, "priority_fee": 1e-5},
+                "max_buy_sol": 0.5,
                 "max_open_positions": 10, "active_positions": 1, "accepting_new": True}
+
+    wallet_sol = 1.0
+
+    async def wallet_info(self, max_age=20):
+        return {"address": "W", "sol": self.wallet_sol, "source": "config"}
+
+    async def check_funds(self, buy_sol, priority_fee):
+        self.funds_checked = (buy_sol, priority_fee)
+        if buy_sol + priority_fee > self.wallet_sol:
+            raise ValueError("Saldo insuficiente: la wallet tiene 0.0100 SOL")
 
     async def preview(self, mint):
         if mint == "malo":
@@ -391,3 +403,48 @@ def test_preview_con_cache_y_errores():
     assert client.get("/api/preview", params={"mint": "malo"}, headers=PAGE).status_code == 400
     # Sin la cabecera del panel no se gasta RPC.
     assert client.get("/api/preview", params={"mint": A}).status_code == 403
+
+
+
+# --------------------------------------------------------------------------- #
+# Wallet y gráfico (paso 7)
+# --------------------------------------------------------------------------- #
+
+def test_wallet():
+    client, _ = make_client()
+    assert client.get("/api/wallet").json() == {"address": "W", "sol": 1.0, "source": "config"}
+
+
+def test_compra_real_comprueba_el_saldo_antes():
+    client, _ = make_client()
+    client.manager.wallet_sol = 0.01
+    r = client.post("/api/positions", headers=PAGE, json={"mint": A, "settings": {"live": True}})
+    assert r.status_code == 400 and "Saldo insuficiente" in r.json()["detail"]
+    assert client.manager.funds_checked == (0.05, 1e-5)
+    assert not hasattr(client.manager, "opened")
+    # Una simulada no mira el saldo.
+    client.manager.funds_checked = None
+    r = client.post("/api/positions", headers=PAGE, json={"mint": A, "settings": {"live": False}})
+    assert r.status_code == 200 and client.manager.funds_checked is None
+
+
+def test_precios_para_el_grafico():
+    client, _ = make_client()
+    puntos = client.get("/api/positions/1/prices").json()["points"]
+    assert len(puntos) == 10 and puntos[0] == [100.0, 1.0]
+    # Solo los nuevos (para ir actualizando el gráfico).
+    assert client.get("/api/positions/1/prices", params={"after": 107.0}).json()["points"] == [[108.0, 9.0], [109.0, 10.0]]
+    assert client.get("/api/positions/9/prices").status_code == 404
+
+
+def test_downsample_conserva_los_picos():
+    from pepump.web.server import downsample
+    serie = [(float(i), 1.0) for i in range(10_000)]
+    serie[5_000] = (5_000.0, 50.0)   # un pico de un solo punto
+    serie[7_000] = (7_000.0, 0.01)   # una caída de un solo punto
+    out = downsample(serie, 200)
+    assert len(out) <= 205
+    precios = [p[1] for p in out]
+    assert 50.0 in precios and 0.01 in precios
+    assert out[0] == [0.0, 1.0] and out[-1] == [9_999.0, 1.0]
+    assert [p[0] for p in out] == sorted(p[0] for p in out)

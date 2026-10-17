@@ -173,6 +173,10 @@ if __name__ == "__main__":
                            f"entorno PEPUMP_WEB_PASSWORD.")
 
     client = PumpPortalClient(api_key=config.api_key)
+    if config.wallet_address:
+        # Para mirar balances (saldo, tokens al retomar) desde el arranque,
+        # sin esperar a aprenderla de la primera compra.
+        client.wallet_address = config.wallet_address
 
     store = None
     if config.state_db:
@@ -224,6 +228,8 @@ if __name__ == "__main__":
                     logger.info(f"{mint} ya estaba abierta y se retomó: no se abre otra.")
                     continue
                 try:
+                    if config.live:
+                        await manager.check_funds(config.buy_sol, config.priority_fee)
                     manager.open(mint)
                 except ValueError as e:
                     logger.error(f"No se abre {mint}: {e}")

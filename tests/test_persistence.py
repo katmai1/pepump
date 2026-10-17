@@ -251,3 +251,53 @@ async def test_ids_persistentes_e_historial(store):
     manager2.stop_all("fin")
     await asyncio.wait_for(manager2.wait_all(), 5)
     await manager2.aclose()
+
+
+async def test_precios_y_armado_se_guardan_y_vuelven_al_retomar(store):
+    manager, conns, _ = make_manager(store)
+    managed = manager.open(A)
+    for p in (1.0, 1.3):  # compra y arma (+30 %, salto > 3 %: se guardan los dos)
+        await _precio(manager, conns, A, p)
+        await asyncio.sleep(0.05)
+    await _hasta(lambda: managed.bot.position is not None and managed.bot.position.armed)
+    manager.stop_all("fin")
+    await asyncio.wait_for(manager.wait_all(), 5)
+    await manager.aclose()
+
+    assert [p for _ts, p in store.prices(managed.id)] == [1.0, 1.3]
+    armed_at = store.get(managed.id)["armed_at"]
+    assert armed_at is not None
+
+    manager2, _, _ = make_manager(store)
+    (retomada,) = await manager2.recover()
+    assert [p for _ts, p in retomada.bot.price_history] == [1.0, 1.3]
+    assert retomada.bot.position.armed_at == armed_at
+    manager2.stop_all("fin")
+    await asyncio.wait_for(manager2.wait_all(), 5)
+    await manager2.aclose()
+
+
+def test_migra_una_base_de_datos_del_esquema_1(tmp_path):
+    import sqlite3
+    path = str(tmp_path / "v1.db")
+    db = sqlite3.connect(path)
+    db.executescript("""
+        CREATE TABLE positions (id INTEGER PRIMARY KEY AUTOINCREMENT, mint TEXT NOT NULL, live INTEGER NOT NULL,
+            created_at REAL NOT NULL, status TEXT NOT NULL, settings_json TEXT NOT NULL, token_name TEXT,
+            token_symbol TEXT, entry_price REAL, market_entry_price REAL, sol_amount REAL, token_amount REAL,
+            entry_is_real_fill INTEGER NOT NULL DEFAULT 0, opened_at REAL, onchain_source TEXT,
+            armed INTEGER NOT NULL DEFAULT 0, highest_price REAL, closed_at REAL, exit_price REAL,
+            proceeds_sol REAL, realized_pnl_sol REAL, realized_pnl_pct REAL, close_reason TEXT,
+            exit_is_real_fill INTEGER NOT NULL DEFAULT 0, end_reason TEXT, updated_at REAL NOT NULL);
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO positions (mint, live, created_at, status, settings_json, updated_at)
+            VALUES ('So11111111111111111111111111111111111111112', 0, 1, 'open', '{}', 1);
+        PRAGMA user_version = 1;
+    """)
+    db.close()
+    s = PositionStore(path)
+    assert s.get(1)["armed_at"] is None  # columna nueva, sin perder la fila
+    s.update(1, {"armed_at": 5.0})
+    s.add_price(1, 1.0, 2.0)
+    assert s.prices(1) == [(1.0, 2.0)]
+    s.close()

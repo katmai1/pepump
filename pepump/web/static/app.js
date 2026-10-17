@@ -25,6 +25,8 @@ const state = {
   logs: [],
   selectedId: null,
   logFilter: "",
+  view: "main",      // "main" (posiciones) o "history"
+  wallet: null,      // {address, sol, source} de /api/wallet
 };
 
 // ------------------------------------------------------------------ formato
@@ -183,10 +185,9 @@ function renderMode() {
   const badge = document.getElementById("mode");
   if (state.live === null) return;
   const reales = state.positions.filter((p) => p.live && p.running).length;
-  badge.hidden = false;
-  badge.textContent = reales ? `⚠ ${reales} ${reales === 1 ? "posición REAL" : "posiciones REALES"}` : "Simulado";
-  badge.title = `Modo por defecto de las posiciones nuevas: ${state.live ? "REAL" : "simulado"} (general.live)`;
-  badge.classList.toggle("live", reales > 0);
+  // Solo aparece si hay dinero real en juego.
+  badge.hidden = reales === 0;
+  badge.textContent = `⚠ ${reales} ${reales === 1 ? "posición REAL" : "posiciones REALES"}`;
   document.title = reales ? `PePump · ${reales} REAL` : "PePump";
 }
 
@@ -227,7 +228,9 @@ function renderTiles() {
   document.getElementById("t-active").textContent = String(running.length);
   document.getElementById("t-active-sub").textContent =
     running.length
-      ? `${nReal} ${nReal === 1 ? "real" : "reales"} · ${running.length - nReal} ${running.length - nReal === 1 ? "simulada" : "simuladas"}`
+      ? [nReal ? `${nReal} ${nReal === 1 ? "real" : "reales"}` : null,
+         running.length - nReal ? `${running.length - nReal} ${running.length - nReal === 1 ? "simulada" : "simuladas"}` : null]
+          .filter(Boolean).join(" · ")
       : `de ${ps.length} en esta sesión`;
 
   setTile("t-invested", null, main.invested === null ? "—" : fmtSol(main.invested),
@@ -439,7 +442,8 @@ const field = (name) => openForm().elements[name];
 
 function fillDefaults() {
   for (const name of [...NUMERIC_FIELDS, ...TEXT_FIELDS]) field(name).value = defaults.settings[name];
-  field("mode").value = defaults.settings.live ? "real" : "sim";
+  // Siempre empieza en simulado: lo real se elige a propósito, cada vez.
+  field("mode").value = "sim";
   updateModeUI();
 }
 
@@ -454,6 +458,75 @@ function updateModeUI() {
   submit.textContent = real ? "Revisar y comprar con SOL real…" : "Revisar y comprar (simulado)…";
   submit.classList.toggle("btn-danger", real);
   submit.classList.toggle("btn-primary", !real);
+  if (real) loadWallet();  // saldo al momento de decidir una compra real
+  renderFormWallet();
+}
+
+// En modo real, el saldo de la wallet al lado del importe (y aviso si no
+// llega). El servidor lo vuelve a comprobar, con saldo fresco, al comprar.
+function renderFormWallet() {
+  const note = document.getElementById("f-wallet");
+  if (!chosenReal()) {
+    note.hidden = true;
+    return;
+  }
+  note.hidden = false;
+  note.className = "wallet-note";
+  const w = state.wallet;
+  if (!w || !w.address) {
+    note.textContent = "Saldo desconocido: pon tu wallet_address en [pumpportal] del .toml para verlo.";
+    return;
+  }
+  if (w.sol === null) {
+    note.textContent = "No se pudo consultar el saldo de la wallet (¿RPC?).";
+    return;
+  }
+  const buy = Number(field("buy_sol").value.replace(",", ".")) || 0;
+  const fee = Number(field("priority_fee").value.replace(",", ".")) || 0;
+  const needed = buy + fee + BUY_OVERHEAD_SOL;
+  if (w.sol < needed) {
+    note.classList.add("bad");
+    note.textContent = `Saldo insuficiente: ${fmtWalletSol(w.sol)} SOL en la wallet; esta compra necesita unos ${needed.toFixed(4)}.`;
+  } else {
+    note.textContent = `Saldo de la wallet: ${fmtWalletSol(w.sol)} SOL`;
+  }
+}
+
+// Mismo margen que manager.BUY_OVERHEAD_SOL (rent de la cuenta del token y comisiones).
+const BUY_OVERHEAD_SOL = 0.004;
+
+// ------------------------------------------------------------------ wallet
+
+// Saldo completo: SOL tiene 9 decimales (1 lamport = 0,000000001 SOL).
+const fmtWalletSol = (sol) => sol.toFixed(9);
+
+let walletEvents = null; // firma de las compras/ventas reales ya vistas
+
+// fresh: sin la caché del servidor (tras una compra/venta, o a mano).
+async function loadWallet({ fresh = false, notify = false } = {}) {
+  try {
+    state.wallet = await api(`/api/wallet${fresh ? "?fresh=1" : ""}`);
+  } catch {
+    return;
+  }
+  if (notify) toast("Saldo actualizado.");
+  renderWallet();
+  if (document.getElementById("open-dialog").open) renderFormWallet();
+}
+
+function renderWallet() {
+  const box = document.getElementById("wallet");
+  const w = state.wallet;
+  if (!w) return;
+  box.hidden = false;
+  if (!w.address) {
+    box.replaceChildren("Wallet: sin configurar");
+    box.title = "Pon la dirección pública de tu wallet en wallet_address, sección [pumpportal] del .toml";
+    return;
+  }
+  box.title = `${w.address}${w.source === "learned" ? " (aprendida de la última compra)" : ""} · pulsa para actualizar el saldo`;
+  box.replaceChildren(`Wallet ${shortMint(w.address)}: `,
+                      el("strong", {}, w.sol === null ? "—" : fmtWalletSol(w.sol)), " SOL");
 }
 
 async function openNewPosition() {
@@ -659,6 +732,7 @@ function renderDetail() {
   const st = statusOf(snap);
   const name = snap.token_name && snap.token_symbol ? `${snap.token_name} ($${snap.token_symbol})` : tokenTitle(snap);
   document.getElementById("detail-title").textContent = `#${snap.id} · ${name}`;
+  updateChart(snap);
   const detailAction = actionButton(snap);
   document.getElementById("detail-actions").replaceChildren(...(detailAction ? [detailAction] : []));
 
@@ -773,6 +847,46 @@ function renderLogFilterOptions() {
   select.value = state.logFilter;
 }
 
+// ----------------------------------------------------------------- gráfico
+
+let chart = null;
+const chartData = { id: null, points: [], lastFetch: 0, loading: false };
+
+async function fetchPrices(id, after) {
+  chartData.loading = true;
+  try {
+    const width = document.getElementById("chart-box").clientWidth || 800;
+    const res = await api(`/api/positions/${id}/prices?after=${after}&max_points=${Math.round(width * 2)}`);
+    if (chartData.id !== id) return;
+    if (after === 0) chartData.points = res.points;
+    else chartData.points.push(...res.points);
+    chartData.lastFetch = Date.now();
+  } catch {
+    /* se reintenta en el próximo refresco */
+  } finally {
+    chartData.loading = false;
+  }
+}
+
+function updateChart(snap) {
+  const figure = document.getElementById("chart");
+  figure.hidden = false;
+  if (!chart) {
+    chart = new PriceChart(document.getElementById("chart-box"), document.getElementById("chart-legend"),
+                           document.getElementById("chart-caption"), fmtPrice);
+  }
+  if (chartData.id !== snap.id) {
+    chartData.id = snap.id;
+    chartData.points = [];
+    chartData.lastFetch = 0;
+    fetchPrices(snap.id, 0).then(() => chart.render(snap, chartData.points, Date.now() / 1000 + serverOffset));
+  } else if (!chartData.loading && snap.running && Date.now() - chartData.lastFetch > 2000) {
+    const last = chartData.points.length ? chartData.points[chartData.points.length - 1][0] : 0;
+    fetchPrices(snap.id, last);
+  }
+  chart.render(snap, chartData.points, Date.now() / 1000 + serverOffset);
+}
+
 // --------------------------------------------------------------- historial
 
 const HISTORY_STATUS = {
@@ -793,8 +907,8 @@ async function loadHistory() {
   } catch {
     return;
   }
-  const box = document.getElementById("history");
-  box.hidden = rows.length === 0;
+  document.getElementById("history-empty").hidden = rows.length > 0;
+  document.querySelector("#history table").hidden = rows.length === 0;
   document.querySelector("#history tbody").replaceChildren(...rows.map((r) => {
     const title = r.token_symbol ? `$${r.token_symbol}` : shortMint(r.mint);
     return el("tr", {},
@@ -835,6 +949,11 @@ function render() {
 function applyState(s) {
   state.live = s.live;
   state.positions = s.positions;
+  // Una posición REAL compró o vendió: el saldo de la wallet cambió.
+  const firma = s.positions.filter((p) => p.live && p.position)
+    .map((p) => `${p.id}:${p.position.closed ? "c" : "o"}`).join(",");
+  if (walletEvents !== null && firma !== walletEvents) loadWallet({ fresh: true });
+  walletEvents = firma;
   serverOffset = s.server_time - Date.now() / 1000;
   render();
 }
@@ -862,7 +981,7 @@ function connect() {
       state.logs = msg.logs.slice(-MAX_LOGS);
       applyState(msg.state);
       renderLogs();
-      loadHistory();
+      if (state.view === "history") loadHistory();
     } else if (msg.type === "state") {
       applyState(msg.state);
     } else if (msg.type === "logs") {
@@ -887,6 +1006,8 @@ let connected = false;
 
 function showLogin() {
   document.getElementById("app").hidden = true;
+  document.getElementById("nav").hidden = true;
+  document.getElementById("wallet").hidden = true;
   document.getElementById("login").hidden = false;
   document.getElementById("logout").hidden = true;
   setConn("down", "Sin sesión");
@@ -897,6 +1018,9 @@ function showLogin() {
 function showApp(authRequired) {
   document.getElementById("login").hidden = true;
   document.getElementById("app").hidden = false;
+  document.getElementById("nav").hidden = false;
+  showView();
+  loadWallet();
   document.getElementById("logout").hidden = !authRequired;
   if (!connected) {
     connected = true;
@@ -973,6 +1097,13 @@ document.getElementById("open-cancel").addEventListener("click", () => document.
 document.getElementById("f-mint").addEventListener("input", onMintInput);
 document.getElementById("f-reset").addEventListener("click", fillDefaults);
 document.getElementById("f-mode").addEventListener("change", updateModeUI);
+for (const name of ["buy_sol", "priority_fee"]) {
+  document.getElementById("open-form").elements[name].addEventListener("input", renderFormWallet);
+}
+// El saldo NO se consulta periódicamente (cada consulta gasta una llamada
+// del RPC): solo al cargar, al elegir Real en el formulario, cuando una
+// posición real compra o vende (ver walletEvents) y al pulsar sobre él.
+document.getElementById("wallet").addEventListener("click", () => loadWallet({ fresh: true, notify: true }));
 for (const id of ["positions", "detail"]) {
   const zone = document.getElementById(id);
   zone.addEventListener("pointerdown", () => { pointerDown = true; });
@@ -998,16 +1129,30 @@ document.getElementById("detail-close").addEventListener("click", () => {
   render();
 });
 
-// La posición seleccionada va en la URL (#pos=3): enlace directo y se
-// mantiene al recargar.
+// La URL dice qué se ve: #historial, o la posición seleccionada (#pos=3).
+// Así hay enlace directo y se mantiene al recargar.
 function syncHash() {
   history.replaceState(null, "", state.selectedId === null ? location.pathname : `#pos=${state.selectedId}`);
 }
 function readHash() {
-  const m = location.hash.match(/^#pos=(\d+)$/);
-  state.selectedId = m ? Number(m[1]) : null;
+  if (location.hash === "#historial") {
+    state.view = "history";
+  } else {
+    state.view = "main";
+    const m = location.hash.match(/^#pos=(\d+)$/);
+    state.selectedId = m ? Number(m[1]) : null;
+  }
 }
-window.addEventListener("hashchange", () => { readHash(); render(); });
+function showView() {
+  document.getElementById("view-main").hidden = state.view !== "main";
+  document.getElementById("view-history").hidden = state.view !== "history";
+  for (const a of document.querySelectorAll("#nav a")) {
+    if (a.dataset.view === state.view) a.setAttribute("aria-current", "page");
+    else a.removeAttribute("aria-current");
+  }
+  if (state.view === "history") loadHistory();
+}
+window.addEventListener("hashchange", () => { readHash(); showView(); render(); });
 readHash();
 document.getElementById("log-filter").addEventListener("change", (e) => {
   state.logFilter = e.target.value;

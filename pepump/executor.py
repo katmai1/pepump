@@ -33,6 +33,7 @@ class Position:
     market_entry_price: Optional[float] = None
     highest_price: float = field(init=False)
     armed: bool = False                # ¿ya se activó el trailing stop?
+    armed_at: Optional[float] = None   # time.time() de cuándo se armó (para el gráfico)
     closed: bool = False
     # True si entry_price/sol_amount/token_amount salen de los balances
     # REALES pre/post de la transacción de compra confirmada (ver

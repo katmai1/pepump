@@ -98,6 +98,13 @@ strategy_price_basis = "real"
 # PUMPPORTAL_API_KEY (más seguro que dejarla escrita en este archivo).
 api_key = ""
 
+# Dirección PÚBLICA de la wallet de esa api_key (la que ves en Phantom,
+# Solflare...; NUNCA la clave privada). Opcional: la API de PumpPortal no la
+# da, así que sin esto el bot solo la conoce después de la primera compra
+# real. Con ella, el panel web muestra el saldo desde el arranque y, antes de
+# cada compra real, comprueba que haya SOL suficiente.
+wallet_address = ""
+
 [onchain]
 # Cuántos segundos se espera el precio por el feed en vivo ANTES de recurrir
 # al fallback on-chain, PARA LA ENTRADA (todavía sin posición abierta). Solo

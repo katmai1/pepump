@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import logging
 import time
+from collections import deque
 from typing import AsyncIterator, Optional
 
 from pepump.executor import Position
@@ -26,6 +27,15 @@ _DIAGNOSTIC_REMINDER_SECONDS = 10.0
 # default son 20s de ceguera por precio. Se reinicia en cuanto vuelve
 # a llegar un trade real (ver _consume_trade_stream).
 _MAX_CURVE_STALLS_BEFORE_POLLING = 2
+
+# Muestreo de precios para el gráfico de la web (ver _record_price): como
+# mucho un punto cada _PRICE_SAMPLE_SECONDS, salvo que el precio se mueva
+# más de _PRICE_SAMPLE_JUMP desde el último punto guardado (un pico o una
+# caída brusca no se pueden perder entre muestras).
+_PRICE_SAMPLE_SECONDS = 2.0
+_PRICE_SAMPLE_JUMP = 0.03
+# Puntos que se guardan en memoria por posición (~11 h a un punto cada 2 s).
+_PRICE_HISTORY_MAX = 20_000
 
 # Mientras la comprobación temprana de existencia on-chain (ver
 # _confirm_mint_not_pumpfun / _get_reference_price) todavía no terminó,
@@ -64,7 +74,11 @@ class TrailingTakeProfitBot:
         # solo la vigila.
         self.position: Optional[Position] = resume_position
         self.recovered = resume_position is not None
-        self.latest_price: Optional[float] = None
+        # Historial de precios (ts, precio) para el gráfico; ver _record_price.
+        self.price_history: deque = deque(maxlen=_PRICE_HISTORY_MAX)
+        # Lo pone el gestor: guarda cada punto en la base de datos.
+        self._price_cb = None
+        self._latest_price: Optional[float] = None
         self._closed_event = asyncio.Event()
         self._ws = None
         self._trade_events: Optional[AsyncIterator[dict]] = None
@@ -222,6 +236,31 @@ class TrailingTakeProfitBot:
         self._close_reason = reason
         self._close_mode = "keep"
         self._shutdown_requested.set()
+
+    @property
+    def latest_price(self) -> Optional[float]:
+        return self._latest_price
+
+    @latest_price.setter
+    def latest_price(self, price: Optional[float]) -> None:
+        # TODOS los caminos que actualizan el precio (feed en vivo, polling
+        # on-chain, fallbacks, espera de la baja de entrada) pasan por aquí.
+        self._latest_price = price
+        if price is not None and price > 0:
+            self._record_price(time.time(), price)
+
+    def _record_price(self, ts: float, price: float) -> None:
+        if self.price_history:
+            last_ts, last_price = self.price_history[-1]
+            if (ts - last_ts < _PRICE_SAMPLE_SECONDS
+                    and abs(price / last_price - 1.0) < _PRICE_SAMPLE_JUMP):
+                return
+        self.price_history.append((ts, price))
+        if self._price_cb is not None:
+            try:
+                self._price_cb(ts, price)
+            except Exception as e:
+                logger.debug(f"No se pudo guardar el punto de precio: {e!r}")
 
     def _persist(self) -> None:
         """Guarda el estado actual (ver store.py). Un fallo al guardar se
@@ -1443,6 +1482,7 @@ class TrailingTakeProfitBot:
             "token_amount": pos.token_amount,
             "opened_at": pos.opened_at,
             "armed": pos.armed,
+            "armed_at": pos.armed_at,
             "highest_price": pos.highest_price,
             "activation_price": entry * (1 + cfg.activation_pct / 100.0),
             "initial_stop_price": entry * (1 - cfg.initial_stop_pct / 100.0),
@@ -1603,6 +1643,7 @@ class TrailingTakeProfitBot:
         if not pos.armed:
             if price >= entry * (1 + self.cfg.activation_pct / 100.0):
                 pos.armed = True
+                pos.armed_at = time.time()
                 pos.highest_price = price
                 self._persist()
                 logger.info(f"✅ Trailing-stop ARMADO. Precio actual {price:.10f} "

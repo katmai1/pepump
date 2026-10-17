@@ -95,13 +95,22 @@ que quedaron abiertas) y todo se hace desde el navegador:
   Siempre con confirmación (en rojo si es real).
 - **Cerrar** una posición (vende al precio actual, o cancela la entrada si
   todavía no compró) o **cerrarlas todas**, también con confirmación.
-- En vivo: estado, precio, próximo nivel de activación o de venta, PnL,
-  detalle de cada posición, historial y logs filtrables por token.
+- En vivo: estado, precio, próximo nivel de activación o de venta, PnL y
+  logs filtrables por token. Al pulsar una posición, su **gráfico de
+  precio** con la entrada, la activación, el stop y el nivel de venta del
+  trailing, y las marcas de compra, armado y venta (los precios se guardan:
+  el gráfico sobrevive a un reinicio).
+- **Historial** (pestaña de arriba): todas las posiciones terminadas.
+- **Saldo de la wallet** arriba a la derecha, y antes de cada compra real se
+  comprueba que haya SOL suficiente. Para verlo desde el arranque, pon la
+  dirección pública de tu wallet en `wallet_address` (sección
+  `[pumpportal]`); si no, el bot la aprende en la primera compra real.
 
 Solo se sale con `Ctrl+C` (sin vender, salvo `--sell-on-exit`).
 
-**Real o simulada, por posición:** `general.live` del `.toml` es solo el modo
-por defecto del formulario (y de `-m`). Cada posición lleva su modo, se
+**Real o simulada, por posición:** el formulario y `ctl.py open` empiezan
+siempre en simulado; lo real se elige a propósito cada vez. `general.live` del
+`.toml` solo decide el modo de las posiciones de `-m`. Cada posición lleva su modo, se
 marca con **REAL** en la tabla, y se retoma en ese modo al reiniciar. Las
 cifras de arriba nunca suman dinero real con simulado.
 
@@ -128,7 +137,7 @@ Con el bot corriendo con `--web`:
 python ctl.py list                 # posiciones y su estado
 python ctl.py open <MINT>          # abrir con los ajustes del .toml
 python ctl.py open <MINT> --sol 0.1 --trailing 12   # ... o con otros
-python ctl.py open <MINT> --real   # con SOL real (o --sim); sin poner, general.live
+python ctl.py open <MINT> --real   # con SOL real (sin --real, simulada)
 python ctl.py close 2              # cerrar la #2 (o: close <MINT>)
 python ctl.py close-all            # cerrar todas
 python ctl.py --url http://192.168.1.50:9000 list

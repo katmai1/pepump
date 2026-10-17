@@ -267,3 +267,36 @@ async def test_modo_por_posicion():
     manager.close_all("fin")
     await asyncio.wait_for(manager.wait_all(), 5)
     await manager.aclose()
+
+
+class _ClienteConSaldo:
+    wallet_address = None
+
+    def __init__(self, sol):
+        self.sol = sol
+        self.consultas = 0
+
+    async def get_sol_balance(self, rpc_url, address=None):
+        self.consultas += 1
+        return self.sol
+
+
+async def test_wallet_info_y_check_funds():
+    manager, _, _ = make_manager(wallet_address="So11111111111111111111111111111111111111112")
+    manager.client = _ClienteConSaldo(0.03)
+    info = await manager.wallet_info()
+    assert info["sol"] == 0.03 and info["source"] == "config"
+    await manager.wallet_info()
+    assert manager.client.consultas == 1  # caché
+    with pytest.raises(ValueError, match="Saldo insuficiente"):
+        await manager.check_funds(0.05, 0.00001)
+    await manager.check_funds(0.02, 0.00001)  # 0.02 + fee + margen cabe en 0.03
+    await manager.aclose()
+
+
+async def test_sin_wallet_conocida_no_bloquea():
+    manager, _, _ = make_manager()
+    manager.client = _ClienteConSaldo(None)
+    assert (await manager.wallet_info())["address"] is None
+    await manager.check_funds(100, 0.1)  # no se sabe el saldo: no bloquea
+    await manager.aclose()

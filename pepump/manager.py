@@ -70,6 +70,13 @@ class ManagedPosition:
 
 PositionRef = Union[int, str]
 
+# Lo que cuesta una compra real además de buy_sol: el rent de crear la
+# cuenta del token (~0.00204 SOL), las comisiones de la transacción y de
+# PumpPortal. El priority fee se suma aparte (es configurable).
+BUY_OVERHEAD_SOL = 0.004
+# El saldo de la wallet se recuerda unos segundos (la web lo pide a menudo).
+WALLET_CACHE_SECONDS = 20.0
+
 
 class PositionManager:
     def __init__(self, base_config: AppConfig, client, feed: Optional[SharedTradeFeed] = None,
@@ -94,6 +101,8 @@ class PositionManager:
         self._next_id = 1  # solo sin store; con store, el id lo da la base de datos
         self._closing_all = False
         self._changed = asyncio.Event()
+        self._wallet_cache: Optional[tuple] = None  # (monotonic, address, sol)
+        self._wallet_mismatch_warned = False
 
     # --- control ------------------------------------------------------------ #
     def open(self, mint: str, **overrides) -> ManagedPosition:
@@ -144,6 +153,9 @@ class PositionManager:
         managed = ManagedPosition(id=pos_id, mint=mint, config=cfg, bot=bot, task=task)
         if self.store is not None:
             bot._persist_cb = lambda b, m=managed: self._save(m)
+            # Al retomar, el gráfico sigue desde donde estaba.
+            bot.price_history.extend(self.store.prices(pos_id))
+            bot._price_cb = lambda ts, price, pid=pos_id: self.store.add_price(pid, ts, price)
         # El panel se engancha después de crear el bot porque necesita el
         # ManagedPosition (id) para dibujarse; el bot todavía no corrió
         # ni una línea, así que no se pierde nada.
@@ -236,7 +248,7 @@ class PositionManager:
                 entry_price=pos.entry_price, market_entry_price=pos.market_entry_price,
                 sol_amount=pos.sol_amount, token_amount=pos.token_amount,
                 entry_is_real_fill=int(pos.entry_is_real_fill), opened_at=pos.opened_at,
-                armed=int(pos.armed), highest_price=pos.highest_price,
+                armed=int(pos.armed), armed_at=pos.armed_at, highest_price=pos.highest_price,
                 closed_at=pos.closed_at, exit_price=pos.exit_price, proceeds_sol=pos.proceeds_sol,
                 realized_pnl_sol=pos.realized_pnl_sol, realized_pnl_pct=pos.realized_pnl_pct,
                 close_reason=pos.close_reason, exit_is_real_fill=int(pos.exit_is_real_fill),
@@ -248,6 +260,51 @@ class PositionManager:
         wallet = getattr(self.client, "wallet_address", None)
         if wallet and self.store.get_meta("wallet_address") != wallet:
             self.store.set_meta("wallet_address", wallet)
+        self._check_wallet_mismatch(wallet)
+
+    def _check_wallet_mismatch(self, learned: Optional[str]) -> None:
+        configured = self.base_config.wallet_address
+        if configured and learned and learned != configured and not self._wallet_mismatch_warned:
+            self._wallet_mismatch_warned = True
+            logger.error(f"⚠️  pumpportal.wallet_address ({configured}) NO es la wallet que usa tu api_key "
+                         f"({learned}, la que pagó la última compra). El saldo que muestra la web es de "
+                         f"la otra: corrige wallet_address en el .toml.")
+
+    # --- wallet ------------------------------------------------------------- #
+    def wallet_address(self) -> Optional[str]:
+        """La de pumpportal.wallet_address; si no, la aprendida de la primera
+        compra real."""
+        return self.base_config.wallet_address or getattr(self.client, "wallet_address", None)
+
+    async def wallet_info(self, max_age: float = WALLET_CACHE_SECONDS) -> dict:
+        address = self.wallet_address()
+        info = {"address": address, "sol": None,
+                "source": "config" if self.base_config.wallet_address else ("learned" if address else None)}
+        if not address or self.client is None:
+            return info
+        cached = self._wallet_cache
+        if cached and cached[1] == address and time.monotonic() - cached[0] < max_age:
+            info["sol"] = cached[2]
+            return info
+        sol = await self.client.get_sol_balance(self.base_config.solana_rpc_url, address)
+        if sol is not None:
+            self._wallet_cache = (time.monotonic(), address, sol)
+        info["sol"] = sol
+        return info
+
+    async def check_funds(self, buy_sol: float, priority_fee: float) -> None:
+        """Antes de una compra REAL: ValueError si la wallet no tiene SOL para
+        buy_sol + priority fee + BUY_OVERHEAD_SOL. Saldo fresco (sin caché). Si
+        no se conoce la wallet o el RPC no responde, no bloquea: la compra
+        fallaría igual en la Lightning API, con su propio error."""
+        info = await self.wallet_info(max_age=0)
+        if info["sol"] is None:
+            return
+        needed = buy_sol + priority_fee + BUY_OVERHEAD_SOL
+        if info["sol"] < needed:
+            raise ValueError(f"Saldo insuficiente: la wallet tiene {info['sol']:.4f} SOL y esta compra "
+                             f"necesita unos {needed:.4f} SOL ({buy_sol} + priority fee + "
+                             f"~{BUY_OVERHEAD_SOL} de comisiones y cuenta del token).")
 
     async def recover(self) -> List[ManagedPosition]:
         """Al arrancar: retoma las posiciones que quedaron abiertas en la
@@ -303,6 +360,7 @@ class PositionManager:
                                 token_amount=row["token_amount"], market_entry_price=row["market_entry_price"],
                                 entry_is_real_fill=row["entry_is_real_fill"], opened_at=row["opened_at"])
             position.armed = row["armed"]
+            position.armed_at = row.get("armed_at")
             if row["highest_price"]:
                 position.highest_price = row["highest_price"]
             managed = self._start(pos_id, mint, cfg, resume_position=position,
@@ -334,11 +392,12 @@ class PositionManager:
         self.store.update(pos_id, {"status": "review", "end_reason": motivo})
 
     def history(self, limit: int = 100) -> List[dict]:
-        """Posiciones terminadas de ejecuciones anteriores (las de esta
-        sesión ya salen en snapshot())."""
+        """Posiciones terminadas (de esta ejecución y de las anteriores), las
+        más recientes primero. Las que siguen activas no salen aquí."""
         if self.store is None:
             return []
-        return self.store.history(limit=limit, exclude_ids=tuple(self._positions))
+        activas = tuple(m.id for m in self._positions.values() if m.active)
+        return self.store.history(limit=limit, exclude_ids=activas)
 
     # --- consulta ----------------------------------------------------------- #
     def get(self, ref: PositionRef) -> Optional[ManagedPosition]:

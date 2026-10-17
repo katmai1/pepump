@@ -11,7 +11,12 @@
 <body>
   <header class="topbar">
     <div class="brand">PePump</div>
-    <span id="mode" class="badge" hidden></span>
+    <nav id="nav" class="nav" aria-label="Secciones" hidden>
+      <a href="#" data-view="main" aria-current="page">Posiciones</a>
+      <a href="#historial" data-view="history">Historial</a>
+    </nav>
+    <span id="mode" class="badge live" hidden></span>
+    <span id="wallet" class="wallet" hidden></span>
     <span id="conn" class="conn" data-state="connecting"><span class="dot" aria-hidden="true"></span><span class="conn-label">Conectando…</span></span>
     <button id="logout" class="btn-ghost small" type="button" hidden>Salir</button>
   </header>
@@ -30,6 +35,7 @@
   </section>
 
   <main id="app" hidden>
+   <div id="view-main" class="view">
     <section class="tiles" aria-label="Resumen">
       <div class="tile">
         <div class="tile-label">Posiciones activas</div>
@@ -87,30 +93,12 @@
         <span id="detail-actions"></span>
         <button id="detail-close" class="btn-ghost" type="button" aria-label="Cerrar detalle">✕</button>
       </div>
+      <figure id="chart" class="chart" hidden>
+        <div class="chart-legend" id="chart-legend"></div>
+        <div class="chart-box" id="chart-box"></div>
+        <figcaption class="sr-only" id="chart-caption"></figcaption>
+      </figure>
       <div class="detail-grid" id="detail-body"></div>
-    </section>
-
-    <section id="history" class="card" hidden>
-      <div class="card-head">
-        <h2>Historial</h2>
-        <span class="muted small">Ejecuciones anteriores del bot</span>
-      </div>
-      <div class="table-wrap">
-        <table class="positions history">
-          <thead>
-            <tr>
-              <th>#</th>
-              <th>Token</th>
-              <th>Resultado</th>
-              <th class="num">PnL</th>
-              <th class="num">PnL SOL</th>
-              <th>Motivo</th>
-              <th class="num">Fecha</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </div>
     </section>
 
     <section class="card">
@@ -129,6 +117,33 @@
       </div>
       <div id="logs" class="logs" role="log" aria-live="off"></div>
     </section>
+   </div>
+
+   <div id="view-history" class="view" hidden>
+    <section id="history" class="card">
+      <div class="card-head">
+        <h2>Historial</h2>
+        <span class="muted small">Posiciones terminadas (cerradas, canceladas o para revisar)</span>
+      </div>
+      <div id="history-empty" class="empty" hidden>Todavía no hay posiciones terminadas.</div>
+      <div class="table-wrap">
+        <table class="positions history">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Token</th>
+              <th>Resultado</th>
+              <th class="num">PnL</th>
+              <th class="num">PnL SOL</th>
+              <th>Motivo</th>
+              <th class="num">Fecha</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+   </div>
   </main>
 
   <dialog id="open-dialog" class="dialog dialog-wide" aria-labelledby="open-title">
@@ -150,6 +165,7 @@
           <span>SOL a invertir</span>
           <input id="f-buy_sol" name="buy_sol" type="number" step="any" min="0" inputmode="decimal" required>
           <small id="f-buy-hint" class="muted"></small>
+          <p id="f-wallet" class="wallet-note" hidden></p>
         </label>
       </div>
       <details class="advanced">
@@ -203,6 +219,7 @@
 
   <div id="toasts" class="toasts" aria-live="polite"></div>
 
+  <script src="/static/chart.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

@@ -713,6 +713,20 @@ class PumpPortalClient:
                             f"{signature}; se van a usar los valores estimados para esta operación.")
         return data
 
+    async def get_sol_balance(self, rpc_url: str, address: Optional[str] = None) -> Optional[float]:
+        """SOL de la wallet (`address`, o la de la api_key si ya se conoce).
+        None si no se conoce la wallet o falla la consulta."""
+        address = address or self.wallet_address
+        if not address:
+            return None
+        try:
+            async with AsyncClient(rpc_url) as client:
+                resp = await client.get_balance(Pubkey.from_string(address), commitment=Confirmed)
+            return _rpc_value(resp, "el saldo de la wallet") / 1e9
+        except Exception as e:
+            logger.debug(f"No se pudo consultar el saldo de SOL de la wallet: {e}")
+            return None
+
     async def get_wallet_token_balance(self, mint: str, rpc_url: str) -> Optional[float]:
         """Tokens de `mint` que tiene ahora mismo la wallet (suma de todas
         sus token accounts de ese mint; 0.0 si no tiene ninguna). None si

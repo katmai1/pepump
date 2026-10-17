@@ -28,13 +28,14 @@ from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+# 1: positions + meta. 2: + positions.armed_at y price_points (gráfico).
+SCHEMA_VERSION = 2
 
 # Columnas que el bot reescribe (todas menos id/mint/live/created_at).
 POSITION_FIELDS = (
     "status", "settings_json", "token_name", "token_symbol",
     "entry_price", "market_entry_price", "sol_amount", "token_amount", "entry_is_real_fill",
-    "opened_at", "onchain_source", "armed", "highest_price",
+    "opened_at", "onchain_source", "armed", "armed_at", "highest_price",
     "closed_at", "exit_price", "proceeds_sol", "realized_pnl_sol", "realized_pnl_pct",
     "close_reason", "exit_is_real_fill", "end_reason", "updated_at",
 )
@@ -57,6 +58,7 @@ CREATE TABLE IF NOT EXISTS positions (
     opened_at           REAL,
     onchain_source      TEXT,
     armed               INTEGER NOT NULL DEFAULT 0,
+    armed_at            REAL,
     highest_price       REAL,
     closed_at           REAL,
     exit_price          REAL,
@@ -73,6 +75,14 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+-- Precios muestreados de cada posición, para el gráfico (ver
+-- TrailingTakeProfitBot._record_price).
+CREATE TABLE IF NOT EXISTS price_points (
+    position_id INTEGER NOT NULL,
+    ts          REAL NOT NULL,
+    price       REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS price_points_pos ON price_points(position_id, ts);
 """
 
 
@@ -91,6 +101,11 @@ class PositionStore:
         if version > SCHEMA_VERSION:
             raise RuntimeError(f"{path} es de una versión más nueva del bot (esquema {version}).")
         self._db.executescript(_SCHEMA)
+        # Migración desde el esquema 1: CREATE TABLE IF NOT EXISTS no añade
+        # columnas a una tabla que ya existe.
+        cols = {r[1] for r in self._db.execute("PRAGMA table_info(positions)")}
+        if "armed_at" not in cols:
+            self._db.execute("ALTER TABLE positions ADD COLUMN armed_at REAL")
         self._db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def close(self) -> None:
@@ -130,6 +145,15 @@ class PositionStore:
             "ORDER BY COALESCE(closed_at, updated_at) DESC LIMIT ?", (limit + len(exclude_ids),)).fetchall()
         out = [_row(r) for r in rows if r["id"] not in set(exclude_ids)]
         return out[:limit]
+
+    # --- precios (gráfico) -------------------------------------------------- #
+    def add_price(self, pos_id: int, ts: float, price: float) -> None:
+        self._db.execute("INSERT INTO price_points (position_id, ts, price) VALUES (?, ?, ?)",
+                         (pos_id, ts, price))
+
+    def prices(self, pos_id: int) -> List[tuple]:
+        return [tuple(r) for r in self._db.execute(
+            "SELECT ts, price FROM price_points WHERE position_id = ? ORDER BY ts", (pos_id,))]
 
     # --- meta -------------------------------------------------------------- #
     def get_meta(self, key: str) -> Optional[str]:
