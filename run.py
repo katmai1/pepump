@@ -66,10 +66,10 @@ import time
 
 from pepump.config import load_config, validate_mint
 from pepump.pump import PumpPortalClient, TokenMetadataOnChainClient
-from pepump.executor import TradeExecutor
-from pepump.bot import TrailingTakeProfitBot
+from pepump.dashboard import MultiPositionPanel
 from pepump.logging_config import setup_logging
-from pepump.shutdown import run_with_shutdown_signals
+from pepump.manager import PositionManager
+from pepump.shutdown import run_with_shutdown_signals_for
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +78,9 @@ logger = logging.getLogger(__name__)
 def parse_args():
     p = argparse.ArgumentParser(description="Bot de trailing take-profit para pump.fun (Lightning API de PumpPortal)")
 
-    p.add_argument("-m", "--mint", type=str, required=True, help="Mint con el que se va a operar")
+    p.add_argument("-m", "--mint", type=str, required=True, action="append",
+                   help="Mint con el que se va a operar. Se puede repetir para abrir varias "
+                        "posiciones a la vez: -m <MINT1> -m <MINT2>")
     p.add_argument("-c", "--config", default="config.toml", help="Ruta al archivo .toml de configuración (default: config.toml)")
     p.add_argument("-v", "--verbose", action="store_true", help="Logging en nivel DEBUG en vez de INFO")
     p.add_argument("--no-panel", action="store_true",
@@ -105,15 +107,16 @@ def show_header(live):
 # logica inicial
 if __name__ == "__main__":
     args = parse_args()
-    panel = setup_logging(level=logging.DEBUG if args.verbose else logging.INFO, panel=not args.no_panel)
+    panel = setup_logging(level=logging.DEBUG if args.verbose else logging.INFO, panel=not args.no_panel,
+                          tag_mint=len(args.mint) > 1)
 
     
     try:
         config = load_config(args.config)
-        # El mint viene SIEMPRE de la línea de comandos, nunca del .toml.
-        # Se normaliza y valida aquí para fallar rápido y con un mensaje
+        # Los mints vienen SIEMPRE de la línea de comandos, nunca del .toml.
+        # Se normalizan y validan aquí para fallar rápido y con un mensaje
         # que apunte a la causa real -ver validate_mint en config.py.
-        config.mint = validate_mint(args.mint)
+        mints = [validate_mint(m) for m in args.mint]
     except FileNotFoundError:
         logger.error(f"No se encontró el archivo de configuración '{args.config}'.")
         sys.exit(1)
@@ -122,16 +125,38 @@ if __name__ == "__main__":
         # .toml mal formado cae aquí también (probado: da un mensaje claro).
         logger.error(f"ERROR de configuración: {e}")
         sys.exit(1)
-   
+    repetidos = sorted({m for m in mints if mints.count(m) > 1})
+    if repetidos:
+        logger.error(f"Mint repetido: {', '.join(repetidos)}. Comparten wallet, así que no se pueden "
+                     f"abrir dos posiciones del mismo token a la vez.")
+        sys.exit(1)
+
     show_header(config.live)
-    
+
     client = PumpPortalClient(api_key=config.api_key)
-    executor = TradeExecutor(client=client, live=config.live, config=config)
-    bot = TrailingTakeProfitBot(client=client, executor=executor, config=config, panel=panel,
-                                metadata_client=TokenMetadataOnChainClient(config.solana_rpc_url))
+
+    async def main():
+        manager = PositionManager(base_config=config, client=client,
+                                  metadata_client=TokenMetadataOnChainClient(config.solana_rpc_url))
+        if panel is not None:
+            multi = MultiPositionPanel(panel, manager.snapshot, live=config.live)
+            manager.panel_factory = multi.for_position
+
+        def on_signal(sig_name: str) -> None:
+            manager.close_all(f"{sig_name} recibido")
+
+        async def run_all():
+            for mint in mints:
+                manager.open(mint)
+            await manager.wait_all()
+
+        try:
+            await run_with_shutdown_signals_for(run_all(), on_signal)
+        finally:
+            await manager.aclose()
 
     try:
-        asyncio.run(run_with_shutdown_signals(bot))
+        asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Interrumpido por el usuario.")
     finally:

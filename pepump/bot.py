@@ -5,7 +5,7 @@ import time
 from typing import AsyncIterator, Optional
 
 from pepump.executor import Position
-from pepump.log_context import current_mint
+from pepump.log_context import current_mint, set_mint_label
 from pepump.pump import (PumpSwapOnChainClient, PumpCurveOnChainClient, RaydiumCpmmOnChainClient,
                          MeteoraDlmmOnChainClient)
 
@@ -555,9 +555,21 @@ class TrailingTakeProfitBot:
         else:
             next_task = pending
         shutdown_task = asyncio.ensure_future(self._shutdown_requested.wait())
-        done, _pending = await asyncio.wait(
-            {next_task, shutdown_task}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
-        )
+        try:
+            done, _pending = await asyncio.wait(
+                {next_task, shutdown_task}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+            )
+        except asyncio.CancelledError:
+            # Cancelaron a quien esperaba (run() cancela el monitor de
+            # precios al terminar): el feed ya no se va a leer más, así que
+            # aquí SÍ se cancela el __anext__ en vuelo. Si se dejara
+            # colgado, terminaría solo al cerrarse el feed con una
+            # excepción que nadie recoge ("Task exception was never
+            # retrieved").
+            next_task.cancel()
+            shutdown_task.cancel()
+            self._pending_next_event_task = None
+            raise
 
         if shutdown_task in done:
             next_task.cancel()
@@ -1276,6 +1288,8 @@ class TrailingTakeProfitBot:
         if not found:
             return
         self.token_name, self.token_symbol = found
+        if self.token_symbol:
+            set_mint_label(self.mint, f"${self.token_symbol} {self.mint[:4]}")
         logger.info(f"Token: {self._token_label()}")
         self._update_panel_fixed()
 

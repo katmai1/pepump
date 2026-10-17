@@ -65,6 +65,13 @@ class StatusPanel:
             self._status = line
             self._redraw()
 
+    def set_all(self, fixed: List[str], status: str) -> None:
+        """Las dos cosas de una vez, con un solo redibujado."""
+        with self._lock:
+            self._fixed = list(fixed)
+            self._status = status
+            self._redraw()
+
     def close(self) -> None:
         """Al salir: se deja el bloque fijo impreso (sin la línea de
         estado, que ya no es "en vivo") y se baja el cursor para que el
@@ -148,3 +155,124 @@ def create_panel(stream) -> Optional[StatusPanel]:
     if panel_unavailable_reason(stream) is not None:
         return None
     return StatusPanel(stream)
+
+
+# --------------------------------------------------------------------------- #
+# Varias posiciones en la misma terminal (ver manager.py)
+# --------------------------------------------------------------------------- #
+
+_FASES = {
+    "starting": "arrancando",
+    "connecting": "conectando",
+    "waiting_entry": "esperando entrada",
+    "buying": "comprando",
+    "open": "abierta",
+    "closing": "cerrando",
+    "closed": "cerrada",
+    "stopped": "terminada",
+}
+
+
+def short_mint(mint: str) -> str:
+    return f"{mint[:4]}…{mint[-4:]}" if len(mint) > 10 else mint
+
+
+def position_label(snap: dict) -> str:
+    """"$SYM 7xKX" si ya se conoce el símbolo, si no el mint acortado."""
+    corto = snap["mint"][:4]
+    if snap.get("token_symbol"):
+        return f"${snap['token_symbol']} {corto}"
+    return short_mint(snap["mint"])
+
+
+def position_row(snap: dict) -> str:
+    """Una línea por posición para el panel con varias posiciones."""
+    partes = [f" #{snap['id']} {position_label(snap)}"]
+    fase = _FASES.get(snap["phase"], snap["phase"])
+    pos = snap.get("position")
+    if pos is not None and snap["phase"] == "open":
+        fase += " · armada" if pos["armed"] else " · esperando activación"
+    if snap["phase"] == "open" and not snap["running"]:
+        fase = "⚠️  ABIERTA SIN VIGILAR"
+    elif snap["close_requested"] and snap["phase"] not in ("closed", "stopped"):
+        fase = "cerrando"
+    partes.append(fase)
+
+    if pos is not None and pos["closed"]:
+        if pos.get("realized_pnl_pct") is not None:
+            partes.append(f"PnL {pos['realized_pnl_pct']:+.2f}% ({pos['realized_pnl_sol']:+.6f} SOL)")
+        if pos.get("close_reason"):
+            partes.append(pos["close_reason"])
+    elif pos is not None:
+        if snap["latest_price"] is not None:
+            partes.append(f"precio {snap['latest_price']:.10f}")
+        if pos["armed"] and pos["trailing_stop_price"] is not None:
+            partes.append(f"venta ≤ {pos['trailing_stop_price']:.10f}")
+        else:
+            partes.append(f"activa ≥ {pos['activation_price']:.10f}")
+        if pos["market_pnl_pct"] is not None:
+            pnl = f"mercado {pos['market_pnl_pct']:+.2f}%"
+            if pos["entry_is_real_fill"] and pos["net_pnl_pct"] is not None:
+                pnl += f" neto {pos['net_pnl_pct']:+.2f}%"
+            partes.append(pnl)
+    else:
+        if snap["latest_price"] is not None:
+            partes.append(f"precio {snap['latest_price']:.10f}")
+        if snap.get("entry_target_price") is not None:
+            partes.append(f"objetivo {snap['entry_target_price']:.10f}")
+        if snap["phase"] == "stopped" and snap.get("end_reason"):
+            partes.append(snap["end_reason"])
+    return " | ".join(partes)
+
+
+class _PositionPanel:
+    """Lo que recibe cada bot como `panel` cuando corre bajo el gestor:
+    guarda su bloque fijo y su línea de estado (las mismas que dibujaría
+    él solo) y le avisa al panel compartido que redibuje."""
+
+    def __init__(self, owner: "MultiPositionPanel"):
+        self._owner = owner
+        self.fixed: List[str] = []
+        self.status: str = ""
+
+    def set_fixed(self, lines: List[str]) -> None:
+        self.fixed = list(lines)
+        self._owner.refresh()
+
+    def set_status(self, line: str) -> None:
+        self.status = line
+        self._owner.refresh()
+
+
+class MultiPositionPanel:
+    """Panel de la terminal con el gestor de posiciones.
+
+    Con UNA sola posición se ve exactamente como siempre (el bloque fijo
+    y la línea de estado de ese bot). Con varias, una cabecera y una
+    línea por posición (ver position_row)."""
+
+    def __init__(self, panel: StatusPanel, snapshot: callable, live: bool):
+        self.panel = panel
+        self._snapshot = snapshot
+        self._live = live
+        self._children: dict = {}
+
+    def for_position(self, managed) -> _PositionPanel:
+        child = _PositionPanel(self)
+        self._children[managed.id] = child
+        return child
+
+    def refresh(self) -> None:
+        snaps = self._snapshot()
+        if len(snaps) == 1 and snaps[0]["id"] in self._children:
+            child = self._children[snaps[0]["id"]]
+            self.panel.set_all(child.fixed, child.status)
+            return
+        modo = "REAL" if self._live else "SIMULADO"
+        activas = sum(1 for s in snaps if s["running"])
+        cabecera = [f" PePump | Modo {modo} | {len(snaps)} posiciones ({activas} activas) "
+                    f"| Ctrl+C cierra todas"]
+        self.panel.set_all(cabecera + [position_row(s) for s in snaps], "")
+
+    def close(self) -> None:
+        self.panel.close()

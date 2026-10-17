@@ -42,10 +42,17 @@ El `mint` **no** va en el `.toml`: se pasa por línea de comandos.
 ```bash
 python run.py -m <MINT> -c config.toml      # modo según general.live
 python run.py -m <MINT> -v                  # logging en DEBUG
+python run.py -m <MINT1> -m <MINT2>         # varias posiciones a la vez
 ```
 
-`Ctrl+C` (o `SIGTERM`) hace un cierre ordenado: si hay una posición
-abierta, la vende al precio más actual posible antes de salir.
+Con varios `-m`, todas las posiciones corren en el mismo proceso y
+comparten una única conexión al feed de PumpPortal. El panel muestra una
+línea por posición y cada log lleva la etiqueta de su token. No se puede
+repetir un mint: las posiciones comparten wallet, y la venta pide el 100%
+de los tokens de ese mint.
+
+`Ctrl+C` (o `SIGTERM`) hace un cierre ordenado: si hay posiciones
+abiertas, las vende todas al precio más actual posible antes de salir.
 
 En Windows funciona igual con `Ctrl+C` y `Ctrl+Pausa`, pero `SIGTERM` no
 se entrega nunca: `taskkill /F` mata el proceso en seco y la posición

@@ -143,7 +143,7 @@ def validate_mint(mint: str) -> str:
     return limpio
 
 
-def _validate(config: AppConfig) -> None:
+def validate_config(config: AppConfig) -> None:
     """Comprobaciones de coherencia de la configuración, ANTES de conectarse a
     nada. Todo lo que se valide aquí es un error que, si no, aparecería
     mucho más tarde y disfrazado de otra cosa: un `buy_sol` en 0 se manda
@@ -267,5 +267,5 @@ def load_config(path: str) -> AppConfig:
         logger.warning("El .toml define general.mint, pero el mint se toma SIEMPRE de la línea de "
                        "comandos (-m/--mint). El valor del archivo se ignora.")
 
-    _validate(config)
+    validate_config(config)
     return config

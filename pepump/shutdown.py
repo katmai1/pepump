@@ -123,6 +123,19 @@ def _install_one(loop, sig, on_signal: Callable[[str], None]) -> Optional[Callab
     return _restaurar_anterior
 
 
+async def run_with_shutdown_signals_for(coro, on_signal: Callable[[str], None]) -> None:
+    """Corre `coro` con las señales de cierre enganchadas a `on_signal`
+    (se desinstalan siempre al terminar). Es lo que usa run.py con el
+    gestor de posiciones: Ctrl+C -> cerrar todas."""
+    loop = asyncio.get_running_loop()
+    quitar = install_shutdown_handlers(loop, on_signal)
+    try:
+        await coro
+    finally:
+        for q in quitar:
+            q()
+
+
 async def run_with_shutdown_signals(bot) -> None:
     """Corre `bot.run()` con Ctrl+C/SIGTERM/Ctrl+Pausa enganchados a
     `bot.close()`: es lo que hacía run() por su cuenta antes de sacar las

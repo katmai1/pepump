@@ -26,3 +26,36 @@ class MintContextFilter(logging.Filter):
         if not hasattr(record, "mint"):
             record.mint = current_mint.get()
         return True
+
+
+# Etiqueta legible por mint ("$SYM 7xKX"), la registra el bot cuando
+# conoce el símbolo del token. Sin etiqueta, se usa el mint acortado.
+_labels: dict = {}
+
+
+def set_mint_label(mint: str, label: str) -> None:
+    _labels[mint] = label
+
+
+def mint_tag(mint: str) -> str:
+    if not mint:
+        return ""
+    return _labels.get(mint) or (f"{mint[:4]}…{mint[-4:]}" if len(mint) > 10 else mint)
+
+
+class MintTagFormatter(logging.Formatter):
+    """Formatter que antepone "[etiqueta] " al mensaje de los logs de una
+    posición. Se usa cuando hay varias en la misma terminal."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        texto = super().format(record)
+        tag = mint_tag(getattr(record, "mint", ""))
+        if not tag:
+            return texto
+        mensaje = record.getMessage()
+        # Se inserta delante del mensaje (después de la hora y el nivel),
+        # no al principio de la línea, para que las columnas sigan alineadas.
+        i = texto.find(mensaje)
+        if i < 0:
+            return f"[{tag}] {texto}"
+        return f"{texto[:i]}[{tag}] {texto[i:]}"

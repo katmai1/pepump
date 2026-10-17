@@ -2,11 +2,12 @@ import logging
 import sys
 from typing import Optional
 
-from pepump.log_context import MintContextFilter
+from pepump.log_context import MintContextFilter, MintTagFormatter
 from pepump.dashboard import PanelAwareHandler, StatusPanel, create_panel, panel_unavailable_reason
 
 
-def setup_logging(level: int = logging.INFO, panel: bool = True) -> Optional[StatusPanel]:
+def setup_logging(level: int = logging.INFO, panel: bool = True,
+                  tag_mint: bool = False) -> Optional[StatusPanel]:
     """
     Configura el logging de toda la app (llamar UNA sola vez, al arrancar
     run.py). El resto de los módulos solo hace `logging.getLogger(__name__)`
@@ -48,13 +49,15 @@ def setup_logging(level: int = logging.INFO, panel: bool = True) -> Optional[Sta
         handler = PanelAwareHandler(sys.stdout, status_panel)
     else:
         handler = logging.StreamHandler(sys.stdout)
-    formatter = logging.Formatter(
+    # Con varias posiciones en la misma terminal, cada línea lleva la
+    # etiqueta de su token ("[$SYM 7xKX] ...") para saber de cuál es.
+    formatter = (MintTagFormatter if tag_mint else logging.Formatter)(
         fmt="[%(asctime)s][%(levelname)s]:\t %(message)s",
         datefmt="%H:%M:%S",
     )
     handler.setFormatter(formatter)
-    # `record.mint` en cada log (ver log_context.py). El formato de la
-    # terminal no lo muestra: con un solo bot por proceso sería ruido.
+    # `record.mint` en cada log (ver log_context.py). Solo se muestra con
+    # tag_mint (varias posiciones): con una sola sería ruido.
     handler.addFilter(MintContextFilter())
     root.addHandler(handler)
 
