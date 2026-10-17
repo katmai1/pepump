@@ -31,6 +31,15 @@ class MintContextFilter(logging.Filter):
 # Etiqueta legible por mint ("$SYM 7xKX"), la registra el bot cuando
 # conoce el símbolo del token. Sin etiqueta, se usa el mint acortado.
 _labels: dict = {}
+# Las etiquetas solo se muestran con más de una posición (con una sola
+# serían ruido). Lo activa el gestor en cuanto tiene la segunda, y ya no
+# se apaga: así no cambia el formato a mitad de una sesión.
+_tags_enabled = False
+
+
+def enable_tags() -> None:
+    global _tags_enabled
+    _tags_enabled = True
 
 
 def set_mint_label(mint: str, label: str) -> None:
@@ -49,7 +58,7 @@ class MintTagFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         texto = super().format(record)
-        tag = mint_tag(getattr(record, "mint", ""))
+        tag = mint_tag(getattr(record, "mint", "")) if _tags_enabled else ""
         if not tag:
             return texto
         mensaje = record.getMessage()

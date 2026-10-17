@@ -8,6 +8,7 @@ orquestación de bot.py sin tocar la red real (websocket de PumpPortal,
 Lightning API, RPC de Solana).
 """
 import asyncio
+import time
 
 import pytest
 
@@ -117,6 +118,13 @@ class SpyExecutor:
             await asyncio.sleep(self.sell_delay)
         if self.sell_calls <= self.fail_sell_times:
             raise self.fail_exc
+        # Lo mismo que rellena TradeExecutor.sell() al confirmar.
+        position.closed_at = time.time()
+        position.exit_price = price
+        position.proceeds_sol = position.token_amount * price
+        position.realized_pnl_sol = position.proceeds_sol - position.sol_amount
+        position.realized_pnl_pct = position.realized_pnl_sol / position.sol_amount * 100.0
+        position.close_reason = reason
         position.closed = True
 
 

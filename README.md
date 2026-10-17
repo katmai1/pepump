@@ -43,6 +43,7 @@ El `mint` **no** va en el `.toml`: se pasa por línea de comandos.
 python run.py -m <MINT> -c config.toml      # modo según general.live
 python run.py -m <MINT> -v                  # logging en DEBUG
 python run.py -m <MINT1> -m <MINT2>         # varias posiciones a la vez
+python run.py                               # solo retomar las que quedaron abiertas
 ```
 
 Con varios `-m`, todas las posiciones corren en el mismo proceso y
@@ -51,12 +52,30 @@ línea por posición y cada log lleva la etiqueta de su token. No se puede
 repetir un mint: las posiciones comparten wallet, y la venta pide el 100%
 de los tokens de ese mint.
 
-`Ctrl+C` (o `SIGTERM`) hace un cierre ordenado: si hay posiciones
-abiertas, las vende todas al precio más actual posible antes de salir.
+### Salir y retomar
 
-En Windows funciona igual con `Ctrl+C` y `Ctrl+Pausa`, pero `SIGTERM` no
-se entrega nunca: `taskkill /F` mata el proceso en seco y la posición
-queda abierta. Ciérrala con `Ctrl+C`.
+`Ctrl+C` (o `SIGTERM`) **sale sin vender**: las posiciones abiertas quedan
+guardadas en `pepump.db` (ver `general.state_db`) y, al volver a arrancar el
+bot, se retoman donde estaban (entrada, máximo, trailing armado o no), sin
+volver a comprar. **Mientras el bot está parado nadie vigila el stop**: si
+el precio cayó por debajo del nivel de venta, vende nada más retomarla.
+Las que todavía esperaban entrada se cancelan (no había dinero en juego).
+
+Con `--sell-on-exit`, `Ctrl+C` vende todas al precio actual antes de salir
+(el comportamiento de antes).
+
+Lo mismo vale si el proceso muere de golpe (corte de luz, `kill -9`,
+`taskkill /F` en Windows): al arrancar se retoma lo que estaba abierto. En
+modo real, antes de retomar se mira la wallet: si los tokens ya no están
+(vendidos a mano), la posición se da por cerrada. Si el bot murió justo
+mientras compraba, se mira si la compra entró; si entró, se marca para
+revisar a mano (no hay datos de entrada para aplicar la estrategia).
+
+Una posición abierta en modo real solo se retoma arrancando en modo real,
+y lo mismo con el simulado.
+
+En Windows `Ctrl+C` y `Ctrl+Pausa` funcionan igual; `SIGTERM` no se
+entrega nunca.
 
 ### Panel web
 

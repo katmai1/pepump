@@ -176,6 +176,19 @@ main {
 .token-name { font-weight: 600; }
 .token-mint { font-family: var(--mono); font-size: 11px; color: var(--muted); }
 .level-kind { display: block; font-size: 11px; color: var(--muted); }
+.tag-pill {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--ink-2);
+  vertical-align: middle;
+}
+.positions.history tbody tr { cursor: default; }
+.positions.history td.reason { white-space: normal; color: var(--ink-2); min-width: 220px; }
 
 .up { color: var(--up); }
 .down { color: var(--down); }

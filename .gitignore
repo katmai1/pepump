@@ -6,3 +6,8 @@
 
 __pycache__/
 *.pyc
+
+# Estado de las posiciones (ver general.state_db).
+*.db
+*.db-wal
+*.db-shm

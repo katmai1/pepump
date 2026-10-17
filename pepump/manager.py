@@ -11,19 +11,25 @@ cuando se corría uno solo; el gestor solo:
   - impide abrir dos posiciones del mismo mint a la vez (comparten wallet:
     la venta pide el 100% de los tokens del mint, así que la primera en
     vender se llevaría los de la otra),
-  - los cierra de forma ordenada (close / close_all -> bot.close()),
+  - los cierra de forma ordenada (close / close_all -> bot.close(), que
+    vende) o los detiene sin vender (stop_all -> bot.stop()),
+  - los guarda en SQLite (store.py) y, al arrancar, retoma los que
+    quedaron abiertos (recover),
   - y da una foto de todas (snapshot) para mostrarlas.
 """
 import asyncio
 import dataclasses
 import logging
+import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Union
 
 from pepump.bot import TrailingTakeProfitBot
 from pepump.config import AppConfig, validate_config, validate_mint
-from pepump.executor import TradeExecutor
+from pepump.executor import Position, TradeExecutor
 from pepump.feed import SharedTradeFeed
+from pepump.log_context import enable_tags
+from pepump.store import PositionStore
 
 logger = logging.getLogger(__name__)
 
@@ -66,12 +72,14 @@ PositionRef = Union[int, str]
 class PositionManager:
     def __init__(self, base_config: AppConfig, client, feed: Optional[SharedTradeFeed] = None,
                  metadata_client=None, panel_factory: Optional[Callable[["ManagedPosition"], object]] = None,
-                 executor_factory: Optional[Callable[[AppConfig], object]] = None):
+                 executor_factory: Optional[Callable[[AppConfig], object]] = None,
+                 store: Optional[PositionStore] = None):
         """`client` es el PumpPortalClient real (trades de la Lightning API,
         balances); el precio llega por `feed` (uno compartido sobre ese
         mismo cliente si no se pasa). `panel_factory(managed)` devuelve el
         panel de cada bot (None = sin panel: el estado se loguea).
-        `executor_factory` existe para los tests."""
+        `executor_factory` existe para los tests. `store` guarda las
+        posiciones para retomarlas (None = sin persistencia)."""
         self.base_config = base_config
         self.client = client
         self.feed = feed if feed is not None else SharedTradeFeed(client)
@@ -79,8 +87,9 @@ class PositionManager:
         self.panel_factory = panel_factory
         self.executor_factory = executor_factory or (
             lambda cfg: TradeExecutor(client=client, live=cfg.live, config=cfg))
+        self.store = store
         self._positions: Dict[int, ManagedPosition] = {}
-        self._next_id = 1
+        self._next_id = 1  # solo sin store; con store, el id lo da la base de datos
         self._closing_all = False
         self._changed = asyncio.Event()
 
@@ -107,12 +116,26 @@ class PositionManager:
         cfg = dataclasses.replace(self.base_config, mint=mint, **overrides)
         validate_config(cfg)
 
-        pos_id = self._next_id
-        self._next_id += 1
+        if self.store is not None:
+            pos_id = self.store.create(mint, cfg.live, {k: getattr(cfg, k) for k in OVERRIDABLE_FIELDS})
+        else:
+            pos_id = self._next_id
+            self._next_id += 1
+        managed = self._start(pos_id, mint, cfg)
+        logger.info(f"Posición #{pos_id} abierta para {mint} "
+                    f"(compra {cfg.buy_sol} SOL, modo {'REAL' if cfg.live else 'SIMULADO'}).")
+        return managed
+
+    def _start(self, pos_id: int, mint: str, cfg: AppConfig, resume_position: Optional[Position] = None,
+               resume_onchain_source: Optional[str] = None) -> ManagedPosition:
         bot = TrailingTakeProfitBot(client=self.feed, executor=self.executor_factory(cfg), config=cfg,
-                                    metadata_client=self.metadata_client)
+                                    metadata_client=self.metadata_client,
+                                    resume_position=resume_position,
+                                    resume_onchain_source=resume_onchain_source)
         task = asyncio.create_task(bot.run(), name=f"pepump-pos-{pos_id}")
         managed = ManagedPosition(id=pos_id, mint=mint, config=cfg, bot=bot, task=task)
+        if self.store is not None:
+            bot._persist_cb = lambda b, m=managed: self._save(m)
         # El panel se engancha después de crear el bot porque necesita el
         # ManagedPosition (id) para dibujarse; el bot todavía no corrió
         # ni una línea, así que no se pierde nada.
@@ -121,9 +144,9 @@ class PositionManager:
             bot._update_panel_fixed()
         task.add_done_callback(lambda t, m=managed: self._on_done(m, t))
         self._positions[pos_id] = managed
+        if len(self._positions) > 1:
+            enable_tags()
         self._notify()
-        logger.info(f"Posición #{pos_id} abierta para {mint} "
-                    f"(compra {cfg.buy_sol} SOL, modo {'REAL' if cfg.live else 'SIMULADO'}).")
         return managed
 
     def close(self, ref: PositionRef, reason: str = "cierre manual") -> ManagedPosition:
@@ -152,6 +175,20 @@ class PositionManager:
         self._notify()
         return pedidas
 
+    def stop_all(self, reason: str = "bot detenido") -> int:
+        """Detiene todos los bots SIN vender (lo que hace Ctrl+C por
+        defecto): las posiciones abiertas quedan guardadas y se retoman al
+        volver a arrancar; las que esperaban entrada se cancelan. No se
+        abren posiciones nuevas desde ese momento."""
+        self._closing_all = True
+        pedidas = 0
+        for managed in list(self._positions.values()):
+            if managed.closable:
+                managed.bot.stop(reason)
+                pedidas += 1
+        self._notify()
+        return pedidas
+
     async def wait_all(self) -> None:
         """Espera a que terminen TODOS los bots, incluidos los que se abran
         mientras tanto."""
@@ -164,6 +201,138 @@ class PositionManager:
     async def aclose(self) -> None:
         """Al apagar el proceso, después de wait_all(): cierra el feed."""
         await self.feed.close()
+
+    # --- persistencia -------------------------------------------------------- #
+    def _save(self, managed: ManagedPosition) -> None:
+        bot = managed.bot
+        pos = bot.position
+        if pos is not None and pos.closed:
+            status = "closed"
+        elif pos is not None:
+            status = "open"
+        elif bot.phase == "buying":
+            status = "buying"
+        elif bot.running:
+            status = "waiting_entry"
+        else:
+            status = "cancelled"
+        fields = {
+            "status": status,
+            "token_name": bot.token_name,
+            "token_symbol": bot.token_symbol,
+            "onchain_source": bot._onchain_source,
+            "end_reason": bot.end_reason,
+        }
+        if pos is not None:
+            fields.update(
+                entry_price=pos.entry_price, market_entry_price=pos.market_entry_price,
+                sol_amount=pos.sol_amount, token_amount=pos.token_amount,
+                entry_is_real_fill=int(pos.entry_is_real_fill), opened_at=pos.opened_at,
+                armed=int(pos.armed), highest_price=pos.highest_price,
+                closed_at=pos.closed_at, exit_price=pos.exit_price, proceeds_sol=pos.proceeds_sol,
+                realized_pnl_sol=pos.realized_pnl_sol, realized_pnl_pct=pos.realized_pnl_pct,
+                close_reason=pos.close_reason, exit_is_real_fill=int(pos.exit_is_real_fill),
+            )
+        self.store.update(managed.id, fields)
+        # La wallet solo se conoce tras la primera compra confirmada (ver
+        # PumpPortalClient.wallet_address): se guarda para poder mirar los
+        # balances al retomar después de un reinicio.
+        wallet = getattr(self.client, "wallet_address", None)
+        if wallet and self.store.get_meta("wallet_address") != wallet:
+            self.store.set_meta("wallet_address", wallet)
+
+    async def recover(self) -> List[ManagedPosition]:
+        """Al arrancar: retoma las posiciones que quedaron abiertas en la
+        ejecución anterior y limpia las que se quedaron a medias. Devuelve
+        las retomadas. Sin store, no hace nada."""
+        if self.store is None:
+            return []
+        live = self.base_config.live
+        rpc = self.base_config.solana_rpc_url
+        wallet = self.store.get_meta("wallet_address")
+        if live and wallet and self.client is not None and not getattr(self.client, "wallet_address", None):
+            self.client.wallet_address = wallet
+
+        for row in self.store.with_status("waiting_entry"):
+            self.store.update(row["id"], {"status": "cancelled",
+                                          "end_reason": "el bot se detuvo antes de comprar"})
+
+        retomadas = []
+        for row in self.store.with_status("buying", "open"):
+            pos_id, mint = row["id"], row["mint"]
+            if row["live"] != live:
+                modo = "REAL" if row["live"] else "SIMULADO"
+                logger.warning(f"Posición #{pos_id} ({mint}) quedó abierta en modo {modo}: no se retoma "
+                               f"en este modo. Arranca en modo {modo} para retomarla.")
+                continue
+            if self._active_for_mint(mint) is not None:
+                logger.error(f"Posición #{pos_id} ({mint}): ya hay otra activa de ese mint; no se retoma.")
+                continue
+
+            balance = None
+            if live:
+                balance = await self.client.get_wallet_token_balance(mint, rpc)
+
+            if row["status"] == "buying":
+                self._recover_half_buy(row, balance)
+                continue
+
+            if balance is not None and balance <= 0:
+                motivo = "ya no hay tokens en la wallet (vendida fuera del bot)"
+                logger.warning(f"Posición #{pos_id} ({mint}): {motivo}. Se marca como cerrada.")
+                self.store.update(pos_id, {"status": "closed", "closed_at": time.time(),
+                                           "close_reason": motivo, "end_reason": motivo})
+                continue
+            if live and balance is None:
+                logger.warning(f"Posición #{pos_id} ({mint}): no se pudo comprobar la wallet "
+                               f"(¿RPC caído?). Se retoma igualmente.")
+            elif balance is not None and row["token_amount"] and balance < row["token_amount"] * 0.99:
+                logger.warning(f"Posición #{pos_id} ({mint}): en la wallet hay {balance:,.2f} tokens y la "
+                               f"posición tenía {row['token_amount']:,.2f}. Al vender se vende TODO lo "
+                               f"que haya de ese token.")
+
+            settings = {k: v for k, v in row["settings"].items() if k in OVERRIDABLE_FIELDS}
+            cfg = dataclasses.replace(self.base_config, mint=mint, **settings)
+            position = Position(mint=mint, entry_price=row["entry_price"], sol_amount=row["sol_amount"],
+                                token_amount=row["token_amount"], market_entry_price=row["market_entry_price"],
+                                entry_is_real_fill=row["entry_is_real_fill"], opened_at=row["opened_at"])
+            position.armed = row["armed"]
+            if row["highest_price"]:
+                position.highest_price = row["highest_price"]
+            managed = self._start(pos_id, mint, cfg, resume_position=position,
+                                  resume_onchain_source=row["onchain_source"])
+            managed.bot.token_name, managed.bot.token_symbol = row["token_name"], row["token_symbol"]
+            retomadas.append(managed)
+            logger.info(f"♻️  Posición #{pos_id} ({mint}) retomada.")
+        return retomadas
+
+    def _recover_half_buy(self, row: dict, balance: Optional[float]) -> None:
+        """El proceso murió con una compra enviada y sin confirmar."""
+        pos_id, mint = row["id"], row["mint"]
+        if not row["live"]:
+            motivo = "el bot se detuvo durante la compra (simulada)"
+            self.store.update(pos_id, {"status": "cancelled", "end_reason": motivo})
+            return
+        if balance is not None and balance <= 0:
+            motivo = "la compra no llegó a ejecutarse (no hay tokens en la wallet)"
+            logger.info(f"Posición #{pos_id} ({mint}): {motivo}.")
+            self.store.update(pos_id, {"status": "cancelled", "end_reason": motivo})
+            return
+        if balance is None:
+            motivo = ("el bot se detuvo durante la compra y no se pudo comprobar la wallet: "
+                      "revisa a mano si se compró")
+        else:
+            motivo = (f"el bot se detuvo durante la compra y en la wallet hay {balance:,.2f} tokens, "
+                      f"pero no hay datos de entrada: revísala y véndela a mano")
+        logger.error(f"⚠️  Posición #{pos_id} ({mint}): {motivo}. https://pump.fun/{mint}")
+        self.store.update(pos_id, {"status": "review", "end_reason": motivo})
+
+    def history(self, limit: int = 100) -> List[dict]:
+        """Posiciones terminadas de ejecuciones anteriores (las de esta
+        sesión ya salen en snapshot())."""
+        if self.store is None:
+            return []
+        return self.store.history(limit=limit, exclude_ids=tuple(self._positions))
 
     # --- consulta ----------------------------------------------------------- #
     def get(self, ref: PositionRef) -> Optional[ManagedPosition]:
@@ -202,7 +371,7 @@ class PositionManager:
         if not task.cancelled() and task.exception() is not None:
             logger.error(f"La posición #{managed.id} ({managed.mint}) terminó con un error "
                          f"inesperado: {task.exception()!r}")
-        if managed.active:
+        if managed.active and not managed.bot.detached:
             logger.error(f"⚠️  La posición #{managed.id} ({managed.mint}) terminó con la posición "
                          f"ABIERTA: los tokens siguen en la wallet. Revísala a mano: "
                          f"https://pump.fun/{managed.mint}")

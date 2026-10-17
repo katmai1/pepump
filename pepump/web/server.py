@@ -13,6 +13,7 @@ intermedia.
   POST /api/positions/{id}/close      cerrar (vender) una posición
   POST /api/positions/close-all       cerrar todas
   GET  /api/logs                      últimos logs (?mint=...&after=<seq>&limit=...)
+  GET  /api/history                   posiciones terminadas en ejecuciones anteriores
   WS   /ws                            estado cada segundo + logs en el momento
 
 Seguridad:
@@ -214,6 +215,10 @@ def create_app(manager: PositionManager, logs: LogBuffer, *, live: bool,
     @app.get("/api/logs", dependencies=lectura)
     async def get_logs(mint: Optional[str] = None, after: int = 0, limit: int = 500):
         return logs.entries(mint=mint, after=after, limit=max(1, min(limit, 2000)))
+
+    @app.get("/api/history", dependencies=lectura)
+    async def get_history(limit: int = 100):
+        return manager.history(limit=max(1, min(limit, 500)))
 
     # --- órdenes ---------------------------------------------------------- #
     @app.post("/api/positions/close-all", dependencies=orden)

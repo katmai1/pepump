@@ -85,6 +85,9 @@ function logTag(mint) {
 
 function statusOf(snap) {
   const pos = snap.position;
+  if (snap.phase === "open" && !snap.running && snap.detached) {
+    return { icon: "⏸", label: "Detenida sin vender", tone: "warn" };
+  }
   if (snap.phase === "open" && !snap.running) {
     return { icon: "⚠", label: "ABIERTA SIN VIGILAR", tone: "critical" };
   }
@@ -213,7 +216,8 @@ function renderTable(now) {
       el("td", { dataset: { label: "#" } }, `#${snap.id}`),
       el("td", { dataset: { label: "Token" } },
         el("div", { class: "token" },
-          el("span", { class: "token-name" }, tokenTitle(snap)),
+          el("span", { class: "token-name" }, tokenTitle(snap),
+            snap.recovered ? el("span", { class: "tag-pill", title: "Retomada de una ejecución anterior del bot" }, "retomada") : null),
           // Sin símbolo todavía, el título ya ES el mint acortado.
           tokenTitle(snap) === shortMint(snap.mint) ? null : el("span", { class: "token-mint" }, shortMint(snap.mint)))),
       el("td", { dataset: { label: "Estado" } },
@@ -397,6 +401,7 @@ function renderDetail() {
     kv("Mint", link, { mono: true }),
     kv("Estado", `${st.icon} ${st.label}`),
     kv("Modo", snap.live ? "REAL" : "Simulado"),
+    ...(snap.recovered ? [kv("Origen", "Retomada de una ejecución anterior")] : []),
     kv("Fuente del precio", snap.price_source === "feed" ? "Feed en vivo (PumpPortal)" : `On-chain (${snap.price_source})`),
     kv("Precio actual", fmtPrice(snap.latest_price)),
   ];
@@ -495,6 +500,45 @@ function renderLogFilterOptions() {
   select.value = state.logFilter;
 }
 
+// --------------------------------------------------------------- historial
+
+const HISTORY_STATUS = {
+  closed: "✓ Cerrada",
+  cancelled: "■ Sin compra",
+  review: "⚠ Revisar a mano",
+};
+
+function fmtDate(ts) {
+  if (!ts) return "—";
+  return new Date(ts * 1000).toLocaleString("es-ES", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+}
+
+async function loadHistory() {
+  let rows;
+  try {
+    rows = await api("/api/history?limit=100");
+  } catch {
+    return;
+  }
+  const box = document.getElementById("history");
+  box.hidden = rows.length === 0;
+  document.querySelector("#history tbody").replaceChildren(...rows.map((r) => {
+    const title = r.token_symbol ? `$${r.token_symbol}` : shortMint(r.mint);
+    return el("tr", {},
+      el("td", { dataset: { label: "#" } }, `#${r.id}`),
+      el("td", { dataset: { label: "Token" } },
+        el("div", { class: "token" },
+          el("span", { class: "token-name" }, title, r.live ? el("span", { class: "tag-pill" }, "real") : null),
+          title === shortMint(r.mint) ? null : el("span", { class: "token-mint" }, shortMint(r.mint)))),
+      el("td", { dataset: { label: "Resultado" } }, HISTORY_STATUS[r.status] || r.status),
+      el("td", { class: `num ${toneClass(r.realized_pnl_pct)}`, dataset: { label: "PnL" } }, fmtPct(r.realized_pnl_pct)),
+      el("td", { class: `num ${toneClass(r.realized_pnl_sol)}`, dataset: { label: "PnL SOL" } }, fmtSolSigned(r.realized_pnl_sol)),
+      el("td", { class: "reason", dataset: { label: "Motivo" } }, r.close_reason || r.end_reason || "—"),
+      el("td", { class: "num", dataset: { label: "Fecha" } }, fmtDate(r.closed_at || r.updated_at)),
+    );
+  }));
+}
+
 // ---------------------------------------------------------------- render
 
 let serverOffset = 0; // reloj del servidor - reloj local (para las duraciones)
@@ -544,6 +588,7 @@ function connect() {
       state.logs = msg.logs.slice(-MAX_LOGS);
       applyState(msg.state);
       renderLogs();
+      loadHistory();
     } else if (msg.type === "state") {
       applyState(msg.state);
     } else if (msg.type === "logs") {

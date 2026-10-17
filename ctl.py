@@ -67,7 +67,9 @@ def label(snap: dict) -> str:
 
 def describe(snap: dict) -> str:
     pos = snap.get("position")
-    if snap["phase"] == "open" and not snap["running"]:
+    if snap["phase"] == "open" and not snap["running"] and snap.get("detached"):
+        estado = "⏸ detenida sin vender"
+    elif snap["phase"] == "open" and not snap["running"]:
         estado = "⚠ ABIERTA SIN VIGILAR"
     elif snap["close_requested"] and snap["running"]:
         estado = "cerrando"

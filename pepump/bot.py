@@ -51,13 +51,19 @@ class TrailingTakeProfitBot:
     lógica de trailing take-profit / stop-loss inicial.
     """
 
-    def __init__(self, client, executor, config, panel=None, metadata_client=None):
+    def __init__(self, client, executor, config, panel=None, metadata_client=None,
+                 persist=None, resume_position: Optional[Position] = None,
+                 resume_onchain_source: Optional[str] = None):
         self.client = client
         self.executor = executor
         self.mint = config.mint
         self.cfg = config
         self.status_interval_seconds = config.status_interval_seconds
-        self.position: Optional[Position] = None
+        # Con resume_position, la posición ya está comprada (de una
+        # ejecución anterior, ver PositionManager.recover): run() no compra,
+        # solo la vigila.
+        self.position: Optional[Position] = resume_position
+        self.recovered = resume_position is not None
         self.latest_price: Optional[float] = None
         self._closed_event = asyncio.Event()
         self._ws = None
@@ -84,7 +90,7 @@ class TrailingTakeProfitBot:
         #   "pumpswap"     -> el mint ya migró a PumpSwap; se lee el
         #                     precio directo del pool on-chain (ver
         #                     PumpSwapOnChainClient).
-        self._onchain_source: Optional[str] = None
+        self._onchain_source: Optional[str] = resume_onchain_source
         # Si _get_reference_price (o algo que llame desde ahí) ya
         # logueó un motivo específico para devolver None -mint que no es
         # de pump.fun, timeout total, fallback on-chain sin precio,
@@ -111,6 +117,15 @@ class TrailingTakeProfitBot:
         # Motivo con el que se pidió close() (None si nadie lo pidió:
         # p. ej. la venta de cierre porque murió el monitor de precios).
         self._close_reason: Optional[str] = None
+        # Qué hacer con una posición abierta al pedir el cierre: "sell"
+        # (close(): se vende) o "keep" (stop(): se deja abierta y guardada
+        # para retomarla al volver a arrancar).
+        self._close_mode = "sell"
+        # True si run() terminó dejando la posición abierta A PROPÓSITO (stop()).
+        self.detached = False
+        # Guarda el estado (ver store.py); lo pone el gestor. None = sin
+        # persistencia (tests, uso suelto).
+        self._persist_cb = persist
         # Estado para quien mire el bot desde fuera (ver snapshot()):
         #   "starting" -> "connecting" -> "waiting_entry" -> "buying"
         #   -> "open" -> "closing" (venta de cierre por close()) ->
@@ -164,9 +179,16 @@ class TrailingTakeProfitBot:
 
         `reason` sale en el log y en el motivo de la venta (historial)."""
         if self._shutdown_requested.is_set():
-            # Segundo pedido (otro Ctrl+C) mientras ya se está vendiendo/
-            # cerrando: no hacemos nada especial (no forzamos un corte
-            # abrupto), simplemente evitamos loguear el aviso de nuevo.
+            if self._close_mode == "keep" and self.running:
+                # Se había pedido parar sin vender y ahora piden cerrar
+                # vendiendo (p. ej. "Cerrar" en la web mientras el proceso
+                # se detenía): gana vender, si todavía se está a tiempo.
+                self._close_mode = "sell"
+                self._close_reason = reason
+                logger.warning(f"⚠️  {reason}: se venderá en vez de dejarla abierta.")
+            # Si no, segundo pedido (otro Ctrl+C) mientras ya se está
+            # vendiendo/cerrando: no hacemos nada especial (no forzamos un
+            # corte abrupto), simplemente evitamos loguear el aviso de nuevo.
             return
         # close() corre en el contexto de quien lo llama (el manejador de
         # la señal, la web), no en el de run(): se etiqueta a mano para
@@ -179,6 +201,36 @@ class TrailingTakeProfitBot:
             current_mint.reset(ctx)
         self._close_reason = reason
         self._shutdown_requested.set()
+
+    def stop(self, reason: str = "detenido") -> None:
+        """Como close(), pero SIN vender: si hay una posición abierta se deja
+        tal cual (guardada, se retoma al volver a arrancar) y run() termina.
+        Si todavía no compró, cancela la entrada igual que close()."""
+        if self._shutdown_requested.is_set():
+            return
+        ctx = current_mint.set(self.mint)
+        try:
+            if self.position is not None and not self.position.closed:
+                logger.warning(f"⏸️  {reason}. La posición queda ABIERTA (sin vender) y se retoma al "
+                               f"volver a arrancar el bot. Mientras esté parado, nadie vigila el stop.")
+            else:
+                logger.warning(f"⏸️  {reason}. Deteniendo...")
+        finally:
+            current_mint.reset(ctx)
+        self._close_reason = reason
+        self._close_mode = "keep"
+        self._shutdown_requested.set()
+
+    def _persist(self) -> None:
+        """Guarda el estado actual (ver store.py). Un fallo al guardar se
+        avisa pero nunca tumba al bot: la posición sigue vigilada igual."""
+        if self._persist_cb is None:
+            return
+        try:
+            self._persist_cb(self)
+        except Exception as e:
+            logger.error(f"No se pudo guardar el estado de la posición: {e!r}. Si el bot se "
+                         f"reinicia ahora, podría no retomarla.")
 
     async def run(self) -> None:
         """Corre el bot hasta que la posición se cierre (TP/SL), se pida
@@ -201,11 +253,15 @@ class TrailingTakeProfitBot:
                 self.phase = "closed"
             elif self.position is not None:
                 self.phase = "open"
-                self.end_reason = "el bot terminó con la posición ABIERTA: revísala a mano"
+                if self.detached:
+                    self.end_reason = "detenida sin vender: se retoma al volver a arrancar"
+                else:
+                    self.end_reason = "el bot terminó con la posición ABIERTA: revísala a mano"
             else:
                 self.phase = "stopped"
             self.running = False
             self.finished_at = time.time()
+            self._persist()
             current_mint.reset(ctx)
 
     async def _run(self) -> None:
@@ -263,36 +319,20 @@ class TrailingTakeProfitBot:
                 self.end_reason = f"no se pudo conectar al feed de PumpPortal: {e}"
                 return
             self._trade_events = self.client.iter_trade_events(self._ws)
-            self.phase = "waiting_entry"
-
-            initial_price = await self._get_initial_price()
-            if initial_price is None:
-                if self._shutdown_requested.is_set():
-                    logger.info("Cancelado antes de abrir posición; no hay nada que vender.")
-                    self.end_reason = f"cancelado antes de abrir posición ({self._close_reason})"
+            if self.position is None:
+                if not await self._enter():
                     return
-                self.end_reason = "no se consiguió precio de entrada (ver logs)"
-                if not self._initial_price_failure_reason_logged:
-                    # Solo llegamos aquí si no se logueó ningún motivo
-                    # específico arriba (ver _initial_price_failure_reason_logged):
-                    # un caso realmente no cubierto por los diagnósticos de
-                    # _get_reference_price. Si ya se logueó un motivo
-                    # puntual (mint que no es de pump.fun, timeout total,
-                    # fallback on-chain sin precio, etc.) NO lo repetimos aquí
-                    # con un mensaje genérico que podría contradecirlo.
-                    logger.error("Se cortó la conexión con PumpPortal antes de recibir un trade con "
-                                 "precio. Verifica la dirección del token y la api_key, y vuelve a intentar.")
-                return
-
-            self.latest_price = initial_price
-            self.phase = "buying"
-            try:
-                await self._on_first_price(initial_price)
-            except Exception as e:
-                logger.error(f"La compra no se confirmó on-chain, no se abrió ninguna posición: {e}")
-                self.end_reason = f"la compra falló: {e}"
-                return
-            self.phase = "open"
+            else:
+                # Posición retomada de una ejecución anterior (ver store.py y
+                # PositionManager.recover): ya está comprada, se sigue vigilando
+                # desde donde estaba (entrada, máximo, armado).
+                self.phase = "open"
+                pos = self.position
+                estado = (f"armada, máximo {pos.highest_price:.10f}" if pos.armed
+                          else f"esperando activación +{self.cfg.activation_pct}%")
+                logger.info(f"♻️  Posición retomada: entrada {pos.market_entry_price:.10f} SOL/token, "
+                            f"{pos.token_amount:,.2f} tokens, {estado}.")
+            self._persist()
 
             if self._onchain_source is not None:
                 # subscribeTokenTrade no está entregando nada útil para
@@ -324,7 +364,11 @@ class TrailingTakeProfitBot:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
-            if need_shutdown_sell:
+            if need_shutdown_sell and self._close_mode == "keep" \
+                    and self.position is not None and not self.position.closed:
+                # stop(): se deja abierta a propósito (ya avisó stop()).
+                self.detached = True
+            elif need_shutdown_sell:
                 if self.position is not None and not self.position.closed:
                     self.phase = "closing"
                     logger.warning("Vendiendo la posición abierta al precio actual antes de salir...")
@@ -349,6 +393,45 @@ class TrailingTakeProfitBot:
                     logger.debug(f"No se pudo cerrar limpiamente el websocket: {e}")
 
         logger.info("Bot finalizado.")
+
+    async def _enter(self) -> bool:
+        """Consigue el precio de entrada y compra. True si quedó una
+        posición abierta; False si no (cancelado, sin precio, compra
+        fallida), con self.end_reason explicando por qué."""
+        self.phase = "waiting_entry"
+
+        initial_price = await self._get_initial_price()
+        if initial_price is None:
+            if self._shutdown_requested.is_set():
+                logger.info("Cancelado antes de abrir posición; no hay nada que vender.")
+                self.end_reason = f"cancelado antes de abrir posición ({self._close_reason})"
+                return False
+            self.end_reason = "no se consiguió precio de entrada (ver logs)"
+            if not self._initial_price_failure_reason_logged:
+                # Solo llegamos aquí si no se logueó ningún motivo
+                # específico arriba (ver _initial_price_failure_reason_logged):
+                # un caso realmente no cubierto por los diagnósticos de
+                # _get_reference_price. Si ya se logueó un motivo
+                # puntual (mint que no es de pump.fun, timeout total,
+                # fallback on-chain sin precio, etc.) NO lo repetimos aquí
+                # con un mensaje genérico que podría contradecirlo.
+                logger.error("Se cortó la conexión con PumpPortal antes de recibir un trade con "
+                             "precio. Verifica la dirección del token y la api_key, y vuelve a intentar.")
+            return False
+
+        self.latest_price = initial_price
+        self.phase = "buying"
+        # ANTES de mandar la compra: si el proceso muere con la orden en
+        # vuelo, al arrancar se sabe que hay que mirar la wallet.
+        self._persist()
+        try:
+            await self._on_first_price(initial_price)
+        except Exception as e:
+            logger.error(f"La compra no se confirmó on-chain, no se abrió ninguna posición: {e}")
+            self.end_reason = f"la compra falló: {e}"
+            return False
+        self.phase = "open"
+        return True
 
     async def _wait_for_close_or_shutdown(self, monitor_task: Optional[asyncio.Task] = None) -> bool:
         """Espera a que la posición se cierre sola (TP/SL normal) O a que
@@ -442,6 +525,7 @@ class TrailingTakeProfitBot:
                 try:
                     await self.executor.sell(self.position, price, self._shutdown_sell_reason(),
                                               pool_override=self._current_pool_override())
+                    self._persist()
                     return
                 except Exception as e:
                     if attempt < self._SHUTDOWN_SELL_ATTEMPTS:
@@ -1290,6 +1374,7 @@ class TrailingTakeProfitBot:
         self.token_name, self.token_symbol = found
         if self.token_symbol:
             set_mint_label(self.mint, f"${self.token_symbol} {self.mint[:4]}")
+        self._persist()
         logger.info(f"Token: {self._token_label()}")
         self._update_panel_fixed()
 
@@ -1315,6 +1400,8 @@ class TrailingTakeProfitBot:
             "phase": phase,
             "running": self.running,
             "close_requested": self._shutdown_requested.is_set(),
+            "recovered": self.recovered,
+            "detached": self.detached,
             "close_reason": self._close_reason,
             "end_reason": self.end_reason,
             "started_at": self.started_at,
@@ -1513,6 +1600,7 @@ class TrailingTakeProfitBot:
             if price >= entry * (1 + self.cfg.activation_pct / 100.0):
                 pos.armed = True
                 pos.highest_price = price
+                self._persist()
                 logger.info(f"✅ Trailing-stop ARMADO. Precio actual {price:.10f} "
                             f"(PnL {pnl:+.2f}%). Máximo inicial registrado.")
             elif price <= entry * (1 - self.cfg.initial_stop_pct / 100.0):
@@ -1522,6 +1610,7 @@ class TrailingTakeProfitBot:
         # --- Caso 2: trailing-stop armado, sigue el máximo ----------------- #
         if price > pos.highest_price:
             pos.highest_price = price
+            self._persist()
             stop_price = pos.highest_price * (1 - self.cfg.trailing_pct / 100.0)
             logger.info(f"📈 Nuevo máximo: {price:.10f} (PnL {pnl:+.2f}%) "
                         f"| nuevo nivel de venta (trailing): {stop_price:.10f}")
@@ -1559,4 +1648,5 @@ class TrailingTakeProfitBot:
                 logger.warning(f"⚠️  Venta fallida ({reason}): {e}. La posición SIGUE ABIERTA, "
                                f"se reintentará con el próximo precio que llegue.")
                 return
+        self._persist()
         self._closed_event.set()

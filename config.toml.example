@@ -26,6 +26,12 @@ trade_history_csv = "trade_history.csv"
 # entry_dip_pct > 0.
 status_interval_seconds = 5.0
 
+# Base de datos (SQLite) con el estado de las posiciones. Gracias a ella,
+# si el bot se para (Ctrl+C, un corte de luz, un cuelgue), al volver a
+# arrancarlo retoma las posiciones que quedaron abiertas, sin volver a
+# comprar. "" la desactiva (no recomendado).
+state_db = "pepump.db"
+
 [trade]
 # Cantidad de SOL a comprar.
 buy_sol = 0.05

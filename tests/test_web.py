@@ -55,6 +55,9 @@ class FakeManager:
             if snap["id"] == ref:
                 snap["close_requested"] = True
 
+    def history(self, limit=100):
+        return [{"id": 99, "mint": A, "status": "closed", "realized_pnl_pct": 12.5}][:limit]
+
     def close_all(self, reason="", block_new=True):
         self.close_all_calls.append((reason, block_new))
         return len(self.snaps)
@@ -87,6 +90,12 @@ def test_state_y_posiciones():
 
     assert client.get("/api/positions/1").json() == SNAP
     assert client.get("/api/positions/2").status_code == 404
+
+
+def test_historial():
+    client, _ = make_client()
+    assert client.get("/api/history").json()[0]["id"] == 99
+    assert client.post("/api/history", headers=PAGE).status_code == 405
 
 
 def test_la_pagina_y_los_estaticos():

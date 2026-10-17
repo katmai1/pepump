@@ -187,12 +187,14 @@ def position_label(snap: dict) -> str:
 
 def position_row(snap: dict) -> str:
     """Una línea por posición para el panel con varias posiciones."""
-    partes = [f" #{snap['id']} {position_label(snap)}"]
+    partes = [f" #{snap['id']} {position_label(snap)}" + (" (retomada)" if snap.get("recovered") else "")]
     fase = _FASES.get(snap["phase"], snap["phase"])
     pos = snap.get("position")
     if pos is not None and snap["phase"] == "open":
         fase += " · armada" if pos["armed"] else " · esperando activación"
-    if snap["phase"] == "open" and not snap["running"]:
+    if snap["phase"] == "open" and not snap["running"] and snap.get("detached"):
+        fase = "⏸️  detenida sin vender"
+    elif snap["phase"] == "open" and not snap["running"]:
         fase = "⚠️  ABIERTA SIN VIGILAR"
     elif snap["close_requested"] and snap["phase"] not in ("closed", "stopped"):
         fase = "cerrando"
@@ -256,6 +258,7 @@ class MultiPositionPanel:
         self._snapshot = snapshot
         self._live = live
         self._children: dict = {}
+        self.ctrl_c_hint = "Ctrl+C sale sin vender"
 
     def for_position(self, managed) -> _PositionPanel:
         child = _PositionPanel(self)
@@ -271,7 +274,7 @@ class MultiPositionPanel:
         modo = "REAL" if self._live else "SIMULADO"
         activas = sum(1 for s in snaps if s["running"])
         cabecera = [f" PePump | Modo {modo} | {len(snaps)} posiciones ({activas} activas) "
-                    f"| Ctrl+C cierra todas"]
+                    f"| {self.ctrl_c_hint}"]
         self.panel.set_all(cabecera + [position_row(s) for s in snaps], "")
 
     def close(self) -> None:

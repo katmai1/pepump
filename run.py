@@ -78,9 +78,9 @@ logger = logging.getLogger(__name__)
 def parse_args():
     p = argparse.ArgumentParser(description="Bot de trailing take-profit para pump.fun (Lightning API de PumpPortal)")
 
-    p.add_argument("-m", "--mint", type=str, required=True, action="append",
-                   help="Mint con el que se va a operar. Se puede repetir para abrir varias "
-                        "posiciones a la vez: -m <MINT1> -m <MINT2>")
+    p.add_argument("-m", "--mint", type=str, action="append", default=[],
+                   help="Mint con el que abrir una posición. Se puede repetir: -m <MINT1> -m <MINT2>. "
+                        "Sin -m, solo se retoman las posiciones que quedaron abiertas")
     p.add_argument("-c", "--config", default="config.toml", help="Ruta al archivo .toml de configuración (default: config.toml)")
     p.add_argument("-v", "--verbose", action="store_true", help="Logging en nivel DEBUG en vez de INFO")
     p.add_argument("--web", nargs="?", type=int, const=8080, default=None, metavar="PUERTO",
@@ -90,6 +90,9 @@ def parse_args():
                    help="Interfaz donde escucha el panel web (default 127.0.0.1: solo esta máquina). "
                         "Con la IP de la red local (o 0.0.0.0) lo ve toda la red: conviene poner "
                         "web_password en el .toml")
+    p.add_argument("--sell-on-exit", action="store_true",
+                   help="Ctrl+C VENDE todas las posiciones antes de salir. Sin esto, Ctrl+C sale sin "
+                        "vender y las posiciones se retoman al volver a arrancar")
     p.add_argument("--no-panel", action="store_true",
                    help="Sin panel fijo al pie: el estado se imprime como una línea de log más cada intervalo")
 
@@ -115,7 +118,7 @@ def show_header(live):
 if __name__ == "__main__":
     args = parse_args()
     panel = setup_logging(level=logging.DEBUG if args.verbose else logging.INFO, panel=not args.no_panel,
-                          tag_mint=len(args.mint) > 1)
+                          tag_mint=True)
 
     
     try:
@@ -168,11 +171,25 @@ if __name__ == "__main__":
 
     client = PumpPortalClient(api_key=config.api_key)
 
+    store = None
+    if config.state_db:
+        from pepump.store import PositionStore
+        try:
+            store = PositionStore(config.state_db)
+        except Exception as e:
+            logger.error(f"No se pudo abrir la base de datos de estado '{config.state_db}': {e}")
+            sys.exit(1)
+    elif not args.sell_on_exit:
+        logger.warning("general.state_db está vacío: sin base de datos, lo que quede abierto al salir "
+                       "NO se retoma después. Considera usar --sell-on-exit.")
+
     async def main():
-        manager = PositionManager(base_config=config, client=client,
+        manager = PositionManager(base_config=config, client=client, store=store,
                                   metadata_client=TokenMetadataOnChainClient(config.solana_rpc_url))
         if panel is not None:
             multi = MultiPositionPanel(panel, manager.snapshot, live=config.live)
+            if args.sell_on_exit:
+                multi.ctrl_c_hint = "Ctrl+C vende todas y sale"
             manager.panel_factory = multi.for_position
 
         web = None
@@ -187,11 +204,24 @@ if __name__ == "__main__":
             logger.info(f"Panel web: http://{shown_host}:{args.web}")
 
         def on_signal(sig_name: str) -> None:
-            manager.close_all(f"{sig_name} recibido")
+            if args.sell_on_exit:
+                manager.close_all(f"{sig_name} recibido")
+            else:
+                manager.stop_all(f"{sig_name} recibido, saliendo sin vender")
 
         async def run_all():
+            retomadas = await manager.recover()
             for mint in mints:
+                if manager.get(mint) is not None and manager.get(mint).active:
+                    logger.info(f"{mint} ya estaba abierta y se retomó: no se abre otra.")
+                    continue
                 manager.open(mint)
+            if not manager.positions():
+                logger.info("No hay posiciones abiertas que retomar ni mints (-m) que abrir. Nada que hacer.")
+                return
+            if retomadas and not mints:
+                logger.info(f"Retomadas {len(retomadas)} posiciones. Ctrl+C sale "
+                            f"{'vendiendo' if args.sell_on_exit else 'SIN vender'}.")
             await manager.wait_all()
 
         try:
@@ -200,6 +230,11 @@ if __name__ == "__main__":
             if web is not None:
                 await web.stop()
             await manager.aclose()
+            abiertas = [m for m in manager.positions() if m.bot.detached]
+            if abiertas:
+                logger.warning(f"⏸️  {len(abiertas)} posición(es) quedan ABIERTAS sin vigilar: "
+                               f"{', '.join(f'#{m.id}' for m in abiertas)}. Se retoman al volver a "
+                               f"arrancar el bot (python run.py, con o sin -m).")
 
     try:
         asyncio.run(main())
@@ -208,3 +243,5 @@ if __name__ == "__main__":
     finally:
         if panel is not None:
             panel.close()
+        if store is not None:
+            store.close()

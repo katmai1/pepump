@@ -21,6 +21,10 @@ class AppConfig:
     # al cerrar la primera orden; si ya existe, se sigue agregando abajo sin
     # tocar lo que ya había. "" desactiva el historial.
     trade_history_csv: str = "trade_history.csv"
+    # Base de datos SQLite donde se guarda el estado de las posiciones para
+    # retomarlas al volver a arrancar (ver store.py). "" la desactiva: al
+    # salir, lo que quede abierto se pierde de vista.
+    state_db: str = "pepump.db"
 
     # --- [trade] ------------------------------------------------------- #
     buy_sol: float = 0.05
