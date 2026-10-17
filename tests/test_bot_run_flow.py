@@ -82,7 +82,7 @@ async def test_run_cancels_monitor_before_selling_on_shutdown():
         # Espera a que haya posición (compra ya hecha) y pide shutdown.
         while bot.position is None:
             await asyncio.sleep(0.005)
-        bot._request_shutdown("SIGINT")
+        bot.close("SIGINT recibido")
 
     asyncio.create_task(request_shutdown_after_buy())
 

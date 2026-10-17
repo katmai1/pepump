@@ -1,11 +1,11 @@
 import asyncio
 import contextlib
 import logging
-import signal
 import time
 from typing import AsyncIterator, Optional
 
 from pepump.executor import Position
+from pepump.log_context import current_mint
 from pepump.pump import (PumpSwapOnChainClient, PumpCurveOnChainClient, RaydiumCpmmOnChainClient,
                          MeteoraDlmmOnChainClient)
 
@@ -98,8 +98,9 @@ class TrailingTakeProfitBot:
         # Stalls SEGUIDOS del feed en vivo con la bonding curve todavía
         # activa (ver _handle_feed_stall y _MAX_CURVE_STALLS_BEFORE_POLLING).
         self._curve_stalls = 0
-        # Se activa con Ctrl+C (SIGINT), SIGTERM o SIGBREAK (ver
-        # _install_shutdown_handlers). NO se usa el try/except
+        # Se activa con close() -que llaman Ctrl+C (SIGINT), SIGTERM o
+        # SIGBREAK vía shutdown.py, o quien controle el bot desde fuera-.
+        # NO se usa el try/except
         # KeyboardInterrupt clásico porque en asyncio esa señal
         # interrumpe el loop de eventos "por afuera" de la corrutina en
         # ejecución, no dentro de ella -no hay garantía de que un
@@ -107,6 +108,25 @@ class TrailingTakeProfitBot:
         # manejador de señales que solo marca este asyncio.Event, el
         # apagado se coordina de forma confiable.
         self._shutdown_requested = asyncio.Event()
+        # Motivo con el que se pidió close() (None si nadie lo pidió:
+        # p. ej. la venta de cierre porque murió el monitor de precios).
+        self._close_reason: Optional[str] = None
+        # Estado para quien mire el bot desde fuera (ver snapshot()):
+        #   "starting" -> "connecting" -> "waiting_entry" -> "buying"
+        #   -> "open" -> "closing" (venta de cierre por close()) ->
+        #   "closed" (posición vendida) o "stopped" (terminó sin abrir
+        #   posición: cancelado, error de conexión, compra fallida...).
+        # Si run() termina con la posición TODAVÍA abierta (falló la venta
+        # de cierre) se queda en "open" con running=False: es el caso que
+        # hay que revisar a mano.
+        self.phase = "starting"
+        self.running = False
+        self.end_reason: Optional[str] = None
+        self.started_at: Optional[float] = None
+        self.finished_at: Optional[float] = None
+        # Precio objetivo de la baja de entrada (entry_dip_pct > 0), para
+        # mostrarlo mientras se espera; None si no aplica o aún no se sabe.
+        self._dip_target: Optional[float] = None
         # BUGFIX (doble venta): serializa CUALQUIER intento de venta de la
         # posición (ya sea por trailing-stop/stop-loss vía _try_sell, o por
         # cierre manual vía _sell_on_shutdown). No alcanza con solo
@@ -132,120 +152,63 @@ class TrailingTakeProfitBot:
         self.token_symbol: Optional[str] = None
         self._update_panel_fixed()
 
-    # Señales que disparan el cierre ordenado. SIGBREAK (Ctrl+Pausa) solo
-    # existe en Windows, así que se filtra con getattr: en Unix no está y
-    # la tupla se queda con SIGINT/SIGTERM.
-    _SHUTDOWN_SIGNALS = tuple(
-        sig for sig in (getattr(signal, "SIGINT", None),
-                        getattr(signal, "SIGTERM", None),
-                        getattr(signal, "SIGBREAK", None))
-        if sig is not None
-    )
+    def close(self, reason: str = "cierre manual") -> None:
+        """Pide el cierre ordenado: si hay una posición abierta se vende
+        al precio más actual posible y run() termina; si todavía no se
+        compró, se corta la espera y run() termina sin comprar nada.
 
-    def _install_shutdown_handlers(self, loop) -> list:
-        """Instala los manejadores de cierre ordenado y devuelve la lista
-        de funciones que los desinstalan (las llama el finally de run()).
+        Es la ÚNICA forma de parar el bot desde fuera (Ctrl+C vía
+        shutdown.run_with_shutdown_signals, y más adelante la web). No
+        bloquea ni espera a que se venda: solo marca el pedido; para
+        saber cuándo terminó, se espera a run().
 
-        Hay DOS caminos porque no existe uno que sirva en los dos
-        sistemas operativos:
-
-          1. `loop.add_signal_handler()` (Unix): el preferido. La señal
-             nunca pasa por un manejador de Python, así que no hay
-             ninguna ventana en la que llegue "por afuera" de la
-             corrutina en ejecución.
-
-          2. `signal.signal()` (Windows): add_signal_handler() es solo de
-             Unix y en Windows lanza NotImplementedError. BUGFIX: sin este
-             fallback no se instalaba NADA en Windows, así que
-             `_shutdown_requested` no se marcaba nunca: Ctrl+C subía como
-             KeyboardInterrupt, run.py lo atrapaba y el proceso terminaba
-             SIN VENDER la posición abierta -justo lo que el cierre
-             ordenado existe para evitar, y con SOL real de por medio-.
-             El manejador no toca el Event directamente (correría fuera
-             del loop de eventos, donde Event.set() no despierta a nadie):
-             hace `loop.call_soon_threadsafe`, que además despierta al
-             ProactorEventLoop -desde Python 3.8 las señales escriben en
-             el socket interno del loop, así que se atiende enseguida y no
-             al llegar el próximo trade del websocket.
-
-        OJO (Windows): SIGTERM se puede registrar pero el sistema no lo
-        entrega nunca; `taskkill /F` mata el proceso en seco, sin darle
-        oportunidad de vender. Ahí el cierre ordenado es Ctrl+C o
-        Ctrl+Pausa."""
-        restores = []
-        for sig in self._SHUTDOWN_SIGNALS:
-            restore = self._install_one_shutdown_handler(loop, sig)
-            if restore is not None:
-                restores.append(restore)
-        if not restores:
-            logger.warning("No se pudo instalar ningún manejador de señales en este sistema: el "
-                           "cierre ordenado NO va a funcionar y una posición abierta puede quedar "
-                           "SIN VENDER al salir. Ciérrala a mano si hace falta.")
-        return restores
-
-    def _install_one_shutdown_handler(self, loop, sig):
-        """Instala el manejador de UNA señal por el mejor camino
-        disponible (ver _install_shutdown_handlers). Devuelve la función
-        que lo desinstala, o None si no se pudo instalar por ninguno de
-        los dos caminos."""
-        try:
-            loop.add_signal_handler(sig, self._request_shutdown, sig.name)
-        except (NotImplementedError, RuntimeError):
-            pass  # Windows, o no estamos en el hilo principal -> camino 2.
-        else:
-            def _quitar_de_asyncio() -> None:
-                try:
-                    loop.remove_signal_handler(sig)
-                except Exception:
-                    pass
-            return _quitar_de_asyncio
-
-        sig_name = sig.name
-
-        def _manejador(_signum, _frame) -> None:
-            try:
-                loop.call_soon_threadsafe(self._request_shutdown, sig_name)
-            except RuntimeError:
-                # El loop ya se cerró (señal justo durante el apagado):
-                # no hay nada que coordinar, y propagar desde un
-                # manejador de señales solo ensuciaría la salida.
-                pass
-
-        try:
-            anterior = signal.signal(sig, _manejador)
-        except (ValueError, OSError, RuntimeError) as e:
-            # ValueError: no estamos en el hilo principal, o esta señal no
-            # existe en este sistema. El aviso global (si no se pudo
-            # instalar NINGUNA) lo da _install_shutdown_handlers.
-            logger.debug(f"No se pudo instalar manejador para {sig_name} en este sistema: {e}")
-            return None
-
-        logger.debug(f"Manejador de {sig_name} instalado vía signal.signal "
-                     f"(add_signal_handler no está disponible en este sistema).")
-
-        def _restaurar_anterior() -> None:
-            # signal.signal() devuelve None cuando el manejador previo no
-            # venía de Python: en ese caso no hay nada que restaurar, y
-            # pasarle None sería un TypeError.
-            if anterior is None:
-                return
-            try:
-                signal.signal(sig, anterior)
-            except Exception:
-                pass
-        return _restaurar_anterior
-
-    def _request_shutdown(self, sig_name: str) -> None:
+        `reason` sale en el log y en el motivo de la venta (historial)."""
         if self._shutdown_requested.is_set():
-            # Segundo Ctrl+C mientras ya se está vendiendo/cerrando: no
-            # hacemos nada especial aquí (no forzamos un corte abrupto),
-            # simplemente evitamos loguear el aviso de nuevo.
+            # Segundo pedido (otro Ctrl+C) mientras ya se está vendiendo/
+            # cerrando: no hacemos nada especial (no forzamos un corte
+            # abrupto), simplemente evitamos loguear el aviso de nuevo.
             return
-        logger.warning(f"⚠️  {sig_name} recibido. Cerrando ordenadamente "
-                       f"(si hay una posición abierta, se vende al precio actual)...")
+        # close() corre en el contexto de quien lo llama (el manejador de
+        # la señal, la web), no en el de run(): se etiqueta a mano para
+        # que este aviso salga con el mint del bot como el resto.
+        ctx = current_mint.set(self.mint)
+        try:
+            logger.warning(f"⚠️  {reason}. Cerrando ordenadamente "
+                           f"(si hay una posición abierta, se vende al precio actual)...")
+        finally:
+            current_mint.reset(ctx)
+        self._close_reason = reason
         self._shutdown_requested.set()
 
     async def run(self) -> None:
+        """Corre el bot hasta que la posición se cierre (TP/SL), se pida
+        close(), o no se pueda abrir. Ver _run para el detalle.
+
+        Todo lo que se loguea mientras tanto -incluido lo que loguean el
+        executor y el cliente, y los hilos de asyncio.to_thread- lleva el
+        mint en `record.mint` (ver log_context.py), para poder separar los
+        logs de cada posición cuando corran varias en el mismo proceso.
+
+        OJO: cancelar la tarea de run() es un corte en seco, SIN vender.
+        Para parar vendiendo la posición, close()."""
+        ctx = current_mint.set(self.mint)
+        self.running = True
+        self.started_at = time.time()
+        try:
+            await self._run()
+        finally:
+            if self.position is not None and self.position.closed:
+                self.phase = "closed"
+            elif self.position is not None:
+                self.phase = "open"
+                self.end_reason = "el bot terminó con la posición ABIERTA: revísala a mano"
+            else:
+                self.phase = "stopped"
+            self.running = False
+            self.finished_at = time.time()
+            current_mint.reset(ctx)
+
+    async def _run(self) -> None:
         """
         Se suscribe (subscribe_trade) al mint ANTES de comprar, para tener
         el feed de precios en vivo corriendo desde el arranque. Con esa
@@ -262,8 +225,8 @@ class TrailingTakeProfitBot:
         cualquier momento: si ya hay una posición abierta, se vende al
         precio más actual posible antes de salir (ver _sell_on_shutdown);
         si todavía no se compró nada, simplemente corta la espera y
-        termina sin vender nada. Ver _install_shutdown_handlers para cómo
-        se engancha cada señal en Unix y en Windows.
+        termina sin vender nada. Las señales llegan aquí vía close(); ver
+        shutdown.py para cómo se engancha cada una en Unix y en Windows.
         """
         logger.info(f"Siguiendo el token: {self.mint}")
         # En segundo plano: el nombre es solo informativo y no tiene por
@@ -271,9 +234,7 @@ class TrailingTakeProfitBot:
         name_task = (asyncio.create_task(self._load_token_name())
                      if self._metadata_client is not None else None)
         logger.debug(f"Suscribiéndose (subscribe_trade) al feed de trades de PumpPortal para {self.mint}...")
-
-        loop = asyncio.get_running_loop()
-        quitar_manejadores = self._install_shutdown_handlers(loop)
+        self.phase = "connecting"
 
         # OJO: connect_trade_stream ya deja el subscribe MANDADO del lado
         # de PumpPortal apenas conecta. Si algo revienta después de esto y
@@ -299,14 +260,19 @@ class TrailingTakeProfitBot:
             except Exception as e:
                 logger.error(f"No se pudo conectar/suscribir al feed de trades de PumpPortal "
                              f"({self.client.DATA_WS_URL}): {e}")
+                self.end_reason = f"no se pudo conectar al feed de PumpPortal: {e}"
                 return
             self._trade_events = self.client.iter_trade_events(self._ws)
+            self.phase = "waiting_entry"
 
             initial_price = await self._get_initial_price()
             if initial_price is None:
                 if self._shutdown_requested.is_set():
                     logger.info("Cancelado antes de abrir posición; no hay nada que vender.")
-                elif not self._initial_price_failure_reason_logged:
+                    self.end_reason = f"cancelado antes de abrir posición ({self._close_reason})"
+                    return
+                self.end_reason = "no se consiguió precio de entrada (ver logs)"
+                if not self._initial_price_failure_reason_logged:
                     # Solo llegamos aquí si no se logueó ningún motivo
                     # específico arriba (ver _initial_price_failure_reason_logged):
                     # un caso realmente no cubierto por los diagnósticos de
@@ -319,11 +285,14 @@ class TrailingTakeProfitBot:
                 return
 
             self.latest_price = initial_price
+            self.phase = "buying"
             try:
                 await self._on_first_price(initial_price)
             except Exception as e:
                 logger.error(f"La compra no se confirmó on-chain, no se abrió ninguna posición: {e}")
+                self.end_reason = f"la compra falló: {e}"
                 return
+            self.phase = "open"
 
             if self._onchain_source is not None:
                 # subscribeTokenTrade no está entregando nada útil para
@@ -357,6 +326,7 @@ class TrailingTakeProfitBot:
 
             if need_shutdown_sell:
                 if self.position is not None and not self.position.closed:
+                    self.phase = "closing"
                     logger.warning("Vendiendo la posición abierta al precio actual antes de salir...")
                     await self._sell_on_shutdown()
                 else:
@@ -364,8 +334,6 @@ class TrailingTakeProfitBot:
         finally:
             if name_task is not None:
                 name_task.cancel()
-            for quitar in quitar_manejadores:
-                quitar()
             if self._pending_next_event_task is not None:
                 self._pending_next_event_task.cancel()
                 self._pending_next_event_task = None
@@ -472,7 +440,7 @@ class TrailingTakeProfitBot:
                                  f"queda ABIERTA — revísala manualmente: https://pump.fun/{self.mint}")
                     return
                 try:
-                    await self.executor.sell(self.position, price, "cierre manual (Ctrl+C/SIGTERM)",
+                    await self.executor.sell(self.position, price, self._shutdown_sell_reason(),
                                               pool_override=self._current_pool_override())
                     return
                 except Exception as e:
@@ -483,6 +451,13 @@ class TrailingTakeProfitBot:
                     logger.error(f"Falló la venta de cierre manual tras {attempt} intentos: {e}. "
                                  f"La posición SIGUE ABIERTA — revísala manualmente: "
                                  f"https://pump.fun/{self.mint}")
+
+    def _shutdown_sell_reason(self) -> str:
+        if self._close_reason is not None:
+            return f"cierre manual ({self._close_reason})"
+        # Nadie pidió close(): se vende porque murió el monitor de precios
+        # (ver _wait_for_close_or_shutdown).
+        return "monitor de precios caído"
 
     async def _resolve_shutdown_price(self) -> Optional[float]:
         if self._onchain_source is not None:
@@ -621,6 +596,7 @@ class TrailingTakeProfitBot:
             return reference_price
 
         target_price = reference_price * (1 - self.cfg.entry_dip_pct / 100.0)
+        self._dip_target = target_price
         logger.info(f"Precio de referencia: {reference_price:.10f} SOL/token. Esperando una baja "
                     f"de {self.cfg.entry_dip_pct}% -> entra si el precio toca {target_price:.10f} "
                     f"SOL/token o menos (sin timeout, cancela con Ctrl+C si hace falta)...")
@@ -1307,6 +1283,78 @@ class TrailingTakeProfitBot:
         if self.token_symbol and self.token_name and self.token_symbol != self.token_name:
             return f"{self.token_name} (${self.token_symbol})"
         return self.token_name or f"${self.token_symbol}"
+
+    def snapshot(self) -> dict:
+        """Foto del estado actual del bot, para mostrarla desde fuera (la
+        web, más adelante). Solo tipos simples (str/float/bool/None/dict),
+        así se puede pasar tal cual a JSON. No cambia nada: se puede
+        llamar en cualquier momento y desde cualquier tarea del loop."""
+        cfg = self.cfg
+        pos = self.position
+        price = self.latest_price
+        phase = "closed" if pos is not None and pos.closed else self.phase
+        snap = {
+            "mint": self.mint,
+            "token_name": self.token_name,
+            "token_symbol": self.token_symbol,
+            "live": cfg.live,
+            "phase": phase,
+            "running": self.running,
+            "close_requested": self._shutdown_requested.is_set(),
+            "close_reason": self._close_reason,
+            "end_reason": self.end_reason,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "latest_price": price,
+            # "feed" = subscribeTokenTrade en vivo; si no, qué fallback
+            # on-chain está dando el precio (ver _onchain_source).
+            "price_source": self._onchain_source or "feed",
+            "entry_target_price": self._dip_target,
+            "settings": {
+                "buy_sol": cfg.buy_sol,
+                "slippage": cfg.slippage,
+                "priority_fee": cfg.priority_fee,
+                "pool": cfg.pool,
+                "entry_dip_pct": cfg.entry_dip_pct,
+                "activation_pct": cfg.activation_pct,
+                "trailing_pct": cfg.trailing_pct,
+                "initial_stop_pct": cfg.initial_stop_pct,
+                "strategy_price_basis": cfg.strategy_price_basis,
+            },
+            "position": None,
+        }
+        if pos is None:
+            return snap
+
+        # Mismos umbrales que evalúa _on_price_update, contra el precio de
+        # entrada que corresponde a strategy_price_basis.
+        entry = pos.strategy_entry_price(cfg.strategy_price_basis)
+        live_price = price is not None and price > 0 and not pos.closed
+        snap["position"] = {
+            "entry_price": pos.entry_price,
+            "market_entry_price": pos.market_entry_price,
+            "entry_is_real_fill": pos.entry_is_real_fill,
+            "sol_amount": pos.sol_amount,
+            "token_amount": pos.token_amount,
+            "opened_at": pos.opened_at,
+            "armed": pos.armed,
+            "highest_price": pos.highest_price,
+            "activation_price": entry * (1 + cfg.activation_pct / 100.0),
+            "initial_stop_price": entry * (1 - cfg.initial_stop_pct / 100.0),
+            "trailing_stop_price": (pos.highest_price * (1 - cfg.trailing_pct / 100.0)
+                                    if pos.armed else None),
+            "market_pnl_pct": pos.market_pnl_pct(price) if live_price else None,
+            "net_pnl_pct": pos.pnl_pct(price) if live_price else None,
+            "closed": pos.closed,
+            "closed_at": pos.closed_at,
+            "exit_price": pos.exit_price,
+            "proceeds_sol": pos.proceeds_sol,
+            "realized_pnl_sol": pos.realized_pnl_sol,
+            "realized_pnl_pct": pos.realized_pnl_pct,
+            "close_reason": pos.close_reason,
+            "exit_is_real_fill": pos.exit_is_real_fill,
+        }
+        return snap
 
     def _update_panel_fixed(self) -> None:
         """Bloque fijo del panel: todo lo que no cambia mientras corre el

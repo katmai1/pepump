@@ -69,6 +69,7 @@ from pepump.pump import PumpPortalClient, TokenMetadataOnChainClient
 from pepump.executor import TradeExecutor
 from pepump.bot import TrailingTakeProfitBot
 from pepump.logging_config import setup_logging
+from pepump.shutdown import run_with_shutdown_signals
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +131,7 @@ if __name__ == "__main__":
                                 metadata_client=TokenMetadataOnChainClient(config.solana_rpc_url))
 
     try:
-        asyncio.run(bot.run())
+        asyncio.run(run_with_shutdown_signals(bot))
     except KeyboardInterrupt:
         logger.info("Interrumpido por el usuario.")
     finally:

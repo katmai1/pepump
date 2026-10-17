@@ -1,11 +1,11 @@
 """
 Tests de la instalación de los manejadores de cierre ordenado
-(TrailingTakeProfitBot._install_shutdown_handlers).
+(shutdown.install_shutdown_handlers / run_with_shutdown_signals).
 
 BUGFIX (Windows se quedaba sin cierre ordenado): antes solo se intentaba
 `loop.add_signal_handler()`, que es exclusivo de Unix. En Windows lanza
 NotImplementedError, el except se lo comía y NO quedaba instalado nada:
-`_shutdown_requested` no se marcaba nunca, Ctrl+C subía como
+el cierre ordenado no se pedía nunca, Ctrl+C subía como
 KeyboardInterrupt y run.py terminaba el proceso SIN VENDER la posición
 abierta. Ahora hay un fallback con `signal.signal()`.
 
@@ -18,7 +18,9 @@ import signal
 
 import pytest
 
+from pepump import shutdown
 from pepump.bot import TrailingTakeProfitBot
+from pepump.shutdown import SHUTDOWN_SIGNALS, install_shutdown_handlers, run_with_shutdown_signals
 
 from .conftest import FakeTradeStreamClient, SpyExecutor, make_config
 
@@ -45,7 +47,7 @@ def restaurar_señales():
     pase: estos tests los pisan de verdad (no con un mock), y dejarlos
     cambiados rompería a pytest y a los tests que corran después."""
     previos = {}
-    for sig in TrailingTakeProfitBot._SHUTDOWN_SIGNALS:
+    for sig in SHUTDOWN_SIGNALS:
         previos[sig] = signal.getsignal(sig)
     yield
     for sig, handler in previos.items():
@@ -75,13 +77,13 @@ async def test_usa_add_signal_handler_cuando_esta_disponible(monkeypatch):
     monkeypatch.setattr(type(loop), "add_signal_handler", _spy_add)
     monkeypatch.setattr(type(loop), "remove_signal_handler", _spy_remove)
 
-    quitar = bot._install_shutdown_handlers(loop)
+    quitar = install_shutdown_handlers(loop, bot.close)
     try:
-        assert len(quitar) == len(bot._SHUTDOWN_SIGNALS)
-        assert [sig for sig, _cb, _a in enganchadas] == list(bot._SHUTDOWN_SIGNALS)
-        # Cada señal queda atada a _request_shutdown con su propio nombre.
+        assert len(quitar) == len(SHUTDOWN_SIGNALS)
+        assert [sig for sig, _cb, _a in enganchadas] == list(SHUTDOWN_SIGNALS)
+        # Cada señal queda atada al callback con su propio nombre.
         for sig, callback, args in enganchadas:
-            assert callback == bot._request_shutdown
+            assert callback == bot.close
             assert args == (sig.name,)
     finally:
         for q in quitar:
@@ -89,7 +91,7 @@ async def test_usa_add_signal_handler_cuando_esta_disponible(monkeypatch):
 
     # Y se desinstalan por el mismo camino (remove_signal_handler), no por
     # el de signal.signal: es la prueba de que se usó el camino de asyncio.
-    assert desenganchadas == list(bot._SHUTDOWN_SIGNALS)
+    assert desenganchadas == list(SHUTDOWN_SIGNALS)
 
 
 async def test_fallback_a_signal_signal_cuando_no_hay_add_signal_handler(
@@ -99,10 +101,10 @@ async def test_fallback_a_signal_signal_cuando_no_hay_add_signal_handler(
     bot = make_bot()
     loop = asyncio.get_running_loop()
 
-    quitar = bot._install_shutdown_handlers(loop)
+    quitar = install_shutdown_handlers(loop, bot.close)
     try:
-        assert len(quitar) == len(bot._SHUTDOWN_SIGNALS)
-        for sig in bot._SHUTDOWN_SIGNALS:
+        assert len(quitar) == len(SHUTDOWN_SIGNALS)
+        for sig in SHUTDOWN_SIGNALS:
             assert callable(signal.getsignal(sig))
             assert signal.getsignal(sig) is not signal.default_int_handler
     finally:
@@ -113,12 +115,12 @@ async def test_fallback_a_signal_signal_cuando_no_hay_add_signal_handler(
 async def test_el_fallback_marca_el_evento_de_apagado(
         sin_add_signal_handler, restaurar_señales):
     """Lo que de verdad importa: cuando llega la señal, el manejador de
-    Windows termina marcando `_shutdown_requested` -que es lo que hace
+    Windows termina llamando a bot.close() -que es lo que hace
     que run() venda la posición antes de salir."""
     bot = make_bot()
     loop = asyncio.get_running_loop()
 
-    quitar = bot._install_shutdown_handlers(loop)
+    quitar = install_shutdown_handlers(loop, bot.close)
     try:
         assert not bot._shutdown_requested.is_set()
         # Se invoca el manejador como lo invocaría el sistema al recibir
@@ -134,7 +136,7 @@ async def test_el_fallback_marca_el_evento_de_apagado(
 
 async def test_restaurar_devuelve_el_manejador_previo(
         sin_add_signal_handler, restaurar_señales):
-    """El finally de run() tiene que dejar el proceso como estaba: si no,
+    """Al terminar run_with_shutdown_signals hay que dejar el proceso como estaba: si no,
     un segundo bot en el mismo proceso (o el propio intérprete al salir)
     se queda con un manejador que apunta a un loop ya cerrado."""
     bot = make_bot()
@@ -144,7 +146,7 @@ async def test_restaurar_devuelve_el_manejador_previo(
         pass
     signal.signal(signal.SIGINT, _manejador_propio)
 
-    quitar = bot._install_shutdown_handlers(loop)
+    quitar = install_shutdown_handlers(loop, bot.close)
     assert signal.getsignal(signal.SIGINT) is not _manejador_propio
     for q in quitar:
         q()
@@ -156,10 +158,10 @@ async def test_avisa_si_no_se_pudo_instalar_ninguno(monkeypatch, caplog):
     posición abierta puede quedar sin vender -no quedarse en silencio."""
     bot = make_bot()
     loop = asyncio.get_running_loop()
-    monkeypatch.setattr(bot, "_install_one_shutdown_handler", lambda loop, sig: None)
+    monkeypatch.setattr(shutdown, "_install_one", lambda loop, sig, on_signal: None)
 
     with caplog.at_level("WARNING"):
-        quitar = bot._install_shutdown_handlers(loop)
+        quitar = install_shutdown_handlers(loop, bot.close)
 
     assert quitar == []
     assert any("SIN VENDER" in rec.message for rec in caplog.records)
@@ -184,8 +186,58 @@ async def test_run_vende_la_posicion_con_el_fallback_de_windows(
         signal.getsignal(signal.SIGINT)(signal.SIGINT, None)
 
     asyncio.create_task(mandar_señal_tras_comprar())
-    await asyncio.wait_for(bot.run(), timeout=5)
+    await asyncio.wait_for(run_with_shutdown_signals(bot), timeout=5)
 
     assert executor.buy_calls == 1
     assert executor.sell_calls == 1
+    assert bot.position.closed is True
+
+
+async def test_run_with_shutdown_signals_desinstala_al_terminar(
+        sin_add_signal_handler, restaurar_señales):
+    """Las señales son del proceso: al terminar el bot (bien o mal) se
+    devuelven tal como estaban, para no dejar un manejador apuntando a un
+    bot/loop que ya no existe."""
+    def _manejador_propio(_signum, _frame):
+        pass
+    signal.signal(signal.SIGINT, _manejador_propio)
+
+    # Sin eventos y con la conexión fallando: run() termina enseguida.
+    client = FakeTradeStreamClient(fail_connect_times=1)
+    bot = TrailingTakeProfitBot(client=client, executor=SpyExecutor(), config=make_config())
+    await asyncio.wait_for(run_with_shutdown_signals(bot), timeout=5)
+
+    assert signal.getsignal(signal.SIGINT) is _manejador_propio
+
+
+async def test_bot_run_ya_no_toca_las_señales(restaurar_señales):
+    """El bot solo, sin run_with_shutdown_signals, no instala nada: así se
+    pueden correr varios en el mismo proceso, controlados desde fuera."""
+    previos = {sig: signal.getsignal(sig) for sig in SHUTDOWN_SIGNALS}
+    loop = asyncio.get_running_loop()
+    agregadas = []
+    real_add = type(loop).add_signal_handler
+
+    def _spy_add(self, sig, *a):
+        agregadas.append(sig)
+        return real_add(self, sig, *a)
+
+    client = FakeTradeStreamClient(events_by_connection=[[{"price": 1.0}]])
+    bot = TrailingTakeProfitBot(client=client, executor=SpyExecutor(),
+                                config=make_config(status_interval_seconds=999))
+    try:
+        type(loop).add_signal_handler = _spy_add
+
+        async def cerrar_tras_comprar():
+            while bot.position is None:
+                await asyncio.sleep(0.005)
+            assert {sig: signal.getsignal(sig) for sig in SHUTDOWN_SIGNALS} == previos
+            bot.close("test")
+
+        asyncio.create_task(cerrar_tras_comprar())
+        await asyncio.wait_for(bot.run(), timeout=5)
+    finally:
+        type(loop).add_signal_handler = real_add
+
+    assert agregadas == []
     assert bot.position.closed is True

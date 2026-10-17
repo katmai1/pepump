@@ -2,6 +2,7 @@ import logging
 import sys
 from typing import Optional
 
+from pepump.log_context import MintContextFilter
 from pepump.dashboard import PanelAwareHandler, StatusPanel, create_panel, panel_unavailable_reason
 
 
@@ -52,6 +53,9 @@ def setup_logging(level: int = logging.INFO, panel: bool = True) -> Optional[Sta
         datefmt="%H:%M:%S",
     )
     handler.setFormatter(formatter)
+    # `record.mint` en cada log (ver log_context.py). El formato de la
+    # terminal no lo muestra: con un solo bot por proceso sería ruido.
+    handler.addFilter(MintContextFilter())
     root.addHandler(handler)
 
     if no_panel_reason:

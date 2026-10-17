@@ -47,6 +47,16 @@ class Position:
     # salvo que se pise explícitamente, como hacen los tests). Sirve para
     # calcular cuánto duró abierta la posición en el historial de CSV.
     opened_at: float = field(default_factory=time.time)
+    # Datos del cierre, los rellena TradeExecutor.sell() al confirmar la
+    # venta (None mientras siga abierta). Los mismos números que van al
+    # historial CSV, para poder mostrarlos sin releer el archivo.
+    closed_at: Optional[float] = None
+    exit_price: Optional[float] = None
+    proceeds_sol: Optional[float] = None
+    realized_pnl_sol: Optional[float] = None
+    realized_pnl_pct: Optional[float] = None
+    close_reason: Optional[str] = None
+    exit_is_real_fill: bool = False
 
     def __post_init__(self):
         if self.market_entry_price is None or self.market_entry_price <= 0:
@@ -326,6 +336,13 @@ class TradeExecutor:
         logger.info(f"[{etiqueta}] VENTA de {position.mint} a precio {exit_price:.10f} SOL/token "
                     f"| motivo: {reason} | mercado: {pnl_mercado:+.2f}% | PnL neto: {pnl_pct:+.2f}% "
                     f"({pnl_sol:+.9f} SOL) | SOL recibidos: {proceeds:.9f}{sufijo}")
+        position.closed_at = time.time()
+        position.exit_price = exit_price
+        position.proceeds_sol = proceeds
+        position.realized_pnl_sol = pnl_sol
+        position.realized_pnl_pct = pnl_pct
+        position.close_reason = reason
+        position.exit_is_real_fill = real_fill
         position.closed = True
 
         # Historial de órdenes cerradas: se registra DESPUÉS de marcar
