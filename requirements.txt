@@ -3,3 +3,5 @@ websockets      # feed de precios: subscribeTokenTrade de PumpPortal
 requests        # Lightning Transaction API de PumpPortal
 solana          # lecturas on-chain (getAccountInfo / getProgramAccounts)
 solders         # tipos de Solana (Pubkey, Signature) usados por solana-py
+fastapi         # panel web (--web)
+uvicorn         # servidor del panel web

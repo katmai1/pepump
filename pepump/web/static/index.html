@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PePump</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">PePump</div>
+    <span id="mode" class="badge" hidden></span>
+    <span id="conn" class="conn" data-state="connecting"><span class="dot" aria-hidden="true"></span><span class="conn-label">Conectando…</span></span>
+  </header>
+
+  <main>
+    <section class="tiles" aria-label="Resumen">
+      <div class="tile">
+        <div class="tile-label">Posiciones activas</div>
+        <div class="tile-value" id="t-active">—</div>
+        <div class="tile-sub" id="t-active-sub"></div>
+      </div>
+      <div class="tile">
+        <div class="tile-label">Invertido en abiertas</div>
+        <div class="tile-value" id="t-invested">—</div>
+        <div class="tile-sub">SOL</div>
+      </div>
+      <div class="tile">
+        <div class="tile-label">PnL abierto</div>
+        <div class="tile-value" id="t-open-pnl">—</div>
+        <div class="tile-sub" id="t-open-pnl-sub">SOL, si se vendiera ahora</div>
+      </div>
+      <div class="tile">
+        <div class="tile-label">PnL realizado</div>
+        <div class="tile-value" id="t-realized">—</div>
+        <div class="tile-sub" id="t-realized-sub">SOL, posiciones cerradas</div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>Posiciones</h2>
+        <span class="muted small">Solo lectura: abrir y cerrar llega en el siguiente paso.</span>
+      </div>
+      <div id="empty" class="empty" hidden>No hay posiciones. Arráncalas con <code>python run.py -m &lt;MINT&gt; --web</code>.</div>
+      <div class="table-wrap">
+        <table id="positions" class="positions">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Token</th>
+              <th>Estado</th>
+              <th class="num">Precio</th>
+              <th class="num">Entrada</th>
+              <th class="num">Próximo nivel</th>
+              <th class="num">PnL mercado</th>
+              <th class="num">PnL neto</th>
+              <th class="num">Tiempo</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="detail" class="card" hidden>
+      <div class="card-head">
+        <h2 id="detail-title">Detalle</h2>
+        <button id="detail-close" class="btn-ghost" type="button" aria-label="Cerrar detalle">✕</button>
+      </div>
+      <div class="detail-grid" id="detail-body"></div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>Logs</h2>
+        <div class="log-tools">
+          <label class="small">
+            <span class="muted">Mostrar</span>
+            <select id="log-filter">
+              <option value="">Todas</option>
+              <option value="__general__">Solo generales</option>
+            </select>
+          </label>
+          <label class="small check"><input type="checkbox" id="log-follow" checked> Seguir</label>
+        </div>
+      </div>
+      <div id="logs" class="logs" role="log" aria-live="off"></div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

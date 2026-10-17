@@ -73,5 +73,7 @@ def setup_logging(level: int = logging.INFO, panel: bool = True,
         logging.getLogger("websockets").setLevel(logging.WARNING)
         logging.getLogger("httpx").setLevel(logging.WARNING)
         logging.getLogger("httpcore").setLevel(logging.WARNING)
+        # Servidor del panel web (--web): solo avisos y errores.
+        logging.getLogger("uvicorn").setLevel(logging.WARNING)
 
     return status_panel

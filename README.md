@@ -58,6 +58,23 @@ En Windows funciona igual con `Ctrl+C` y `Ctrl+Pausa`, pero `SIGTERM` no
 se entrega nunca: `taskkill /F` mata el proceso en seco y la posición
 queda abierta. Ciérrala con `Ctrl+C`.
 
+### Panel web
+
+```bash
+python run.py -m <MINT1> -m <MINT2> --web          # http://127.0.0.1:8080
+python run.py -m <MINT> --web 9000                 # otro puerto
+```
+
+Muestra en vivo todas las posiciones (estado, precio, próximo nivel de
+activación o de venta, PnL), el detalle de cada una y los logs filtrables
+por token. Por ahora es **solo lectura**: no compra ni vende nada.
+
+Solo escucha en `127.0.0.1` (esta máquina). `--web-host 0.0.0.0` lo abre a
+la red, pero todavía no tiene contraseña: para verlo desde otro equipo es
+más seguro un túnel SSH (`ssh -L 8080:127.0.0.1:8080 tu-servidor`) o
+Tailscale. Cuando terminan todas las posiciones, el proceso sale y el
+panel se cierra con él.
+
 ## Estrategia
 
 1. Se suscribe al feed de trades del mint **antes** de comprar y espera el

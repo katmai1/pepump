@@ -83,6 +83,11 @@ def parse_args():
                         "posiciones a la vez: -m <MINT1> -m <MINT2>")
     p.add_argument("-c", "--config", default="config.toml", help="Ruta al archivo .toml de configuración (default: config.toml)")
     p.add_argument("-v", "--verbose", action="store_true", help="Logging en nivel DEBUG en vez de INFO")
+    p.add_argument("--web", nargs="?", type=int, const=8080, default=None, metavar="PUERTO",
+                   help="Arranca el panel web (solo lectura) en http://127.0.0.1:PUERTO (default 8080)")
+    p.add_argument("--web-host", default="127.0.0.1",
+                   help="Interfaz donde escucha el panel web (default 127.0.0.1: solo esta máquina). "
+                        "0.0.0.0 lo expone a toda la red: NO lo hagas sin saber quién puede entrar")
     p.add_argument("--no-panel", action="store_true",
                    help="Sin panel fijo al pie: el estado se imprime como una línea de log más cada intervalo")
 
@@ -131,6 +136,26 @@ if __name__ == "__main__":
                      f"abrir dos posiciones del mismo token a la vez.")
         sys.exit(1)
 
+    web_sock = None
+    log_buffer = None
+    if args.web is not None:
+        # Imports aquí: sin --web no hace falta tener FastAPI/uvicorn instalados.
+        from pepump.web.logbuffer import LogBuffer
+        from pepump.web.server import bind_socket, is_loopback
+        # El puerto se abre ANTES de comprar nada: si está ocupado, se sale
+        # sin haber tocado ninguna posición.
+        try:
+            web_sock = bind_socket(args.web_host, args.web)
+        except OSError as e:
+            logger.error(f"No se pudo abrir el panel web en {args.web_host}:{args.web}: {e}")
+            sys.exit(1)
+        if not is_loopback(args.web_host):
+            logger.warning(f"⚠️  El panel web escucha en {args.web_host}: cualquiera que llegue a esa "
+                           f"dirección ve tus posiciones (todavía no tiene contraseña). Para verlo "
+                           f"desde otro equipo es más seguro un túnel SSH o Tailscale.")
+        log_buffer = LogBuffer()
+        logging.getLogger().addHandler(log_buffer)
+
     show_header(config.live)
 
     client = PumpPortalClient(api_key=config.api_key)
@@ -141,6 +166,16 @@ if __name__ == "__main__":
         if panel is not None:
             multi = MultiPositionPanel(panel, manager.snapshot, live=config.live)
             manager.panel_factory = multi.for_position
+
+        web = None
+        if web_sock is not None:
+            from pepump.web.server import WebPanel, allowed_hosts_for, create_app
+            app = create_app(manager, log_buffer, live=config.live,
+                             allowed_hosts=allowed_hosts_for(args.web_host))
+            web = WebPanel(app, web_sock)
+            web.start()
+            shown_host = "127.0.0.1" if args.web_host in ("0.0.0.0", "::") else args.web_host
+            logger.info(f"Panel web: http://{shown_host}:{args.web}")
 
         def on_signal(sig_name: str) -> None:
             manager.close_all(f"{sig_name} recibido")
@@ -153,6 +188,8 @@ if __name__ == "__main__":
         try:
             await run_with_shutdown_signals_for(run_all(), on_signal)
         finally:
+            if web is not None:
+                await web.stop()
             await manager.aclose()
 
     try:
