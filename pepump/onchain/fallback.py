@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 class OnchainFallback:
     def __init__(self, mint: str, rpc_url: str, source: Optional[str] = None, jupiter=None,
-                 live: bool = False):
+                 live: bool = False, prefer_jupiter: bool = False):
         self.mint = mint
         self.rpc_url = rpc_url
         self.source: Optional[str] = source
@@ -46,6 +46,8 @@ class OnchainFallback:
         # Para decidir si las órdenes de Meteora pueden ir por Jupiter: en
         # REAL solo si hay clave con la que firmar (ver pool_override).
         self.live = live
+        # jupiter_for_all: todas las órdenes por Jupiter si se puede.
+        self.prefer_jupiter = prefer_jupiter
         # Tokens con los que se cotiza la venta en Jupiter: los de la
         # posición una vez comprada (los pone bot.py), y antes de comprar
         # los que darían por buy_sol (ver resolve_jupiter). El precio de
@@ -302,14 +304,20 @@ class OnchainFallback:
         # por Jupiter si se puede (en REAL, solo con clave para firmar), y
         # si no se fuerza "auto" (aunque cfg.pool diga otra cosa) y
         # PumpPortal decide por dónde rutear.
+        # Con jupiter_for_all (prefer_jupiter), todo va por Jupiter si se
+        # puede: Jupiter rutea solo por la curva o por PumpSwap, así que
+        # tampoco hace falta el override de "pump-amm" tras una migración.
+        if self.source == "jupiter":
+            return JUPITER_POOL
+        jupiter_ok = self.jupiter is not None and (self.jupiter.can_sign or not self.live)
+        es_meteora = self.source in ("meteora-dlmm", "meteora-damm-v2")
+        if jupiter_ok and (self.prefer_jupiter or es_meteora):
+            return JUPITER_POOL
         if self.source is None:
             return None
-        if self.source in ("meteora-dlmm", "meteora-damm-v2"):
-            if self.jupiter is not None and (self.jupiter.can_sign or not self.live):
-                return JUPITER_POOL
+        if es_meteora:
             return "auto"
-        return {"pumpswap": "pump-amm", "raydium-cpmm": "raydium-cpmm",
-                "jupiter": JUPITER_POOL}.get(self.source)
+        return {"pumpswap": "pump-amm", "raydium-cpmm": "raydium-cpmm"}.get(self.source)
 
     # ---- Consultas puntuales para detectar una migración a mitad de posición ---- #
 

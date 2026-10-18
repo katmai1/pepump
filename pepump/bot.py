@@ -6,7 +6,7 @@ from collections import deque
 from typing import Callable, Optional
 
 from pepump.executor import Position, sell_retry_params
-from pepump.jupiter import PRIORITY_BACKGROUND
+from pepump.jupiter import JUPITER_POOL, PRIORITY_BACKGROUND
 from pepump.log_context import current_mint, set_mint_label
 from pepump.onchain.fallback import OnchainFallback
 from pepump.strategy import Action, TrailingStrategy
@@ -89,7 +89,8 @@ class TrailingTakeProfitBot:
         # del feed en vivo, de dónde sale ahora (`self.onchain.source`) y
         # por qué pool hay que rutear la orden.
         self.onchain = OnchainFallback(self.mint, config.solana_rpc_url, resume_onchain_source,
-                                       jupiter=jupiter, live=config.live)
+                                       jupiter=jupiter, live=config.live,
+                                       prefer_jupiter=config.jupiter_for_all)
         if resume_position is not None:
             self.onchain.jupiter_tokens = resume_position.token_amount
         # Si _get_reference_price (o algo que llame desde ahí) ya
@@ -1221,6 +1222,8 @@ class TrailingTakeProfitBot:
             # "feed" = subscribeTokenTrade en vivo; si no, qué fallback
             # on-chain está dando el precio (ver OnchainFallback.source).
             "price_source": self.onchain.source or "feed",
+            # Por dónde irán (o fueron) las órdenes de esta posición.
+            "order_route": "jupiter" if self.onchain.pool_override() == JUPITER_POOL else "pumpportal",
             "entry_target_price": self._dip_target,
             "sell_failures": self.sell_failures,
             "entry_reference_price": self._dip_reference,

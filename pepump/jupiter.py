@@ -355,6 +355,9 @@ def build_jupiter_client(config) -> Optional[JupiterClient]:
     if not config.jupiter_api_key:
         if private_key:
             logger.warning("Hay wallet_private_key pero no jupiter_api_key: la clave no se usa.")
+        if config.jupiter_for_all:
+            logger.warning("jupiter_for_all = true pero no hay jupiter_api_key: todas las órdenes "
+                           "siguen yendo por PumpPortal.")
         return None
     keypair = load_keypair(private_key) if private_key else None
     if keypair is not None and config.wallet_address and str(keypair.pubkey()) != config.wallet_address:
@@ -363,6 +366,11 @@ def build_jupiter_client(config) -> Optional[JupiterClient]:
     if keypair is None:
         logger.info("Jupiter activado solo para cotizar y simular: sin wallet_private_key no se puede "
                     "operar en real por Jupiter.")
+        if config.jupiter_for_all:
+            logger.warning("jupiter_for_all = true pero no hay wallet_private_key: en REAL las órdenes "
+                           "siguen yendo por PumpPortal (en simulado, por Jupiter).")
+    elif config.jupiter_for_all:
+        logger.info("jupiter_for_all: todas las órdenes van por Jupiter.")
     return JupiterClient(config.jupiter_api_key, keypair, config.jupiter_request_interval_seconds)
 
 

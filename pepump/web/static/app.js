@@ -758,6 +758,7 @@ function renderDetail() {
     kv("Fuente del precio", snap.price_source === "feed" ? "Feed en vivo (PumpPortal)"
       : snap.price_source === "jupiter" ? "Jupiter (cotización de venta; órdenes por Jupiter)"
       : `On-chain (${snap.price_source})`),
+    kv("Órdenes por", snap.order_route === "jupiter" ? "Jupiter" : "PumpPortal (Lightning API)"),
     kv("Precio actual", fmtPrice(snap.latest_price)),
   ];
   if (snap.entry_target_price && !pos) {

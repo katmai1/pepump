@@ -231,6 +231,14 @@ Jupiter**:
   siempre delante de las consultas de precio; con varias posiciones por
   Jupiter, el precio de cada una se refresca más despacio.
 
+**Todas las órdenes por Jupiter** (`jupiter_for_all = true`): también las de
+pump.fun (curva) y PumpSwap. Jupiter cobra un 0.1% (0.5% en tokens de menos
+de 24 h) y la Lightning API de PumpPortal un 1%; la comisión del pool se paga
+igual. Medido con 0.05 SOL en tokens de PumpSwap: ~0.9 puntos menos por
+operación. El precio sigue saliendo del feed de PumpPortal u on-chain; solo
+cambia por dónde va la orden (en la web: "Órdenes por"). En real hace falta
+`wallet_private_key`; sin ella, siguen yendo por PumpPortal.
+
 Ojo con los costes: comprar y vender al momento sale alrededor de un 8% más
 caro en estos tokens (impuestos de transferencia, comisiones de la curva,
 dos saltos de ruta). El PnL neto arranca en ese negativo.

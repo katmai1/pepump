@@ -109,6 +109,11 @@ class AppConfig:
     # cuenta (precio de todas las posiciones + órdenes). 2.0 es el plan
     # gratuito; con un plan de pago se puede bajar.
     jupiter_request_interval_seconds: float = 2.0
+    # True = TODAS las órdenes van por Jupiter (también las de pump.fun y
+    # PumpSwap), no solo las de tokens que PumpPortal no sabe operar. El
+    # precio sigue saliendo de donde siempre. En REAL hace falta
+    # wallet_private_key; sin ella, siguen yendo por PumpPortal.
+    jupiter_for_all: bool = False
 
     # --- [web] -------------------------------------------------------------- #
     # Contraseña del panel web (--web). Opcional: vacía, el panel no pide

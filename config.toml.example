@@ -151,6 +151,16 @@ jupiter_api_key = ""
 # posiciones a la vez, el precio de cada una se refresca más despacio.
 jupiter_request_interval_seconds = 2.0
 
+# true = TODAS las órdenes van por Jupiter, también las de pump.fun (curva) y
+# PumpSwap. Sale más barato: Jupiter cobra un 0.1% (0.5% en tokens de menos
+# de 24 h) y la Lightning API de PumpPortal un 1%; la comisión del pool se
+# paga igual por los dos lados. El precio sigue saliendo de donde siempre
+# (feed de PumpPortal u on-chain). En REAL hace falta wallet_private_key;
+# sin ella, las órdenes siguen yendo por PumpPortal.
+# false = solo van por Jupiter los tokens que PumpPortal no sabe operar
+# (Meteora, o los que no cotizan contra SOL).
+jupiter_for_all = false
+
 # Clave PRIVADA de la wallet, para operar en REAL por Jupiter (Jupiter no
 # firma por ti, a diferencia de la Lightning API de PumpPortal). Tiene que ser
 # la misma wallet que la de PumpPortal (si pones wallet_address arriba, se

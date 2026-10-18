@@ -527,3 +527,54 @@ def test_vista_previa_ofrece_jupiter(monkeypatch):
     preview = asyncio.run(manager.preview(MINT))
 
     assert preview["market"] == "jupiter" and preview["price"] == 0.00004
+
+
+# --------------------------------------------------------------------------- #
+# jupiter_for_all
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("source, sin_jupiter", [
+    (None, None), ("bondingcurve", None), ("pumpswap", "pump-amm"), ("raydium-cpmm", "raydium-cpmm"),
+])
+def test_jupiter_for_all_manda_todas_las_ordenes_por_jupiter(source, sin_jupiter):
+    from pepump.onchain.fallback import OnchainFallback
+    con = OnchainFallback(MINT, "http://rpc", source, jupiter=FakeJupiter(), live=True, prefer_jupiter=True)
+    sin_clave = OnchainFallback(MINT, "http://rpc", source, jupiter=FakeJupiter(can_sign=False), live=True,
+                                prefer_jupiter=True)
+    sin_opcion = OnchainFallback(MINT, "http://rpc", source, jupiter=FakeJupiter(), live=True)
+
+    assert con.pool_override() == JUPITER_POOL
+    # En real sin clave, o sin la opción, como siempre.
+    assert sin_clave.pool_override() == sin_jupiter
+    assert sin_opcion.pool_override() == sin_jupiter
+
+
+def test_jupiter_for_all_en_simulado_no_necesita_clave():
+    from pepump.onchain.fallback import OnchainFallback
+    onchain = OnchainFallback(MINT, "http://rpc", None, jupiter=FakeJupiter(can_sign=False), live=False,
+                              prefer_jupiter=True)
+    assert onchain.pool_override() == JUPITER_POOL
+
+
+def test_el_bot_compra_por_jupiter_con_jupiter_for_all_y_lo_muestra():
+    bot = _bot(make_config(jupiter_for_all=True), FakeJupiter())
+    assert bot.snapshot()["order_route"] == "jupiter"
+
+    asyncio.run(bot._on_first_price(0.00004))
+
+    assert bot.executor.last_buy_pool_override == JUPITER_POOL
+
+
+def test_sin_jupiter_for_all_las_de_pumpfun_van_por_pumpportal():
+    bot = _bot(make_config(), FakeJupiter())
+    assert bot.snapshot()["order_route"] == "pumpportal"
+
+
+def test_jupiter_for_all_sin_api_key_avisa(caplog):
+    assert build_jupiter_client(make_config(jupiter_for_all=True)) is None
+    assert "siguen yendo por PumpPortal" in caplog.text
+
+
+def test_jupiter_for_all_sin_clave_avisa_que_en_real_va_por_pumpportal(caplog):
+    build_jupiter_client(make_config(jupiter_api_key="jup", jupiter_for_all=True))
+    assert "en REAL las órdenes siguen yendo por PumpPortal" in caplog.text
