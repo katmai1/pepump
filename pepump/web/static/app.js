@@ -103,6 +103,11 @@ function statusOf(snap) {
   if (snap.phase === "open" && !snap.running) {
     return { icon: "⚠", label: "ABIERTA SIN VIGILAR", tone: "critical" };
   }
+  if (snap.sell_failures > 0 && !(pos && pos.closed)) {
+    // La venta falló y el bot la está reintentando con más slippage.
+    return { icon: "⚠", label: `Venta fallida ×${snap.sell_failures} · reintentando`,
+             tone: snap.sell_failures >= 3 ? "critical" : "warn" };
+  }
   if (snap.close_requested && !["closed", "stopped"].includes(snap.phase)) {
     return { icon: "◐", label: "Cerrando", tone: "warn" };
   }

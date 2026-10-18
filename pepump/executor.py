@@ -104,6 +104,28 @@ class Position:
         return (self.entry_price / self.market_entry_price - 1.0) * 100.0
 
 
+# Cuánto sube cada venta fallida: +SELL_SLIPPAGE_STEP puntos de slippage y
+# priority fee x SELL_PRIORITY_FEE_FACTOR, hasta los topes de la config.
+# Con los valores por defecto: slippage 15 -> 25 -> 35 -> 45 -> 50 y fee
+# 0.00001 -> 0.00004 -> 0.00016 -> 0.00064 -> 0.001 SOL.
+SELL_SLIPPAGE_STEP = 10.0
+SELL_PRIORITY_FEE_FACTOR = 4.0
+
+
+def sell_retry_params(cfg, failures: int) -> tuple[float, float]:
+    """(slippage, priority_fee) para una venta tras `failures` intentos
+    fallidos seguidos. Con 0 fallos son los de la config, tal cual.
+
+    Los topes (max_sell_slippage / max_sell_priority_fee) nunca bajan los
+    valores base: si una posición se abrió con un slippage mayor que el
+    tope, se vende con el suyo."""
+    slippage = min(cfg.slippage + SELL_SLIPPAGE_STEP * failures,
+                   max(cfg.max_sell_slippage, cfg.slippage))
+    priority_fee = min(cfg.priority_fee * SELL_PRIORITY_FEE_FACTOR ** failures,
+                       max(cfg.max_sell_priority_fee, cfg.priority_fee))
+    return slippage, priority_fee
+
+
 # --------------------------------------------------------------------------- #
 # Ejecutor de trades: decide y ejecuta compra/venta, simulada o real
 # --------------------------------------------------------------------------- #
@@ -217,7 +239,10 @@ class TradeExecutor:
             await asyncio.sleep(self.cfg.tx_confirm_poll_interval_seconds)
 
     async def sell(self, position: Position, price: float, reason: str,
-                    pool_override: Optional[str] = None) -> None:
+                    pool_override: Optional[str] = None, slippage: Optional[float] = None,
+                    priority_fee: Optional[float] = None) -> None:
+        """`slippage`/`priority_fee` pisan los de la config (reintentos de
+        una venta fallida, ver sell_retry_params); None = los de la config."""
         # Valores ESTIMADOS a partir del precio de referencia -se usan
         # tal cual en modo SIMULADO, y como respaldo en modo REAL si no
         # se pudieron leer los datos reales de fill (ver más abajo).
@@ -230,7 +255,8 @@ class TradeExecutor:
             try:
                 result = await self.client.execute_lightning_trade(
                     action="sell", mint=position.mint, amount="100%", denominated_in_sol=False,
-                    slippage=self.cfg.slippage, priority_fee=self.cfg.priority_fee,
+                    slippage=self.cfg.slippage if slippage is None else slippage,
+                    priority_fee=self.cfg.priority_fee if priority_fee is None else priority_fee,
                     pool=pool_override or self.cfg.pool,
                     solana_rpc_url=self.cfg.solana_rpc_url,
                     tx_confirm_timeout_seconds=self.cfg.tx_confirm_timeout_seconds,

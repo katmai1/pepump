@@ -1,6 +1,6 @@
-# Runtime + lo necesario para correr los tests.
+# Runtime + lo necesario para correr los tests y el lint.
 -r requirements.txt
-pytest
-pytest-asyncio
-ruff            # lint + orden de imports (config en pyproject.toml)
-mypy            # tipos (config en pyproject.toml)
+pytest==9.1.1
+pytest-asyncio==1.4.0
+ruff==0.17.1         # lint + orden de imports (config en pyproject.toml)
+mypy==2.4.0          # tipos (config en pyproject.toml)

@@ -151,7 +151,7 @@ def test_handle_feed_stall_bonding_curve_da_precio_de_seguridad(monkeypatch):
 #
 # Un stall aislado es probablemente una pausa de volumen y no justifica
 # abandonar el feed en vivo. Pero si se repiten, el trailing-stop pasa a
-# evaluarse solo una vez cada `stall_timeout_seconds` (20s por defecto):
+# evaluarse solo una vez cada `stall_timeout_seconds` (10s por defecto):
 # demasiada ceguera con la posición abierta. A partir del segundo stall
 # seguido se pasa a polling on-chain de la curva.
 

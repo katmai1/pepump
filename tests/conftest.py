@@ -109,15 +109,19 @@ class SpyExecutor:
         self.last_buy_pool_override = None
         self.last_sell_pool_override = None
         self.last_sell_reason = None
+        # (slippage, priority_fee) de cada intento de venta, en orden.
+        self.sell_params: list = []
 
     async def buy(self, mint: str, price: float, pool_override: Optional[str] = None) -> Position:
         self.buy_calls += 1
         self.last_buy_pool_override = pool_override
         return Position(mint=mint, entry_price=price, sol_amount=0.05, token_amount=0.05 / price)
 
-    async def sell(self, position: Position, price: float, reason: str, pool_override: Optional[str] = None) -> None:
+    async def sell(self, position: Position, price: float, reason: str, pool_override: Optional[str] = None,
+                   slippage: Optional[float] = None, priority_fee: Optional[float] = None) -> None:
         self.sell_calls += 1
         self.last_sell_pool_override = pool_override
+        self.sell_params.append((slippage, priority_fee))
         self.last_sell_reason = reason
         if self.sell_delay:
             await asyncio.sleep(self.sell_delay)
@@ -145,6 +149,14 @@ class _RaydiumCpmmSinPools:
 
     async def fetch_price(self, mint: str):
         return None
+
+
+@pytest.fixture(autouse=True)
+def _reintentos_de_venta_sin_pausa(monkeypatch):
+    """La pausa entre reintentos de venta (1 s, 2 s...) solo alargaría los
+    tests; el que la comprueba la vuelve a poner."""
+    from pepump.bot import TrailingTakeProfitBot
+    monkeypatch.setattr(TrailingTakeProfitBot, "_SELL_RETRY_DELAY_SECONDS", 0.0)
 
 
 @pytest.fixture(autouse=True)

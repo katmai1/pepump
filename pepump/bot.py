@@ -5,7 +5,7 @@ import time
 from collections import deque
 from typing import Callable, Optional
 
-from pepump.executor import Position
+from pepump.executor import Position, sell_retry_params
 from pepump.log_context import current_mint, set_mint_label
 from pepump.onchain.fallback import OnchainFallback
 from pepump.strategy import Action, TrailingStrategy
@@ -25,7 +25,7 @@ _DIAGNOSTIC_REMINDER_SECONDS = 10.0
 # seguidos significan que el feed no está entregando nada para este
 # mint aunque el token siga vivo -y mientras tanto el trailing-stop
 # solo se evalúa una vez cada `stall_timeout_seconds`, que con el
-# default son 20s de ceguera por precio. Se reinicia en cuanto vuelve
+# default son 10s de ceguera por precio. Se reinicia en cuanto vuelve
 # a llegar un trade real (ver _consume_trade_stream).
 _MAX_CURVE_STALLS_BEFORE_POLLING = 2
 
@@ -47,6 +47,11 @@ _PRICE_HISTORY_MAX = 20_000
 # los live_feed_timeout_seconds completos (pensados para tolerar
 # tokens de poco volumen, no para esto).
 _EXISTENCE_CHECK_POLL_SECONDS = 0.5
+
+# Con cuántas ventas fallidas SEGUIDAS se avisa en ERROR (y en la web) de
+# que hay que mirar la posición: a partir de ahí lo normal es que algo
+# más esté mal (sin SOL para fees, RPC caído, token sin liquidez...).
+_SELL_FAILURES_ALERT = 3
 
 
 class TrailingTakeProfitBot:
@@ -147,6 +152,11 @@ class TrailingTakeProfitBot:
         # porque no queda nada que vender) y no dispara un segundo pedido
         # real.
         self._sell_lock = asyncio.Lock()
+        # Ventas fallidas SEGUIDAS de esta posición (ver _sell): cada una
+        # sube el slippage y el priority fee del siguiente intento, y entre
+        # intento e intento se espera un poco (_sell_retry_at, monotonic).
+        self.sell_failures = 0
+        self._sell_retry_at = 0.0
         # Panel fijo al pie de la terminal (ver dashboard.py). None cuando
         # la salida no es una terminal (archivo, pipe, tests): entonces el
         # estado se loguea como una línea más, igual que siempre.
@@ -505,6 +515,9 @@ class TrailingTakeProfitBot:
         return True
 
     _SHUTDOWN_SELL_ATTEMPTS = 3
+    # Unidad de la pausa entre reintentos de venta (ver _sell); los tests
+    # la ponen en 0.
+    _SELL_RETRY_DELAY_SECONDS = 1.0
 
     async def _sell_on_shutdown(self) -> None:
         """Intenta conseguir el precio MÁS actual posible (una consulta
@@ -524,25 +537,20 @@ class TrailingTakeProfitBot:
             # Se reintenta: al cerrar no hay "próximo precio" que dispare
             # otro intento como en _try_sell, y un solo timeout de la
             # Lightning API dejaba la posición abierta y el bot ya fuera.
-            for attempt in range(1, self._SHUTDOWN_SELL_ATTEMPTS + 1):
+            for _attempt in range(self._SHUTDOWN_SELL_ATTEMPTS):
                 price = await self._resolve_shutdown_price()
                 if price is None or price <= 0:
                     logger.error("No se pudo determinar ningún precio para vender al cerrar. La posición "
                                  f"queda ABIERTA — revísala manualmente: https://pump.fun/{self.mint}")
                     return
-                try:
-                    await self.executor.sell(self.position, price, self._shutdown_sell_reason(),
-                                              pool_override=self.onchain.pool_override())
+                wait = self._sell_retry_at - time.monotonic()
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                if await self._sell(self.position, price, self._shutdown_sell_reason()):
                     self._persist()
                     return
-                except Exception as e:
-                    if attempt < self._SHUTDOWN_SELL_ATTEMPTS:
-                        logger.warning(f"Falló la venta de cierre manual (intento {attempt}/"
-                                       f"{self._SHUTDOWN_SELL_ATTEMPTS}): {e}. Reintentando...")
-                        continue
-                    logger.error(f"Falló la venta de cierre manual tras {attempt} intentos: {e}. "
-                                 f"La posición SIGUE ABIERTA — revísala manualmente: "
-                                 f"https://pump.fun/{self.mint}")
+            logger.error(f"Falló la venta de cierre tras {self._SHUTDOWN_SELL_ATTEMPTS} intentos. "
+                         f"La posición SIGUE ABIERTA — revísala manualmente: https://pump.fun/{self.mint}")
 
     def _shutdown_sell_reason(self) -> str:
         if self._close_reason is not None:
@@ -1067,7 +1075,7 @@ class TrailingTakeProfitBot:
                 # El feed lleva varios ciclos sin entregar NADA para un
                 # mint que sigue perfectamente vivo en la curva. Seguir
                 # esperándolo significa evaluar el trailing-stop una vez
-                # cada stall_timeout_seconds (20s por defecto): demasiado
+                # cada stall_timeout_seconds (10s por defecto): demasiado
                 # lento para una memecoin. Pasamos a polling on-chain de
                 # la bonding curve, que es la MISMA fuente contra la que
                 # se ejecuta el trade, cada onchain_poll_interval_seconds.
@@ -1143,6 +1151,7 @@ class TrailingTakeProfitBot:
             # on-chain está dando el precio (ver OnchainFallback.source).
             "price_source": self.onchain.source or "feed",
             "entry_target_price": self._dip_target,
+            "sell_failures": self.sell_failures,
             "entry_reference_price": self._dip_reference,
             "settings": {
                 "buy_sol": cfg.buy_sol,
@@ -1253,6 +1262,9 @@ class TrailingTakeProfitBot:
             pnl = pos.market_pnl_pct(self.latest_price)
             neto = (f" | neto {pos.pnl_pct(self.latest_price):+.2f}%"
                     if pos.entry_is_real_fill else "")
+            if self.sell_failures:
+                neto += f" | ⚠ {self.sell_failures} ventas fallidas, reintentando"
+
             if pos.armed:
                 stop_price = self.strategy.trailing_stop_price(pos)
                 self._show_status(f"⏱️  [armado] precio {self.latest_price:.10f} | máximo {pos.highest_price:.10f} "
@@ -1309,20 +1321,48 @@ class TrailingTakeProfitBot:
             interrumpida" (que es lo que pasaría si se colara hasta el
             except genérico de _consume_trade_stream), y
           - NO trabe el bot para siempre: como la posición sigue abierta
-            (closed=False) y NO seteamos _closed_event, el próximo trade
-            que llegue vuelve a evaluar la condición de salida y reintenta
-            la venta sola, sin intervención manual."""
+            (closed=False) y NO seteamos _closed_event, el próximo precio
+            que llegue (pasada la pausa entre reintentos) vuelve a evaluar
+            la condición de salida y reintenta la venta sola, con más
+            slippage y priority fee (ver _sell)."""
         async with self._sell_lock:
             # Revalidamos DESPUÉS de conseguir el lock: si _sell_on_shutdown
             # (u otra llamada) ya vendió mientras esperábamos aquí, esto ya
             # no corresponde -evita el segundo pedido real a la Lightning API.
             if pos.closed:
                 return
-            try:
-                await self.executor.sell(pos, price, reason, pool_override=self.onchain.pool_override())
-            except Exception as e:
-                logger.warning(f"⚠️  Venta fallida ({reason}): {e}. La posición SIGUE ABIERTA, "
-                               f"se reintentará con el próximo precio que llegue.")
+            # Todavía en la pausa tras una venta fallida: el siguiente
+            # precio que llegue después lo vuelve a intentar.
+            if time.monotonic() < self._sell_retry_at:
+                return
+            if not await self._sell(pos, price, reason):
                 return
         self._persist()
         self._closed_event.set()
+
+    async def _sell(self, pos: Position, price: float, reason: str) -> bool:
+        """Un intento de venta, con el slippage y el priority fee que tocan
+        según las ventas fallidas anteriores (ver sell_retry_params). True
+        si se vendió. Si falla, cuenta el fallo y fija cuándo se puede
+        volver a intentar. Se llama siempre con _sell_lock tomado."""
+        slippage, priority_fee = sell_retry_params(self.cfg, self.sell_failures)
+        try:
+            await self.executor.sell(pos, price, reason, pool_override=self.onchain.pool_override(),
+                                     slippage=slippage, priority_fee=priority_fee)
+        except Exception as e:
+            self.sell_failures += 1
+            # Pausa corta y creciente (1, 2, ... hasta 5 s): no machacar la
+            # Lightning API con la misma orden, pero sin dejar el stop
+            # mucho tiempo sin ejecutar.
+            self._sell_retry_at = time.monotonic() + min(self.sell_failures, 5) * self._SELL_RETRY_DELAY_SECONDS
+            next_slippage, next_fee = sell_retry_params(self.cfg, self.sell_failures)
+            logger.warning(f"⚠️  Venta fallida ({reason}), intento {self.sell_failures}: {e}. La posición "
+                           f"SIGUE ABIERTA; el próximo intento va con slippage {next_slippage:g}% y "
+                           f"priority fee {next_fee:.6f} SOL.")
+            if self.sell_failures == _SELL_FAILURES_ALERT:
+                logger.error(f"🚨 {self.sell_failures} ventas fallidas seguidas de {self.mint}. El bot sigue "
+                             f"reintentando, pero revisa la posición (saldo de SOL para fees, RPC, "
+                             f"liquidez): https://pump.fun/{self.mint}")
+            return False
+        self.sell_failures = 0
+        return True

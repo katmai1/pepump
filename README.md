@@ -158,6 +158,12 @@ toma de `PEPUMP_WEB_PASSWORD` o la pregunta.
    sigue al máximo alcanzado, siempre `trailing_pct` % por debajo.
 5. Si el precio retrocede hasta ese nivel, vende.
 
+Si una venta falla (lo típico: slippage excedido con el precio cayendo), se
+reintenta con el siguiente precio, tras una pausa corta y creciente, subiendo
+en cada intento el slippage (+10 puntos) y el priority fee (x4) hasta
+`max_sell_slippage` / `max_sell_priority_fee`. Con 3 fallos seguidos avisa
+en el log y en el panel web.
+
 Cada orden cerrada se registra en el CSV de `general.trade_history_csv`
 (`""` desactiva el historial).
 

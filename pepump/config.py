@@ -39,6 +39,13 @@ class AppConfig:
     slippage: float = 15.0
     priority_fee: float = 0.00001
     pool: str = "auto"  # ver POOLS_VALIDOS
+    # Topes para los REINTENTOS de una venta fallida (ver
+    # executor.sell_retry_params): cada fallo sube el slippage y el priority
+    # fee, porque cuando salta un stop el precio suele estar cayendo rápido
+    # y repetir la misma orden falla igual. Nunca bajan de slippage /
+    # priority_fee.
+    max_sell_slippage: float = 50.0
+    max_sell_priority_fee: float = 0.001
 
     # --- [strategy] ------------------------------------------------------ #
     activation_pct: float = 10.0
@@ -120,7 +127,7 @@ class AppConfig:
     # sigue esperando el feed en vivo normalmente. Un valor más alto que
     # live_feed_timeout_seconds evita falsos positivos en tokens con
     # volumen intermitente pero todavía en bonding curve.
-    stall_timeout_seconds: float = 20.0
+    stall_timeout_seconds: float = 10.0
     # Después de mandar una compra/venta REAL (Lightning API), cuántos
     # segundos esperar a que la transacción confirme on-chain antes de
     # darla por fallida. Necesario porque PumpPortal puede devolver un
@@ -202,6 +209,10 @@ def validate_config(config: AppConfig) -> None:
                        f"(está en {config.max_open_positions})")
     positivo("trade.slippage", config.slippage)
     positivo("trade.priority_fee", config.priority_fee, incluir_cero=True)
+    if config.max_sell_slippage is None or not 0 < config.max_sell_slippage <= 100:
+        errores.append(f"trade.max_sell_slippage tiene que estar en el rango (0, 100] "
+                       f"(está en {config.max_sell_slippage})")
+    positivo("trade.max_sell_priority_fee", config.max_sell_priority_fee, incluir_cero=True)
     if config.pool not in POOLS_VALIDOS:
         errores.append(f"trade.pool tiene que ser uno de {list(POOLS_VALIDOS)} (está en {config.pool!r})")
 

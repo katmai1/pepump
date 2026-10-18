@@ -56,6 +56,15 @@ pool = "auto"
 # cambia aquí, a propósito.
 max_buy_sol = 0.5
 
+# Si una venta falla (típicamente slippage excedido: cuando salta un stop el
+# precio suele estar cayendo rápido), el bot la reintenta subiendo en cada
+# intento el slippage (+10 puntos) y el priority fee (x4), hasta estos
+# topes. Con los valores de arriba: slippage 15 -> 25 -> 35 -> 45 -> 50 y
+# fee 0.00001 -> 0.00004 -> 0.00016 -> 0.00064 -> 0.001 SOL. Nunca bajan
+# de slippage / priority_fee. Solo afectan a las VENTAS, no a la compra.
+max_sell_slippage = 50
+max_sell_priority_fee = 0.001
+
 [strategy]
 # Subida %% desde el precio de entrada necesaria para "armar" el trailing-stop.
 activation_pct = 10.0
@@ -122,7 +131,10 @@ live_feed_timeout_seconds = 5.0
 # precio válido, pasa a polling on-chain (ver onchain_poll_interval_seconds
 # más abajo) para no perderse el trailing-stop/stop-loss. Si no, sigue
 # esperando el feed en vivo (probablemente solo poco volumen momentáneo).
-stall_timeout_seconds = 20.0
+# Es el tiempo máximo que el bot puede pasar sin enterarse del precio si el
+# feed deja de entregar sin avisar: más bajo reacciona antes, a cambio de
+# dos consultas baratas al RPC (getAccountInfo) por cada pausa de volumen.
+stall_timeout_seconds = 10.0
 
 # Cada cuántos segundos se consulta el precio on-chain de PumpSwap mientras
 # el bot está en modo fallback (mint migrado, ya sea desde la entrada o a

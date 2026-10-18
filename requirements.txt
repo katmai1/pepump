@@ -1,7 +1,9 @@
 # Dependencias de runtime del bot (ver requirements-dev.txt para los tests).
-websockets      # feed de precios: subscribeTokenTrade de PumpPortal
-requests        # Lightning Transaction API de PumpPortal
-solana          # lecturas on-chain (getAccountInfo / getProgramAccounts)
-solders         # tipos de Solana (Pubkey, Signature) usados por solana-py
-fastapi         # panel web (--web)
-uvicorn         # servidor del panel web
+# Versiones fijadas: son las probadas con la suite de tests. Para subir una,
+# cámbiala aquí, instala y pasa `pytest` antes de operar en real.
+websockets==11.0.3   # feed de precios: subscribeTokenTrade de PumpPortal (solana exige <12)
+requests==2.34.2     # Lightning Transaction API de PumpPortal
+solana==0.35.1       # lecturas on-chain (getAccountInfo / getProgramAccounts)
+solders==0.21.0      # tipos de Solana (Pubkey, Signature) usados por solana-py
+fastapi==0.143.3     # panel web (--web)
+uvicorn==0.54.0      # servidor del panel web
