@@ -65,6 +65,7 @@ import sys
 
 from pepump.config import load_config, validate_mint
 from pepump.dashboard import MultiPositionPanel
+from pepump.jupiter import build_jupiter_client
 from pepump.logging_config import setup_logging
 from pepump.manager import PositionManager
 from pepump.onchain.metadata import TokenMetadataOnChainClient
@@ -180,6 +181,15 @@ if __name__ == "__main__":
         # sin esperar a aprenderla de la primera compra.
         client.wallet_address = config.wallet_address
 
+    try:
+        jupiter = build_jupiter_client(config)
+    except ValueError as e:
+        logger.error(str(e))
+        sys.exit(1)
+    if jupiter is not None and jupiter.wallet_address and not client.wallet_address:
+        # Misma wallet para las dos APIs: con la clave ya se conoce.
+        client.wallet_address = jupiter.wallet_address
+
     store = None
     if config.state_db:
         from pepump.store import PositionStore
@@ -194,7 +204,8 @@ if __name__ == "__main__":
 
     async def main():
         manager = PositionManager(base_config=config, client=client, store=store,
-                                  metadata_client=TokenMetadataOnChainClient(config.solana_rpc_url))
+                                  metadata_client=TokenMetadataOnChainClient(config.solana_rpc_url),
+                                  jupiter=jupiter)
         if panel is not None:
             multi = MultiPositionPanel(panel, manager.snapshot, live=config.live)
             if args.sell_on_exit:

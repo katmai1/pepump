@@ -571,6 +571,7 @@ const MARKETS = {
   bondingcurve: "En la curva de pump.fun",
   pumpswap: "Migrado a PumpSwap",
   other: "No está en pump.fun ni en PumpSwap: se intentará Raydium CPMM / Meteora DLMM",
+  jupiter: "No está en pump.fun ni en PumpSwap: si tampoco está en Raydium CPMM / Meteora DLMM, irá por Jupiter (precio = lo que darían al vender)",
   unknown: "No se pudo comprobar dónde cotiza (¿RPC?)",
 };
 
@@ -754,7 +755,9 @@ function renderDetail() {
     kv("Estado", `${st.icon} ${st.label}`),
     kv("Modo", snap.live ? "REAL (SOL de verdad)" : "Simulado", { tone: snap.live ? "down" : "" }),
     ...(snap.recovered ? [kv("Origen", "Retomada de una ejecución anterior")] : []),
-    kv("Fuente del precio", snap.price_source === "feed" ? "Feed en vivo (PumpPortal)" : `On-chain (${snap.price_source})`),
+    kv("Fuente del precio", snap.price_source === "feed" ? "Feed en vivo (PumpPortal)"
+      : snap.price_source === "jupiter" ? "Jupiter (cotización de venta; órdenes por Jupiter)"
+      : `On-chain (${snap.price_source})`),
     kv("Precio actual", fmtPrice(snap.latest_price)),
   ];
   if (snap.entry_target_price && !pos) {

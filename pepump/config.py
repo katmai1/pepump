@@ -1,7 +1,8 @@
 import logging
 import os
+import stat
 import tomllib
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 
 from solders.pubkey import Pubkey
 
@@ -89,6 +90,24 @@ class AppConfig:
     # compra real. Con ella, la web muestra el saldo desde el arranque y se
     # comprueba que haya SOL antes de cada compra real.
     wallet_address: str = ""
+
+    # --- [jupiter] ---------------------------------------------------------- #
+    # API key de Jupiter (portal de desarrolladores). Con ella, los tokens
+    # que no cotizan contra SOL en pump.fun, PumpSwap, Raydium CPMM ni
+    # Meteora DLMM se operan por Jupiter (ver jupiter.py). Vacía = sin
+    # Jupiter. También con la variable de entorno JUPITER_API_KEY. Para
+    # operar en REAL hace falta además la clave privada de la wallet
+    # (wallet_private_key, abajo).
+    jupiter_api_key: str = ""
+    # Clave PRIVADA de la wallet (la misma que la de PumpPortal), para firmar
+    # las órdenes de Jupiter. Vacía = Jupiter solo en simulado. También con
+    # la variable de entorno PEPUMP_WALLET_PRIVATE_KEY. repr=False: que no
+    # salga nunca en un log ni en un traceback que muestre la config.
+    wallet_private_key: str = field(default="", repr=False)
+    # Mínimo de segundos entre dos peticiones a Jupiter, para TODA la
+    # cuenta (precio de todas las posiciones + órdenes). 2.0 es el plan
+    # gratuito; con un plan de pago se puede bajar.
+    jupiter_request_interval_seconds: float = 2.0
 
     # --- [web] -------------------------------------------------------------- #
     # Contraseña del panel web (--web). Opcional: vacía, el panel no pide
@@ -244,6 +263,7 @@ def validate_config(config: AppConfig) -> None:
     positivo("onchain.stall_timeout_seconds", config.stall_timeout_seconds)
     positivo("onchain.tx_confirm_timeout_seconds", config.tx_confirm_timeout_seconds)
     positivo("onchain.tx_confirm_poll_interval_seconds", config.tx_confirm_poll_interval_seconds)
+    positivo("jupiter.jupiter_request_interval_seconds", config.jupiter_request_interval_seconds)
 
     if config.wallet_address:
         try:
@@ -287,6 +307,20 @@ def validate_config(config: AppConfig) -> None:
                        f"Confirma que sea el importe que quieres arriesgar.")
 
 
+def _warn_if_readable_by_others(path: str) -> None:
+    """Con la clave privada dentro, el .toml solo lo debería poder leer su
+    dueño. En Windows los permisos POSIX no dicen nada: no se comprueba."""
+    if os.name != "posix":
+        return
+    try:
+        mode = os.stat(path).st_mode
+    except OSError:
+        return
+    if mode & (stat.S_IRGRP | stat.S_IROTH):
+        logger.warning(f"⚠️  {path} tiene la clave privada de la wallet y lo pueden leer otros usuarios "
+                       f"de esta máquina. Protégelo con: chmod 600 {path}")
+
+
 def load_config(path: str) -> AppConfig:
     """Lee el .toml (organizado en secciones [general]/[trade]/[strategy]/
     [pumpportal] solo por legibilidad) y arma UNA única AppConfig con todos
@@ -296,7 +330,7 @@ def load_config(path: str) -> AppConfig:
 
     valid_keys = {f.name for f in fields(AppConfig)}
     merged: dict = {}
-    for section_name in ("general", "trade", "strategy", "pumpportal", "onchain", "web"):
+    for section_name in ("general", "trade", "strategy", "pumpportal", "jupiter", "onchain", "web"):
         section = raw.get(section_name, {})
         unknown = set(section) - valid_keys
         if unknown:
@@ -319,6 +353,14 @@ def load_config(path: str) -> AppConfig:
         config.api_key = os.environ.get("PUMPPORTAL_API_KEY", "")
     config.api_key = config.api_key.strip()
     config.wallet_address = config.wallet_address.strip()
+    if not config.jupiter_api_key:
+        config.jupiter_api_key = os.environ.get("JUPITER_API_KEY", "")
+    config.jupiter_api_key = config.jupiter_api_key.strip()
+    if config.wallet_private_key:
+        _warn_if_readable_by_others(path)
+    else:
+        config.wallet_private_key = os.environ.get("PEPUMP_WALLET_PRIVATE_KEY", "")
+    config.wallet_private_key = config.wallet_private_key.strip()
 
     if not config.api_key:
         raise ValueError(

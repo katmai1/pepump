@@ -454,3 +454,29 @@ def test_fetch_actual_fill_suma_varias_cuentas_propias_del_mismo_mint(monkeypatc
 
     assert fill is not None
     assert fill["token_delta"] == pytest.approx(400.0)
+
+
+def test_fetch_actual_fill_con_wallet_no_supone_que_paga_la_tx(monkeypatch):
+    """Orden de Jupiter enrutada por un market maker: quien paga la tx
+    (índice 0) no es nuestra wallet. Con `wallet`, el delta de SOL y de
+    tokens es el de nuestra cuenta, esté donde esté."""
+    meta = FakeMeta(
+        pre_balances=[5_000_000_000, 1_000_000_000],
+        post_balances=[4_000_000_000, 1_060_000_000],
+        pre_token_balances=[FakeTokenBalance(MINT, WALLET, 1000.0)],
+        post_token_balances=[FakeTokenBalance(MINT, WALLET, 0.0)],
+    )
+    resp = FakeGetTransactionResp(FakeConfirmedTx(meta, [OTHER_ACCOUNT, WALLET]))
+    monkeypatch.setattr(txinfo_module, "AsyncClient", lambda url: FakeAsyncClient(resp=resp))
+
+    fill = asyncio.run(txinfo_module.fetch_actual_fill(FAKE_SIGNATURE, "http://fake-rpc", MINT, wallet=WALLET))
+
+    assert fill == {"sol_delta": pytest.approx(0.06), "token_delta": pytest.approx(-1000.0), "wallet": WALLET}
+
+
+def test_fetch_actual_fill_con_wallet_que_no_esta_en_la_tx(monkeypatch):
+    resp = _make_resp(sol_delta_lamports=-1, pre_tokens=0.0, post_tokens=1.0)
+    monkeypatch.setattr(txinfo_module, "AsyncClient", lambda url: FakeAsyncClient(resp=resp))
+
+    assert asyncio.run(txinfo_module.fetch_actual_fill(FAKE_SIGNATURE, "http://fake-rpc", MINT,
+                                                       wallet="NoEsta1111111111111111111111111111111111111")) is None

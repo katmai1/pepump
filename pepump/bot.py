@@ -6,6 +6,7 @@ from collections import deque
 from typing import Callable, Optional
 
 from pepump.executor import Position, sell_retry_params
+from pepump.jupiter import PRIORITY_BACKGROUND
 from pepump.log_context import current_mint, set_mint_label
 from pepump.onchain.fallback import OnchainFallback
 from pepump.strategy import Action, TrailingStrategy
@@ -53,6 +54,10 @@ _EXISTENCE_CHECK_POLL_SECONDS = 0.5
 # más esté mal (sin SOL para fees, RPC caído, token sin liquidez...).
 _SELL_FAILURES_ALERT = 3
 
+# Cada cuánto se registra el precio tras la venta si sale de Jupiter (ver
+# follow_after_close): cada consulta gasta el cupo de peticiones de la cuenta.
+_FOLLOW_JUPITER_INTERVAL_SECONDS = 30.0
+
 
 class TrailingTakeProfitBot:
     """
@@ -63,7 +68,7 @@ class TrailingTakeProfitBot:
 
     def __init__(self, client, executor, config, panel=None, metadata_client=None,
                  persist=None, resume_position: Optional[Position] = None,
-                 resume_onchain_source: Optional[str] = None):
+                 resume_onchain_source: Optional[str] = None, jupiter=None):
         self.client = client
         self.executor = executor
         self.mint = config.mint
@@ -83,7 +88,10 @@ class TrailingTakeProfitBot:
         # Fallback on-chain (ver onchain/fallback.py): si el precio no sale
         # del feed en vivo, de dónde sale ahora (`self.onchain.source`) y
         # por qué pool hay que rutear la orden.
-        self.onchain = OnchainFallback(self.mint, config.solana_rpc_url, resume_onchain_source)
+        self.onchain = OnchainFallback(self.mint, config.solana_rpc_url, resume_onchain_source,
+                                       jupiter=jupiter)
+        if resume_position is not None:
+            self.onchain.jupiter_tokens = resume_position.token_amount
         # Si _get_reference_price (o algo que llame desde ahí) ya
         # logueó un motivo específico para devolver None -mint que no es
         # de pump.fun, timeout total, fallback on-chain sin precio,
@@ -642,6 +650,9 @@ class TrailingTakeProfitBot:
                     mint_not_pumpfun = existence_check_task.result()
                     existence_check_task = None
                     if mint_not_pumpfun:
+                        price = await self._jupiter_reference()
+                        if price is not None:
+                            return price
                         self._log_mint_not_pumpfun_abort()
                         self._initial_price_failure_reason_logged = True
                         return None
@@ -665,6 +676,9 @@ class TrailingTakeProfitBot:
                         if price is not None:
                             return price
                         if mint_not_pumpfun:
+                            jupiter_price = await self._jupiter_reference()
+                            if jupiter_price is not None:
+                                return jupiter_price
                             self._log_mint_not_pumpfun_abort()
                             self._initial_price_failure_reason_logged = True
                             return None
@@ -751,6 +765,21 @@ class TrailingTakeProfitBot:
                 with contextlib.suppress(BaseException):
                     await existence_check_task
 
+    async def _jupiter_reference(self) -> Optional[float]:
+        """Mint que no está en ninguna fuente on-chain: si hay Jupiter, se
+        intenta operar por ahí (ver OnchainFallback.resolve_jupiter). En
+        REAL hace falta poder firmar; sin clave se avisa y no se entra."""
+        jupiter = self.onchain.jupiter
+        if jupiter is None:
+            return None
+        if self.cfg.live and not jupiter.can_sign:
+            logger.error("Este token solo se puede operar por Jupiter, y para hacerlo en REAL falta la "
+                         "clave privada de la wallet (wallet_private_key en [jupiter] del .toml).")
+            return None
+        logger.info("No cotiza contra SOL en pump.fun, PumpSwap, Raydium CPMM ni Meteora DLMM: "
+                    "pruebo con Jupiter...")
+        return await self.onchain.resolve_jupiter(self.cfg.buy_sol)
+
     def _log_mint_not_pumpfun_abort(self) -> None:
         """Único mensaje de error para el caso "este mint no es de
         pump.fun/PumpSwap" -antes se logueaba una vez en
@@ -762,7 +791,9 @@ class TrailingTakeProfitBot:
                      f"PumpSwap, ni pool de Raydium CPMM ni de Meteora DLMM contra SOL con liquidez "
                      f"real). Si está en otro DEX (Meteora DAMM, Raydium AMM v4/CLMM, LaunchLab sin "
                      f"graduar...), este bot "
-                     f"no puede calcular su precio de entrada.")
+                     f"no puede calcular su precio de entrada"
+                     + (" (tampoco se pudo por Jupiter, ver arriba)." if self.onchain.jupiter is not None else
+                        ". Con una API key de Jupiter (jupiter_api_key) se podría operar por ahí."))
 
     async def _wait_for_dip_entry(self, reference_price: float, target_price: float) -> Optional[float]:
         """Sólo se llama cuando `entry_dip_pct` > 0 (ver _get_initial_price).
@@ -924,7 +955,15 @@ class TrailingTakeProfitBot:
         # Copia propia: no cambia la fuente que muestra el snapshot. Si el
         # precio venía del feed, el mint estaba en la bonding curve, y
         # fetch_price ya pasa solo a PumpSwap si la curva completa.
-        onchain = OnchainFallback(self.mint, self.cfg.solana_rpc_url, self.onchain.source or "bondingcurve")
+        onchain = OnchainFallback(self.mint, self.cfg.solana_rpc_url, self.onchain.source or "bondingcurve",
+                                  jupiter=self.onchain.jupiter)
+        interval = self.cfg.onchain_poll_interval_seconds
+        if onchain.source == "jupiter":
+            # Cada consulta gasta cupo de Jupiter, que comparten las
+            # posiciones abiertas: más espaciado y siempre detrás de ellas.
+            onchain.jupiter_tokens = self.onchain.jupiter_tokens
+            onchain.jupiter_priority = PRIORITY_BACKGROUND
+            interval = max(interval, _FOLLOW_JUPITER_INTERVAL_SECONDS)
         deadline = time.monotonic() + seconds
         logger.info(f"Registrando el precio {seconds / 60:.0f} min más tras la venta (para análisis).")
         try:
@@ -936,7 +975,7 @@ class TrailingTakeProfitBot:
                     price = None
                 if price is not None and price > 0:
                     self._record_price(time.time(), price)
-                await asyncio.sleep(min(self.cfg.onchain_poll_interval_seconds, left))
+                await asyncio.sleep(min(interval, left))
             logger.debug("[Tras la venta] fin del registro de precios.")
         finally:
             current_mint.reset(ctx)
@@ -1315,6 +1354,7 @@ class TrailingTakeProfitBot:
 
     async def _on_first_price(self, price: float) -> None:
         self.position = await self.executor.buy(self.mint, price, pool_override=self.onchain.pool_override())
+        self.onchain.jupiter_tokens = self.position.token_amount
         self._update_panel_fixed()
         logger.info(f"Activación del trailing-stop: +{self.cfg.activation_pct}% "
                     f"| ancho del trailing una vez armado: {self.cfg.trailing_pct}% "

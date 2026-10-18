@@ -130,6 +130,36 @@ api_key = ""
 # cada compra real, comprueba que haya SOL suficiente.
 wallet_address = ""
 
+[jupiter]
+# OPCIONAL. Para tokens que no cotizan contra SOL en pump.fun, PumpSwap,
+# Raydium CPMM ni Meteora DLMM (p. ej. los de StonkFun, contra STONK, ORE o
+# TSLAx): el precio sale de la cotización de venta de Jupiter y las órdenes
+# van por Jupiter, que encuentra la ruta SOL -> quote -> token sola. Los
+# demás tokens siguen yendo por PumpPortal como siempre.
+# Vacía = sin Jupiter. Si la dejas vacía aquí, también se busca la variable
+# de entorno JUPITER_API_KEY.
+#
+# Comisiones: Jupiter cobra un 0.1% por operación (0.5% en tokens de menos
+# de 24 h), más las de los pools de la ruta. Ojo con los tokens Token-2022
+# con impuesto de transferencia (p. ej. 3%): se paga al comprar y al vender.
+jupiter_api_key = ""
+
+# Mínimo de segundos entre dos peticiones a Jupiter, para TODA la cuenta:
+# el precio de todas las posiciones de Jupiter y las órdenes comparten este
+# cupo (las órdenes van siempre primero). 2.0 = plan gratuito. Con varias
+# posiciones a la vez, el precio de cada una se refresca más despacio.
+jupiter_request_interval_seconds = 2.0
+
+# Clave PRIVADA de la wallet, para operar en REAL por Jupiter (Jupiter no
+# firma por ti, a diferencia de la Lightning API de PumpPortal). Tiene que ser
+# la misma wallet que la de PumpPortal (si pones wallet_address arriba, se
+# comprueba). Formato base58, como la exporta Phantom o PumpPortal. Vacía =
+# Jupiter solo en simulado.
+# ¡Con esto, quien lea este archivo puede vaciar la wallet! Protégelo
+# (chmod 600 config.toml) y no lo copies ni lo compartas. Si la dejas vacía
+# aquí, también se busca la variable de entorno PEPUMP_WALLET_PRIVATE_KEY.
+wallet_private_key = ""
+
 [onchain]
 # Cuántos segundos se espera el precio por el feed en vivo ANTES de recurrir
 # al fallback on-chain, PARA LA ENTRADA (todavía sin posición abierta). Solo

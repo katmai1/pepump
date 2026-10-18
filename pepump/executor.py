@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from pepump.history import append_closed_trade
+from pepump.jupiter import JUPITER_POOL, PRIORITY_TRADE
 from pepump.pumpportal import TradeOutcomeUnknown
 
 logger = logging.getLogger(__name__)
@@ -144,15 +145,16 @@ def simulated_buy(cfg, price: float) -> tuple[float, float, float]:
 
 
 def simulated_sell(cfg, tokens: float, price: float,
-                   priority_fee: Optional[float] = None) -> tuple[float, float]:
+                   priority_fee: Optional[float] = None, fee_pct: Optional[float] = None) -> tuple[float, float]:
     """Venta SIMULADA con los costes de una real (con cfg.sim_costs): se
     cobra `sim_slippage_pct` % por debajo del precio de mercado, menos
-    `sim_fee_pct` % de comisiones, el priority fee y el fee de red, y
-    vuelve el rent de la cuenta del token. Devuelve (SOL recibidos,
-    precio efectivo)."""
+    `sim_fee_pct` % de comisiones (o `fee_pct`), el priority fee y el fee
+    de red, y vuelve el rent de la cuenta del token. Devuelve (SOL
+    recibidos, precio efectivo)."""
     fee = cfg.priority_fee if priority_fee is None else priority_fee
+    fee_pct = cfg.sim_fee_pct if fee_pct is None else fee_pct
     gross = tokens * price * (1 - cfg.sim_slippage_pct / 100.0)
-    proceeds = gross * (1 - cfg.sim_fee_pct / 100.0) - fee - NETWORK_FEE_SOL + TOKEN_ACCOUNT_RENT_SOL
+    proceeds = gross * (1 - fee_pct / 100.0) - fee - NETWORK_FEE_SOL + TOKEN_ACCOUNT_RENT_SOL
     # Sin ingresos netos no hay precio de salida con sentido (igual que en
     # una venta real): se deja el de mercado.
     exit_price = proceeds / tokens if proceeds > 0 and tokens > 0 else price
@@ -181,13 +183,41 @@ class TradeExecutor:
     """
     Gestiona la compra y venta de un token, ya sea en modo SIMULADO (no toca
     la red, solo lleva la cuenta en memoria) o en modo REAL (usa un
-    PumpPortalClient para mandar la orden a la Lightning API).
+    PumpPortalClient para mandar la orden a la Lightning API, o el
+    JupiterClient si la posición va por Jupiter: pool_override="jupiter").
     """
 
-    def __init__(self, client, live: bool, config):
+    def __init__(self, client, live: bool, config, jupiter=None):
         self.client = client
         self.live = live
         self.cfg = config
+        self.jupiter = jupiter
+
+    def _jupiter(self):
+        if self.jupiter is None:
+            raise RuntimeError("Esta posición va por Jupiter y no hay jupiter_api_key configurada.")
+        return self.jupiter
+
+    async def _execute(self, pool: str, **kwargs) -> dict:
+        if pool == JUPITER_POOL:
+            return await self._jupiter().execute_trade(**kwargs)
+        return await self.client.execute_lightning_trade(pool=pool, **kwargs)
+
+    async def _simulated_jupiter_buy(self, mint: str, price: float) -> tuple[float, float, float]:
+        """Como simulated_buy, pero los tokens salen de una cotización de
+        compra real de Jupiter (ruta, comisiones e impacto ya incluidos), en
+        vez de aplicar sim_fee_pct a un precio. Si la cotización falla, se
+        cae a simulated_buy con el precio de referencia."""
+        try:
+            tokens = await self._jupiter().buy_tokens(mint, self.cfg.buy_sol, self.cfg.solana_rpc_url,
+                                                      priority=PRIORITY_TRADE)
+        except Exception as e:
+            logger.warning(f"[SIMULADO] No se pudo cotizar la compra en Jupiter ({e}); "
+                           f"se simula con el precio de referencia.")
+            return simulated_buy(self.cfg, price)
+        tokens *= 1 - self.cfg.sim_slippage_pct / 100.0
+        spent = self.cfg.buy_sol + self.cfg.priority_fee + NETWORK_FEE_SOL + TOKEN_ACCOUNT_RENT_SOL
+        return spent, tokens, spent / tokens
 
     async def buy(self, mint: str, price: float, pool_override: Optional[str] = None) -> Position:
         # Valores ESTIMADOS a partir del precio de referencia -se usan
@@ -199,14 +229,17 @@ class TradeExecutor:
         real_fill = False
 
         if not self.live and self.cfg.sim_costs:
-            sol_amount, token_amount, entry_price = simulated_buy(self.cfg, price)
+            if pool_override == JUPITER_POOL:
+                sol_amount, token_amount, entry_price = await self._simulated_jupiter_buy(mint, price)
+            else:
+                sol_amount, token_amount, entry_price = simulated_buy(self.cfg, price)
 
         if self.live:
             try:
-                result = await self.client.execute_lightning_trade(
+                result = await self._execute(
+                    pool_override or self.cfg.pool,
                     action="buy", mint=mint, amount=sol_amount, denominated_in_sol=True,
                     slippage=self.cfg.slippage, priority_fee=self.cfg.priority_fee,
-                    pool=pool_override or self.cfg.pool,
                     solana_rpc_url=self.cfg.solana_rpc_url,
                     tx_confirm_timeout_seconds=self.cfg.tx_confirm_timeout_seconds,
                     tx_confirm_poll_interval_seconds=self.cfg.tx_confirm_poll_interval_seconds,
@@ -307,15 +340,18 @@ class TradeExecutor:
         real_fill = False
 
         if not self.live and self.cfg.sim_costs:
-            proceeds, exit_price = simulated_sell(self.cfg, token_amount_sold, price, priority_fee)
+            # El precio de Jupiter ya es lo que se recibiría al vender
+            # (comisiones incluidas): no se cobran otra vez.
+            fee_pct = 0.0 if pool_override == JUPITER_POOL else None
+            proceeds, exit_price = simulated_sell(self.cfg, token_amount_sold, price, priority_fee, fee_pct)
 
         if self.live:
             try:
-                result = await self.client.execute_lightning_trade(
+                result = await self._execute(
+                    pool_override or self.cfg.pool,
                     action="sell", mint=position.mint, amount="100%", denominated_in_sol=False,
                     slippage=self.cfg.slippage if slippage is None else slippage,
                     priority_fee=self.cfg.priority_fee if priority_fee is None else priority_fee,
-                    pool=pool_override or self.cfg.pool,
                     solana_rpc_url=self.cfg.solana_rpc_url,
                     tx_confirm_timeout_seconds=self.cfg.tx_confirm_timeout_seconds,
                     tx_confirm_poll_interval_seconds=self.cfg.tx_confirm_poll_interval_seconds,

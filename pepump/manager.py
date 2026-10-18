@@ -29,6 +29,7 @@ from pepump.bot import TrailingTakeProfitBot
 from pepump.config import AppConfig, validate_config, validate_mint
 from pepump.executor import Position, TradeExecutor
 from pepump.feed import SharedTradeFeed
+from pepump.jupiter import PRIORITY_BACKGROUND
 from pepump.log_context import enable_tags
 from pepump.onchain.pump_curve import PumpCurveOnChainClient
 from pepump.onchain.pumpswap import PumpSwapOnChainClient
@@ -89,20 +90,23 @@ class PositionManager:
     def __init__(self, base_config: AppConfig, client, feed: Optional[SharedTradeFeed] = None,
                  metadata_client=None, panel_factory: Optional[Callable[["ManagedPosition"], object]] = None,
                  executor_factory: Optional[Callable[[AppConfig], object]] = None,
-                 store: Optional[PositionStore] = None):
+                 store: Optional[PositionStore] = None, jupiter=None):
         """`client` es el PumpPortalClient real (trades de la Lightning API,
         balances); el precio llega por `feed` (uno compartido sobre ese
         mismo cliente si no se pasa). `panel_factory(managed)` devuelve el
         panel de cada bot (None = sin panel: el estado se loguea).
         `executor_factory` existe para los tests. `store` guarda las
-        posiciones para retomarlas (None = sin persistencia)."""
+        posiciones para retomarlas (None = sin persistencia). `jupiter` es el
+        JupiterClient (None = sin Jupiter): lo comparten todas las
+        posiciones, con un único cupo de peticiones."""
         self.base_config = base_config
         self.client = client
         self.feed = feed if feed is not None else SharedTradeFeed(client)
         self.metadata_client = metadata_client
         self.panel_factory = panel_factory
+        self.jupiter = jupiter
         self.executor_factory = executor_factory or (
-            lambda cfg: TradeExecutor(client=client, live=cfg.live, config=cfg))
+            lambda cfg: TradeExecutor(client=client, live=cfg.live, config=cfg, jupiter=jupiter))
         self.store = store
         self._positions: Dict[int, ManagedPosition] = {}
         self._next_id = 1  # solo sin store; con store, el id lo da la base de datos
@@ -157,7 +161,8 @@ class PositionManager:
         bot = TrailingTakeProfitBot(client=self.feed, executor=self.executor_factory(cfg), config=cfg,
                                     metadata_client=self.metadata_client,
                                     resume_position=resume_position,
-                                    resume_onchain_source=resume_onchain_source)
+                                    resume_onchain_source=resume_onchain_source,
+                                    jupiter=self.jupiter)
         task = asyncio.create_task(bot.run(), name=f"pepump-pos-{pos_id}")
         managed = ManagedPosition(id=pos_id, mint=mint, config=cfg, bot=bot, task=task)
         if self.store is not None:
@@ -509,7 +514,17 @@ class PositionManager:
                 return "pumpswap", price
             if exists is False and absent:
                 # Ni curva de pump.fun ni pool de PumpSwap: el bot todavía
-                # puede intentar Raydium CPMM / Meteora DLMM al entrar.
+                # puede intentar Raydium CPMM / Meteora DLMM al entrar, y si
+                # no, Jupiter (la cotización es orientativa: al entrar se
+                # mira primero lo demás).
+                if self.jupiter is not None:
+                    try:
+                        tokens = await self.jupiter.buy_tokens(mint, self.base_config.buy_sol, rpc,
+                                                               priority=PRIORITY_BACKGROUND)
+                        return "jupiter", await self.jupiter.sell_price(mint, tokens, rpc,
+                                                                        priority=PRIORITY_BACKGROUND)
+                    except Exception as e:
+                        logger.debug(f"[Vista previa] Jupiter no cotiza {mint}: {e}")
                 return "other", None
             return "unknown", None
 

@@ -190,8 +190,42 @@ on-chain que se activan solos cuando ese feed deja de entregar trades:
   (`stall_timeout_seconds`) y lo confirma on-chain antes de cambiar de
   fuente.
 
-No se usan DexScreener ni Jupiter a propósito: desalinean el precio que el
-bot "ve" del precio contra el que realmente se ejecuta la orden.
+No se usan DexScreener ni Jupiter para el precio de estos tokens a propósito:
+desalinean el precio que el bot "ve" del precio contra el que realmente se
+ejecuta la orden.
+
+### Tokens que no cotizan contra SOL: Jupiter
+
+Algunos tokens solo tienen liquidez contra otro token: los de StonkFun, por
+ejemplo, están en una curva de Raydium LaunchLab contra STONK, ORE o una
+acción tokenizada (TSLAx). Si un mint no aparece en ninguna de las fuentes de
+arriba y hay `jupiter_api_key` (sección `[jupiter]`), el bot lo opera **por
+Jupiter**:
+
+- **Precio:** lo que Jupiter daría ahora por vender la posición, dividido
+  entre los tokens. Ya incluye la ruta (SOL → STONK → token), las comisiones
+  de los pools y de Jupiter, el impacto y el impuesto de transferencia de
+  Token-2022. Antes de comprar, se cotiza la venta de lo que se compraría con
+  `buy_sol`.
+- **Órdenes:** por Jupiter (`/order` + `/execute`). Jupiter no firma: para
+  operar en real hace falta la clave privada de la wallet
+  (`wallet_private_key` en `[jupiter]`, o la variable de entorno
+  `PEPUMP_WALLET_PRIVATE_KEY`), y tiene que ser la misma wallet que la de
+  PumpPortal. Sin ella, Jupiter solo se usa en simulado. Con la clave en el
+  `.toml`, quien lea ese archivo puede vaciar la wallet: `chmod 600
+  config.toml` (el bot avisa al arrancar si lo pueden leer otros usuarios).
+- **Simulado:** la compra usa la cotización real de Jupiter, y la venta no
+  cobra `sim_fee_pct` (el precio ya es neto).
+- **Cupo de peticiones:** el plan gratuito da una petición cada ~2 s para
+  toda la cuenta (`jupiter_request_interval_seconds`). Las órdenes van
+  siempre delante de las consultas de precio; con varias posiciones por
+  Jupiter, el precio de cada una se refresca más despacio.
+
+Ojo con los costes: comprar y vender al momento sale alrededor de un 8% más
+caro en estos tokens (impuestos de transferencia, comisiones de la curva,
+dos saltos de ruta). El PnL neto arranca en ese negativo.
+
+
 
 ## Tests
 

@@ -15,10 +15,14 @@ Valores de `source`:
   "pumpswap"     -> el mint ya migró; se lee el pool oficial de PumpSwap.
   "raydium-cpmm" -> no es de pump.fun; pool de Raydium CPMM contra SOL.
   "meteora-dlmm" -> la liquidez contra SOL está en Meteora DLMM.
+  "jupiter"      -> ninguno de los anteriores: el precio es la cotización de
+                    venta de Jupiter y las órdenes van por Jupiter (ver
+                    jupiter.py). Solo si hay jupiter_api_key.
 """
 import logging
 from typing import Optional
 
+from pepump.jupiter import JUPITER_POOL, PRIORITY_PRICE
 from pepump.onchain.meteora_dlmm import MeteoraDlmmOnChainClient
 from pepump.onchain.pump_curve import PumpCurveOnChainClient
 from pepump.onchain.pumpswap import PumpSwapOnChainClient
@@ -28,10 +32,19 @@ logger = logging.getLogger(__name__)
 
 
 class OnchainFallback:
-    def __init__(self, mint: str, rpc_url: str, source: Optional[str] = None):
+    def __init__(self, mint: str, rpc_url: str, source: Optional[str] = None, jupiter=None):
         self.mint = mint
         self.rpc_url = rpc_url
         self.source: Optional[str] = source
+        # JupiterClient, o None si no hay jupiter_api_key.
+        self.jupiter = jupiter
+        # Tokens con los que se cotiza la venta en Jupiter: los de la
+        # posición una vez comprada (los pone bot.py), y antes de comprar
+        # los que darían por buy_sol (ver resolve_jupiter). El precio de
+        # Jupiter depende del tamaño (impacto en el pool), por eso se cotiza
+        # siempre lo que de verdad se va a vender.
+        self.jupiter_tokens: Optional[float] = None
+        self.jupiter_priority = PRIORITY_PRICE
 
     async def fetch_price(self) -> Optional[float]:
         """Consulta puntual al fallback on-chain ACTUALMENTE activo
@@ -47,6 +60,13 @@ class OnchainFallback:
         espíritu que bot._handle_feed_stall detectando una migración a
         mitad de posición, pero aquí para el caso en que ya veníamos
         on-chain por bonding curve."""
+        if self.source == "jupiter":
+            if self.jupiter is None:
+                raise RuntimeError("esta posición va por Jupiter y no hay jupiter_api_key configurada")
+            if not self.jupiter_tokens:
+                raise RuntimeError("no se sabe cuántos tokens cotizar en Jupiter")
+            return await self.jupiter.sell_price(self.mint, self.jupiter_tokens, self.rpc_url,
+                                                 priority=self.jupiter_priority)
         if self.source == "raydium-cpmm":
             cpmm = RaydiumCpmmOnChainClient(self.rpc_url)
             return await cpmm.fetch_price(self.mint)
@@ -205,6 +225,25 @@ class OnchainFallback:
 
         return price, pool_confirmed_absent, False
 
+    async def resolve_jupiter(self, buy_sol: float) -> Optional[float]:
+        """Último recurso para un mint que no está en ninguna de las fuentes
+        on-chain: cuántos tokens darían por `buy_sol` y a qué precio se
+        venderían. Si Jupiter tiene ruta, deja `self.source` en "jupiter" y
+        devuelve ese precio de venta; si no (o no hay Jupiter), None."""
+        if self.jupiter is None:
+            return None
+        try:
+            tokens = await self.jupiter.buy_tokens(self.mint, buy_sol, self.rpc_url)
+            price = await self.jupiter.sell_price(self.mint, tokens, self.rpc_url)
+        except Exception as e:
+            logger.warning(f"[Jupiter] Tampoco se pudo cotizar {self.mint} en Jupiter: {e}")
+            return None
+        self.jupiter_tokens = tokens
+        self.source = "jupiter"
+        logger.info(f"Precio de referencia (cotización de venta en Jupiter, {tokens:,.2f} tokens): "
+                    f"{price:.10f} SOL/token")
+        return price
+
     def pool_override(self) -> Optional[str]:
         """Si ya confirmamos -sea al entrar (resolve_reference) o a
         mitad de posición (bot._handle_feed_stall)- que este mint migró de
@@ -234,7 +273,7 @@ class OnchainFallback:
         if self.source is None:
             return None
         return {"pumpswap": "pump-amm", "raydium-cpmm": "raydium-cpmm",
-                "meteora-dlmm": "auto"}.get(self.source)
+                "meteora-dlmm": "auto", "jupiter": JUPITER_POOL}.get(self.source)
 
     # ---- Consultas puntuales para detectar una migración a mitad de posición ---- #
 

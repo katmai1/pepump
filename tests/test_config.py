@@ -1,5 +1,6 @@
 import dataclasses
 import logging
+import os
 import pathlib
 import tomllib
 
@@ -8,10 +9,18 @@ import pytest
 from pepump.config import AppConfig, load_config, validate_config, validate_mint
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-CONFIG_SECTIONS = ("general", "trade", "strategy", "pumpportal", "onchain", "web")
+CONFIG_SECTIONS = ("general", "trade", "strategy", "pumpportal", "jupiter", "onchain", "web")
 # `mint` es el único campo de AppConfig que NO va en el .toml: siempre
 # llega por la línea de comandos (-m/--mint, required en run.py).
 FIELDS_NOT_IN_TOML = {"mint"}
+
+
+@pytest.fixture(autouse=True)
+def _sin_claves_del_entorno(monkeypatch):
+    """Que una clave exportada en la terminal de quien corre los tests no
+    cambie lo que carga el .toml."""
+    for var in ("JUPITER_API_KEY", "PEPUMP_WALLET_PRIVATE_KEY"):
+        monkeypatch.delenv(var, raising=False)
 
 
 def write_toml(tmp_path, content: str):
@@ -147,11 +156,40 @@ def test_example_toml_no_tiene_claves_que_ya_no_existen():
     assert not extra, f"Sobran en config.toml.example: {extra}"
 
 
+def _toml_con_clave(tmp_path, clave: str, modo: int):
+    path = write_toml(tmp_path, f'[pumpportal]\napi_key = "k"\n[jupiter]\nwallet_private_key = "{clave}"\n')
+    os.chmod(path, modo)
+    return path
+
+
+@pytest.mark.skipif(os.name != "posix", reason="permisos POSIX")
+def test_clave_privada_en_un_toml_legible_por_otros_avisa(tmp_path, caplog):
+    path = _toml_con_clave(tmp_path, "secreta", 0o644)
+    with caplog.at_level(logging.WARNING):
+        cfg = load_config(str(path))
+    assert cfg.wallet_private_key == "secreta"
+    assert "chmod 600" in caplog.text and "secreta" not in caplog.text
+
+
+@pytest.mark.skipif(os.name != "posix", reason="permisos POSIX")
+def test_clave_privada_en_un_toml_protegido_no_avisa(tmp_path, caplog):
+    path = _toml_con_clave(tmp_path, "secreta", 0o600)
+    with caplog.at_level(logging.WARNING):
+        load_config(str(path))
+    assert "chmod 600" not in caplog.text
+
+
+def test_clave_privada_por_variable_de_entorno(tmp_path, monkeypatch):
+    monkeypatch.setenv("PEPUMP_WALLET_PRIVATE_KEY", " de-entorno ")
+    path = write_toml(tmp_path, '[pumpportal]\napi_key = "k"\n')
+    assert load_config(str(path)).wallet_private_key == "de-entorno"
+
+
 def test_example_toml_carga_sin_errores(tmp_path):
     """El ejemplo tiene que ser un .toml válido y cargable tal cual (con
     una api_key puesta), no solo un archivo de comentarios."""
     text = (REPO_ROOT / "config.toml.example").read_text(encoding="utf-8")
-    text = text.replace('api_key = ""', 'api_key = "clave-de-prueba"')
+    text = text.replace('\napi_key = ""', '\napi_key = "clave-de-prueba"')
     path = tmp_path / "config.toml"
     path.write_text(text, encoding="utf-8")
 

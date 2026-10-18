@@ -198,7 +198,8 @@ def _wallet_token_delta(meta, mint: str, wallet: str) -> Optional[float]:
 
 
 async def fetch_actual_fill(signature: str, rpc_url: str, mint: str,
-                              max_attempts: int = 3, retry_delay_seconds: float = 0.75) -> Optional[dict]:
+                              max_attempts: int = 3, retry_delay_seconds: float = 0.75,
+                              wallet: Optional[str] = None) -> Optional[dict]:
     """Lee la transacción YA CONFIRMADA (ver _confirm_transaction_onchain,
     que se llama SIEMPRE antes que esto) y calcula, a partir de los
     balances reales pre/post en la wallet, cuánto SOL neto se movió y
@@ -210,6 +211,9 @@ async def fetch_actual_fill(signature: str, rpc_url: str, mint: str,
     en el índice 0 del mensaje, y las órdenes de la Lightning API de
     PumpPortal las firma y paga siempre la wallet asociada a la
     api_key -así que ese índice 0 es, siempre, nuestra propia wallet.
+    Con `wallet` se busca esa dirección entre las cuentas de la tx en vez de
+    suponer el índice 0: en una orden de Jupiter enrutada por un market
+    maker, el que paga la tx puede no ser nuestra wallet.
 
     Devuelve None si por lo que sea no se puede leer/parsear la tx (el
     llamador debe caer entonces al precio/importe ESTIMADO en vez de
@@ -265,19 +269,23 @@ async def fetch_actual_fill(signature: str, rpc_url: str, mint: str,
             account_keys = resp.value.transaction.transaction.message.account_keys  # type: ignore[union-attr]
             if not account_keys:
                 return None
-            wallet = str(account_keys[0])
+            keys = [str(k) for k in account_keys]
+            if wallet is not None and wallet not in keys:
+                return None
+            index = keys.index(wallet) if wallet is not None else 0
+            payer = keys[index]
 
-            sol_delta = (meta.post_balances[0] - meta.pre_balances[0]) / 1_000_000_000.0
+            sol_delta = (meta.post_balances[index] - meta.pre_balances[index]) / 1_000_000_000.0
 
             # Movimiento real de tokens de NUESTRA wallet -ver
             # _wallet_token_delta, que es donde vive la identificación de
             # cuál de las token accounts de la tx es la nuestra (y el
             # bugfix por el que las compras caían siempre al estimado).
-            token_delta = _wallet_token_delta(meta, mint, wallet)
+            token_delta = _wallet_token_delta(meta, mint, payer)
             if token_delta is None:
                 return None
 
-            return {"sol_delta": sol_delta, "token_delta": token_delta, "wallet": wallet}
+            return {"sol_delta": sol_delta, "token_delta": token_delta, "wallet": payer}
         except Exception as e:
             if attempt < max_attempts:
                 await asyncio.sleep(retry_delay_seconds)
