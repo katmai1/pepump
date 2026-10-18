@@ -53,7 +53,7 @@ class PumpSwapOnChainClient:
     #   211 coin_creator               (32)
     #   243 is_mayhem_mode             (1)
     #   244 is_cashback_coin           (1)
-    #   245 reserva VIRTUAL de quote   (u64 little-endian, lamports)
+    #   245 reserva VIRTUAL de quote   (i64 little-endian, lamports)
     _CREATOR_OFFSET = 11
     _BASE_MINT_OFFSET = 43
     _QUOTE_MINT_OFFSET = 75
@@ -85,6 +85,13 @@ class PumpSwapOnChainClient:
     # Ignorarlo hacía que el bot entrara con un precio de referencia ~21%
     # más bajo que el real (y que el stop-loss saltara solo, porque el
     # precio de entrada REAL leído del fill sí era el correcto).
+    #
+    # BUGFIX (precio ~20 millones de veces el real): el campo es un i64 CON
+    # signo, no un u64. En el pool de 5yC9BM...pump (AgenC) vale
+    # 0xffffffffeb44c910 = -347.813.616 lamports (-0,348 SOL). Leído sin
+    # signo daba 18.446.744.073 SOL "virtuales" -> 322 SOL/token en vez de
+    # ~1,586e-5, y la entrada con dip se disparaba al instante porque el
+    # precio real quedaba muy por debajo de esa referencia inventada.
     _VIRTUAL_QUOTE_OFFSET = 245
     _MIN_POOL_ACCOUNT_LEN_CON_VIRTUAL = _VIRTUAL_QUOTE_OFFSET + 8
 
@@ -139,9 +146,12 @@ class PumpSwapOnChainClient:
                 # La reserva de quote que usa el programa para su curva es
                 # la del vault MÁS la virtual (ver _VIRTUAL_QUOTE_OFFSET).
                 virtual_quote = pool["virtual_quote_lamports"] / 1e9
-                if not base_balance:
+                effective_quote = quote_balance + virtual_quote
+                if not base_balance or effective_quote <= 0:
+                    logger.warning(f"[On-chain PumpSwap] Reservas inválidas en el pool {pool_address}: "
+                                   f"{base_balance} tokens / {quote_balance} SOL + {virtual_quote} SOL virtuales.")
                     return None, False
-                price = (quote_balance + virtual_quote) / base_balance
+                price = effective_quote / base_balance
                 if price <= 0:
                     return None, False
 
@@ -196,13 +206,13 @@ class PumpSwapOnChainClient:
 
     @classmethod
     def _pool_virtual_quote_lamports(cls, data) -> int:
-        """Reserva VIRTUAL de quote del pool, en lamports (ver
+        """Reserva VIRTUAL de quote del pool, en lamports y CON signo (ver
         _VIRTUAL_QUOTE_OFFSET). 0 si la cuenta es de un layout viejo/más
         corto que no trae el campo -ahí no hay nada que sumar."""
         if data is None or len(data) < cls._MIN_POOL_ACCOUNT_LEN_CON_VIRTUAL:
             return 0
         return int.from_bytes(
-            bytes(data)[cls._VIRTUAL_QUOTE_OFFSET:cls._VIRTUAL_QUOTE_OFFSET + 8], "little")
+            bytes(data)[cls._VIRTUAL_QUOTE_OFFSET:cls._VIRTUAL_QUOTE_OFFSET + 8], "little", signed=True)
 
     @classmethod
     def _parse_pool(cls, data) -> Optional[dict]:

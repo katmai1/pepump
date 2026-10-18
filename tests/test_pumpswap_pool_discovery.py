@@ -158,3 +158,23 @@ def test_lp_supply_se_lee_como_u64_little_endian(lp_supply):
 def test_quote_mint_se_lee_del_offset_correcto():
     data = build_pool_account_data(MINT, WSOL_MINT, 1)
     assert PumpSwapOnChainClient._pool_quote_mint(data) == WSOL_MINT
+
+
+def _con_virtual(lamports_bytes: bytes) -> bytes:
+    """Pool de layout nuevo (301 bytes) con el campo virtual en el 245."""
+    data = build_pool_account_data(MINT, WSOL_MINT, 1)
+    data += bytes([0, 0])                           # is_mayhem_mode, is_cashback_coin
+    assert len(data) == PumpSwapOnChainClient._VIRTUAL_QUOTE_OFFSET
+    return data + lamports_bytes + bytes(301 - len(data) - 8)
+
+
+def test_reserva_virtual_positiva():
+    data = _con_virtual((17_584_505_366).to_bytes(8, "little"))
+    assert PumpSwapOnChainClient._pool_virtual_quote_lamports(data) == 17_584_505_366
+
+
+def test_reserva_virtual_se_lee_con_signo():
+    """BUGFIX: bytes reales del pool de 5yC9BM...pump (AgenC). Leído como
+    u64 daba 18.446.744.073 SOL virtuales y un precio de 322 SOL/token."""
+    data = _con_virtual(bytes.fromhex("10c944ebffffffff"))
+    assert PumpSwapOnChainClient._pool_virtual_quote_lamports(data) == -347_813_616
