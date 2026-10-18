@@ -120,10 +120,40 @@
    </div>
 
    <div id="view-history" class="view" hidden>
+    <section class="tiles" aria-label="PnL del historial">
+      <div class="tile">
+        <div class="tile-label">PnL total</div>
+        <div class="tile-value" id="h-pnl">—</div>
+        <div class="tile-sub" id="h-pnl-sub"></div>
+      </div>
+      <div class="tile">
+        <div class="tile-label">Operaciones cerradas</div>
+        <div class="tile-value" id="h-count">—</div>
+        <div class="tile-sub" id="h-count-sub"></div>
+      </div>
+      <div class="tile">
+        <div class="tile-label">Acierto</div>
+        <div class="tile-value" id="h-winrate">—</div>
+        <div class="tile-sub" id="h-winrate-sub"></div>
+      </div>
+      <div class="tile">
+        <div class="tile-label">PnL medio</div>
+        <div class="tile-value" id="h-avg">—</div>
+        <div class="tile-sub" id="h-avg-sub"></div>
+      </div>
+    </section>
+
     <section id="history" class="card">
       <div class="card-head">
         <h2>Historial</h2>
-        <span class="muted small">Posiciones terminadas (cerradas, canceladas o para revisar)</span>
+        <label class="small check">Mostrar
+          <select id="history-mode">
+            <option value="all">Todas</option>
+            <option value="real">Reales</option>
+            <option value="sim">Simuladas</option>
+          </select>
+        </label>
+        <button id="history-clear" class="btn btn-danger-outline" type="button" disabled>Limpiar historial</button>
       </div>
       <div id="history-empty" class="empty" hidden>Todavía no hay posiciones terminadas.</div>
       <div class="table-wrap">

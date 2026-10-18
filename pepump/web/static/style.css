@@ -95,6 +95,8 @@ main {
   gap: 16px;
 }
 
+.view { display: grid; gap: 16px; min-width: 0; }
+
 /* --- cifras clave ------------------------------------------------------- */
 .tiles {
   display: grid;
@@ -217,7 +219,7 @@ main {
 
 /* --- logs ---------------------------------------------------------------- */
 .log-tools { display: flex; align-items: center; gap: 14px; }
-.log-tools select {
+.log-tools select, #history-mode {
   font: inherit;
   color: var(--ink);
   background: var(--surface);

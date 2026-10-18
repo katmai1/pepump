@@ -913,13 +913,57 @@ function fmtDate(ts) {
   return new Date(ts * 1000).toLocaleString("es-ES", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
 }
 
+let historyData = { rows: [], summary: { real: null, sim: null } };
+
 async function loadHistory() {
-  let rows;
   try {
-    rows = await api("/api/history?limit=100");
+    historyData = await api("/api/history?limit=100");
   } catch {
     return;
   }
+  renderHistory();
+}
+
+const historyMode = () => document.getElementById("history-mode").value;
+
+// Mismo criterio que las cifras de arriba de la página principal: lo real y
+// lo simulado nunca se suman. Con "Todas", las cifras grandes son las reales
+// (si hay) y lo simulado va aparte en la línea pequeña.
+function renderHistorySummary() {
+  const { real, sim } = historyData.summary;
+  const mode = historyMode();
+  let main, other, etiqueta;
+  if (mode === "real") [main, other, etiqueta] = [real, null, "reales"];
+  else if (mode === "sim") [main, other, etiqueta] = [sim, null, "simuladas"];
+  else if (real) [main, other, etiqueta] = [real, sim, "reales"];
+  else [main, other, etiqueta] = [sim, null, "simuladas"];
+  const aparte = (txt) => (other ? ` · simulado: ${txt}` : "");
+
+  if (!main) {
+    for (const id of ["h-pnl", "h-count", "h-winrate", "h-avg"]) setTile(id, null, "—", "");
+    document.getElementById("h-pnl-sub").textContent = "Todavía no hay posiciones cerradas.";
+    return;
+  }
+  const roi = main.invested_sol ? (main.pnl_sol / main.invested_sol) * 100 : null;
+  setTile("h-pnl", main.pnl_sol, fmtSolSigned(main.pnl_sol),
+          `SOL ${etiqueta}${roi === null ? "" : ` · ${fmtPct(roi)} sobre ${fmtSol(main.invested_sol)}`}` +
+          aparte(`${fmtSolSigned(other && other.pnl_sol)} SOL`));
+  setTile("h-count", null, String(main.closed),
+          `${main.wins} ganadoras · ${main.losses} perdedoras` + aparte(String(other && other.closed)));
+  const winrate = main.closed ? (main.wins / main.closed) * 100 : null;
+  setTile("h-winrate", null, winrate === null ? "—" : `${winrate.toFixed(0)} %`,
+          `de las ${etiqueta}` + aparte(other && other.closed ? `${((other.wins / other.closed) * 100).toFixed(0)} %` : "—"));
+  setTile("h-avg", main.avg_pct, fmtPct(main.avg_pct),
+          `mejor ${fmtPct(main.best_pct)} · peor ${fmtPct(main.worst_pct)}`);
+}
+
+function renderHistory() {
+  renderHistorySummary();
+  const mode = historyMode();
+  const rows = historyData.rows.filter((r) => mode === "all" || r.live === (mode === "real"));
+  // "Revisar a mano" no se borra: solo cuenta lo que sí se puede limpiar.
+  document.getElementById("history-clear").disabled =
+    !historyData.rows.some((r) => r.status !== "review");
   document.getElementById("history-empty").hidden = rows.length > 0;
   document.querySelector("#history table").hidden = rows.length === 0;
   document.querySelector("#history tbody").replaceChildren(...rows.map((r) => {
@@ -937,6 +981,27 @@ async function loadHistory() {
       el("td", { class: "num", dataset: { label: "Fecha" } }, fmtDate(r.closed_at || r.updated_at)),
     );
   }));
+}
+
+async function clearHistory() {
+  const mode = historyMode();
+  const que = { all: "todas las posiciones terminadas", real: "las posiciones REALES terminadas",
+                sim: "las posiciones simuladas terminadas" }[mode];
+  const ok = await confirmDialog("¿Limpiar el historial?", [
+    el("p", {}, `Se borran ${que} (cerradas y sin compra) y sus gráficos. No se puede deshacer.`),
+    el("p", { class: "muted small" },
+       "Las marcadas «Revisar a mano» se mantienen. El archivo .csv de órdenes cerradas no se toca."),
+    realWarning(mode !== "sim" && historyData.rows.some((r) => r.live),
+                "también se borra el PnL de las posiciones reales."),
+  ].filter(Boolean), "Borrar");
+  if (!ok) return;
+  try {
+    const res = await api("/api/history/clear", { method: "POST", body: { mode } });
+    toast(`Historial limpio: ${res.deleted} ${res.deleted === 1 ? "posición borrada" : "posiciones borradas"}.`);
+  } catch (err) {
+    toast(`No se pudo limpiar el historial: ${err.message}`, "error");
+  }
+  loadHistory();
 }
 
 // ---------------------------------------------------------------- render
@@ -1106,6 +1171,8 @@ document.querySelector("#positions tbody").addEventListener("click", (e) => {
 });
 document.getElementById("detail-actions").addEventListener("click", onActionClick);
 document.getElementById("close-all").addEventListener("click", closeAll);
+document.getElementById("history-clear").addEventListener("click", clearHistory);
+document.getElementById("history-mode").addEventListener("change", renderHistory);
 document.getElementById("new-position").addEventListener("click", openNewPosition);
 document.getElementById("open-form").addEventListener("submit", submitNewPosition);
 // El aviso de error es del último intento: se quita en cuanto tocas algo.

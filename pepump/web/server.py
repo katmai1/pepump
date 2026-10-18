@@ -18,7 +18,8 @@ intermedia.
   POST /api/positions/{id}/close      cerrar (vender) una posición
   POST /api/positions/close-all       cerrar todas
   GET  /api/logs                      últimos logs (?mint=...&after=<seq>&limit=...)
-  GET  /api/history                   posiciones terminadas en ejecuciones anteriores
+  GET  /api/history                   posiciones terminadas + resumen de PnL
+  POST /api/history/clear             borrar el historial ({"mode": "all"|"real"|"sim"})
   WS   /ws                            estado cada segundo + logs en el momento
 
 Seguridad:
@@ -262,7 +263,8 @@ def create_app(manager: PositionManager, logs: LogBuffer, *, live: bool,
 
     @app.get("/api/history", dependencies=lectura)
     async def get_history(limit: int = 100):
-        return manager.history(limit=max(1, min(limit, 500)))
+        return {"rows": manager.history(limit=max(1, min(limit, 500))),
+                "summary": manager.history_summary()}
 
     @app.get("/api/defaults", dependencies=lectura)
     async def get_defaults():
@@ -291,6 +293,14 @@ def create_app(manager: PositionManager, logs: LogBuffer, *, live: bool,
         return {**result, "active_position": managed.id if managed is not None and managed.active else None}
 
     # --- órdenes ---------------------------------------------------------- #
+    @app.post("/api/history/clear", dependencies=orden)
+    async def clear_history(body: dict = Body(default={})):
+        modes = {"all": None, "real": True, "sim": False}
+        mode = body.get("mode", "all")
+        if mode not in modes:
+            raise HTTPException(status_code=400, detail="mode debe ser all, real o sim")
+        return {"deleted": manager.clear_history(live=modes[mode])}
+
     @app.post("/api/positions", dependencies=orden)
     async def open_position(request: Request, body: dict = Body(...)):
         mint = body.get("mint")

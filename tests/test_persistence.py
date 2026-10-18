@@ -294,3 +294,56 @@ def test_migra_una_base_de_datos_del_esquema_1(tmp_path):
     s.add_price(1, 1.0, 2.0)
     assert s.prices(1) == [(1.0, 2.0)]
     s.close()
+
+
+def _cerrada(s, mint, live, pnl_sol, pnl_pct, sol=0.1, status="closed"):
+    pos_id = s.create(mint, live=live, settings={})
+    s.update(pos_id, {"status": status, "sol_amount": sol, "realized_pnl_sol": pnl_sol,
+                      "realized_pnl_pct": pnl_pct, "closed_at": 1.0})
+    s.add_price(pos_id, 1.0, 1.0)
+    return pos_id
+
+
+def test_resumen_de_pnl_separa_reales_y_simuladas(store):
+    _cerrada(store, A, True, 0.05, 50.0)
+    _cerrada(store, A, True, -0.02, -20.0)
+    _cerrada(store, B, False, 0.01, 10.0)
+    _cerrada(store, B, False, None, None, status="cancelled")  # no cuenta
+    resumen = store.history_summary()
+    real = resumen["real"]
+    assert (real["closed"], real["wins"], real["losses"]) == (2, 1, 1)
+    assert real["pnl_sol"] == pytest.approx(0.03)
+    assert real["invested_sol"] == pytest.approx(0.2)
+    assert (real["best_pct"], real["worst_pct"], real["avg_pct"]) == (50.0, -20.0, 15.0)
+    assert resumen["sim"]["closed"] == 1 and resumen["sim"]["pnl_sol"] == pytest.approx(0.01)
+
+
+def test_limpiar_historial_por_modo_y_sin_tocar_revisar_ni_activas(store):
+    real = _cerrada(store, A, True, 0.05, 50.0)
+    sim = _cerrada(store, B, False, 0.01, 10.0)
+    cancelada = _cerrada(store, B, False, None, None, status="cancelled")
+    revisar = _cerrada(store, A, True, None, None, status="review")
+    activa = store.create(A, live=False, settings={})  # waiting_entry
+
+    assert sorted(store.clear_history(live=False)) == [sim, cancelada]
+    assert store.prices(sim) == []
+    assert store.get(real) is not None
+    assert store.clear_history(exclude_ids=(real,)) == []
+    assert store.clear_history() == [real]
+    assert store.get(revisar) is not None and store.get(activa) is not None
+    assert store.history_summary() == {"real": None, "sim": None}
+
+
+async def test_manager_limpia_historial_y_sesion(store):
+    manager, conns, _ = make_manager(store)
+    managed = manager.open(A)
+    await _precio(manager, conns, A, 1.0)
+    await _hasta(lambda: managed.bot.position is not None)
+    manager.close(managed.id, "test")
+    await asyncio.wait_for(managed.task, 5)
+    assert [h["id"] for h in manager.history()] == [managed.id]
+
+    assert manager.clear_history() == 1
+    assert manager.history() == []
+    assert manager.get(managed.id) is None  # ya no cuenta en el PnL de la sesión
+    await manager.aclose()

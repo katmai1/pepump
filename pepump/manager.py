@@ -421,6 +421,35 @@ class PositionManager:
         activas = tuple(m.id for m in self._positions.values() if m.active)
         return self.store.history(limit=limit, exclude_ids=activas)
 
+    def history_summary(self) -> dict:
+        """PnL de las posiciones cerradas, reales y simuladas por separado
+        (ver PositionStore.history_summary)."""
+        if self.store is None:
+            return {"real": None, "sim": None}
+        return self.store.history_summary()
+
+    def clear_history(self, live: Optional[bool] = None) -> int:
+        """Borra del historial las posiciones terminadas (todas, solo las
+        reales o solo las simuladas) y devuelve cuántas. También las quita
+        de esta sesión -para que no cuenten en el PnL realizado del panel- y
+        corta el registro de precios tras la venta de las borradas, que si
+        no seguiría escribiendo puntos de una posición que ya no existe.
+        El .csv de órdenes cerradas no se toca."""
+        if self.store is None:
+            return 0
+        activas = tuple(m.id for m in self._positions.values() if m.active)
+        borradas = set(self.store.clear_history(live=live, exclude_ids=activas))
+        nombres = {f"pepump-follow-{pos_id}" for pos_id in borradas}
+        for task in self._followers:
+            if task.get_name() in nombres:
+                task.cancel()
+        for pos_id in borradas:
+            self._positions.pop(pos_id, None)
+        if borradas:
+            logger.info(f"Historial: {len(borradas)} posiciones terminadas borradas.")
+            self._notify()
+        return len(borradas)
+
     # --- consulta ----------------------------------------------------------- #
     def get(self, ref: PositionRef) -> Optional[ManagedPosition]:
         if isinstance(ref, int):

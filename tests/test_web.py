@@ -60,6 +60,13 @@ class FakeManager:
     def history(self, limit=100):
         return [{"id": 99, "mint": A, "status": "closed", "realized_pnl_pct": 12.5}][:limit]
 
+    def history_summary(self):
+        return {"real": None, "sim": {"closed": 1, "wins": 1, "losses": 0, "pnl_sol": 0.01}}
+
+    def clear_history(self, live=None):
+        self.cleared = live
+        return 3
+
     def defaults(self):
         return {"live": False, "settings": {"live": False, "buy_sol": 0.05, "priority_fee": 1e-5},
                 "max_buy_sol": 0.5,
@@ -126,8 +133,25 @@ def test_state_y_posiciones():
 
 def test_historial():
     client, _ = make_client()
-    assert client.get("/api/history").json()[0]["id"] == 99
+    body = client.get("/api/history").json()
+    assert body["rows"][0]["id"] == 99
+    assert body["summary"]["sim"]["pnl_sol"] == 0.01
     assert client.post("/api/history", headers=PAGE).status_code == 405
+
+
+@pytest.mark.parametrize("mode,live", [("all", None), ("real", True), ("sim", False)])
+def test_limpiar_historial(mode, live):
+    client, _ = make_client()
+    r = client.post("/api/history/clear", json={"mode": mode}, headers=PAGE)
+    assert r.status_code == 200 and r.json() == {"deleted": 3}
+    assert client.manager.cleared is live
+
+
+def test_limpiar_historial_exige_la_cabecera_y_un_modo_valido():
+    client, _ = make_client()
+    assert client.post("/api/history/clear", json={}).status_code == 403
+    assert client.post("/api/history/clear", json={"mode": "x"}, headers=PAGE).status_code == 400
+    assert not hasattr(client.manager, "cleared")
 
 
 def test_la_pagina_y_los_estaticos():

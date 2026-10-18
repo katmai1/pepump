@@ -147,6 +147,41 @@ class PositionStore:
         out = [_row(r) for r in rows if r["id"] not in set(exclude_ids)]
         return out[:limit]
 
+    def history_summary(self) -> dict:
+        """PnL de TODAS las posiciones cerradas (no solo las que lista
+        `history`), por separado reales y simuladas: nunca se suman."""
+        rows = self._db.execute(
+            "SELECT live, COUNT(*) AS closed, SUM(realized_pnl_sol > 0) AS wins, "
+            "SUM(realized_pnl_sol < 0) AS losses, SUM(realized_pnl_sol) AS pnl_sol, "
+            "SUM(sol_amount) AS invested_sol, AVG(realized_pnl_pct) AS avg_pct, "
+            "MAX(realized_pnl_pct) AS best_pct, MIN(realized_pnl_pct) AS worst_pct "
+            "FROM positions WHERE status = 'closed' AND realized_pnl_sol IS NOT NULL "
+            "GROUP BY live").fetchall()
+        out: dict = {"real": None, "sim": None}
+        for r in rows:
+            out["real" if r["live"] else "sim"] = {k: r[k] for k in r.keys() if k != "live"}
+        return out
+
+    def clear_history(self, live: Optional[bool] = None, exclude_ids=()) -> List[int]:
+        """Borra las posiciones cerradas o canceladas (y sus precios) y
+        devuelve sus ids. `live`: solo las reales (True), solo las simuladas
+        (False) o todas (None). Las de status 'review' NO se borran: piden
+        revisar algo a mano (p. ej. tokens que pueden seguir en la wallet)."""
+        sql = "SELECT id FROM positions WHERE status IN ('closed', 'cancelled')"
+        params: list = []
+        if live is not None:
+            sql += " AND live = ?"
+            params.append(int(live))
+        excluir = set(exclude_ids)
+        ids = [r[0] for r in self._db.execute(sql, params) if r[0] not in excluir]
+        if ids:
+            marks = ", ".join("?" for _ in ids)
+            with self._db:
+                self._db.execute("BEGIN")
+                self._db.execute(f"DELETE FROM price_points WHERE position_id IN ({marks})", ids)
+                self._db.execute(f"DELETE FROM positions WHERE id IN ({marks})", ids)
+        return ids
+
     # --- precios (gráfico) -------------------------------------------------- #
     def add_price(self, pos_id: int, ts: float, price: float) -> None:
         self._db.execute("INSERT INTO price_points (position_id, ts, price) VALUES (?, ?, ?)",
