@@ -77,20 +77,22 @@ class TokenAccountCloser:
                                                     acc.account.lamports))
         return vacias
 
-    async def close_empty(self, mint: Optional[str] = None) -> tuple[float, int]:
+    async def close_empty(self, mint: Optional[str] = None) -> tuple[float, int, int]:
         """Cierra las cuentas vacías (de `mint`, o todas). Devuelve (SOL
-        recuperados netos del fee de las tx, cuentas cerradas). Una cuenta que
-        no se deja cerrar no impide cerrar las demás."""
+        recuperados netos del fee de las tx, cuentas cerradas, cuentas que no
+        se pudieron cerrar). Una cuenta que no se deja cerrar no impide cerrar
+        las demás; el motivo va al log en DEBUG y quien llama decide si avisa."""
         cuentas = await self.find_empty(mint)
-        recuperado, cerradas = 0, 0
+        recuperado, cerradas, fallidas = 0, 0, 0
         for i in range(0, len(cuentas), self.MAX_CLOSES_PER_TX):
             lote = cuentas[i:i + self.MAX_CLOSES_PER_TX]
             try:
                 await self._close(lote)
             except Exception as e:
                 if len(lote) == 1:
-                    logger.warning(f"[Cuentas de token] No se pudo cerrar {lote[0].address} "
-                                   f"({lote[0].mint}): {e}")
+                    logger.debug(f"[Cuentas de token] No se pudo cerrar {lote[0].address} "
+                                 f"({lote[0].mint}): {e}")
+                    fallidas += 1
                     continue
                 # Una cuenta que no se deja cerrar hace fallar el lote entero
                 # (en la simulación, sin pagar nada): de una en una.
@@ -99,15 +101,16 @@ class TokenAccountCloser:
                     try:
                         await self._close([cuenta])
                     except Exception as e2:
-                        logger.warning(f"[Cuentas de token] No se pudo cerrar {cuenta.address} "
-                                       f"({cuenta.mint}): {e2}")
+                        logger.debug(f"[Cuentas de token] No se pudo cerrar {cuenta.address} "
+                                     f"({cuenta.mint}): {e2}")
+                        fallidas += 1
                         continue
                     recuperado += cuenta.lamports - _TX_FEE_LAMPORTS
                     cerradas += 1
                 continue
             recuperado += sum(c.lamports for c in lote) - _TX_FEE_LAMPORTS
             cerradas += len(lote)
-        return recuperado / _LAMPORTS_PER_SOL, cerradas
+        return recuperado / _LAMPORTS_PER_SOL, cerradas, fallidas
 
     async def _close(self, cuentas: list[EmptyTokenAccount]) -> str:
         owner = self.keypair.pubkey()
@@ -117,8 +120,12 @@ class TokenAccountCloser:
             blockhash = (await client.get_latest_blockhash()).value.blockhash
             tx = Transaction([self.keypair], Message.new_with_blockhash(instrucciones, owner, blockhash), blockhash)
             # Con simulación previa: si algo no se puede cerrar, falla aquí
-            # sin pagar el fee.
-            resp = await client.send_raw_transaction(bytes(tx), opts=TxOpts(skip_preflight=False))
+            # sin pagar el fee. Contra "confirmed", no el "finalized" por
+            # defecto de solana-py: va ~13 s por detrás y, justo después de
+            # una venta, la cuenta todavía tenía los tokens ahí (caso real:
+            # NonNativeHasBalance, 0xb, al cerrar tras vender).
+            resp = await client.send_raw_transaction(
+                bytes(tx), opts=TxOpts(skip_preflight=False, preflight_commitment=Confirmed))
         signature = str(resp.value)
         await PumpPortalClient._confirm_transaction_onchain(
             signature, self.rpc_url, self.confirm_timeout_seconds, self.confirm_poll_interval_seconds)
@@ -153,7 +160,7 @@ async def sweep_empty_token_accounts(closer: TokenAccountCloser) -> None:
     """Al arrancar: cierra las cuentas vacías que dejaron operaciones
     anteriores. Nunca lanza."""
     try:
-        recuperado, cerradas = await closer.close_empty()
+        recuperado, cerradas, fallidas = await closer.close_empty()
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -162,3 +169,6 @@ async def sweep_empty_token_accounts(closer: TokenAccountCloser) -> None:
     if cerradas:
         logger.info(f"🧹 Cerradas {cerradas} cuentas de token vacías de operaciones anteriores: "
                     f"recuperados {recuperado:.6f} SOL de rent.")
+    if fallidas:
+        logger.warning(f"[Cuentas de token] {fallidas} cuentas vacías no se pudieron cerrar (ejecuta "
+                       f"con -v para ver el motivo).")

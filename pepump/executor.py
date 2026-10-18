@@ -236,21 +236,34 @@ class TradeExecutor:
         spent = self.cfg.buy_sol + self.cfg.priority_fee + NETWORK_FEE_SOL + TOKEN_ACCOUNT_RENT_SOL
         return spent, tokens, entry_price_without_rent(spent, tokens, TOKEN_ACCOUNT_RENT_SOL)
 
+    # Intentos de cerrar la cuenta del token justo después de vender, y pausa
+    # entre ellos: el nodo RPC puede tardar un poco en ver la venta.
+    CLOSE_ACCOUNT_ATTEMPTS = 3
+    CLOSE_ACCOUNT_RETRY_SECONDS = 2.0
+
     async def _recover_token_account_rent(self, mint: str) -> float:
         """Tras una venta real: cierra la cuenta del token si quedó vacía y
         devuelve los SOL recuperados (netos del fee). 0 si no hay closer o si
-        falla (lo recoge el barrido del próximo arranque)."""
+        no se pudo (lo recoge el barrido del próximo arranque)."""
         if self.closer is None:
             return 0.0
-        try:
-            recuperado, cerradas = await self.closer.close_empty(mint)
-        except Exception as e:
-            logger.warning(f"[REAL] No se pudo cerrar la cuenta vacía de {mint} ({e}); su rent se "
-                           f"recupera al volver a arrancar el bot.")
-            return 0.0
-        if cerradas:
-            logger.info(f"[REAL] Cuenta del token cerrada: recuperados {recuperado:.9f} SOL de rent.")
-        return recuperado
+        motivo = "la cuenta todavía no aparece vacía"
+        for intento in range(1, self.CLOSE_ACCOUNT_ATTEMPTS + 1):
+            try:
+                recuperado, cerradas, fallidas = await self.closer.close_empty(mint)
+            except Exception as e:
+                cerradas, fallidas, motivo = 0, 1, str(e)
+            else:
+                if cerradas:
+                    logger.info(f"[REAL] Cuenta del token cerrada: recuperados {recuperado:.9f} SOL de rent.")
+                    return recuperado
+                if fallidas:
+                    motivo = "el cierre falló (ejecuta con -v para ver el motivo)"
+            if intento < self.CLOSE_ACCOUNT_ATTEMPTS:
+                await asyncio.sleep(self.CLOSE_ACCOUNT_RETRY_SECONDS)
+        logger.warning(f"[REAL] No se pudo cerrar la cuenta vacía de {mint} ({motivo}); su rent se "
+                       f"recupera al volver a arrancar el bot.")
+        return 0.0
 
     async def _simulated_jupiter_sell(self, mint: str, tokens: float, price: float,
                                       priority_fee: Optional[float]) -> tuple[float, float]:

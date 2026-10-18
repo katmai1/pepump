@@ -98,9 +98,9 @@ def test_solo_cierra_cuentas_vacias_y_cerrables(rpc):
                 _acc(program=TOKEN_2022_PROGRAM_ID,
                      extensions=[{"extension": "transferFeeAmount", "state": {"withheldAmount": 7}}])])
 
-    recuperado, cerradas = asyncio.run(_closer().close_empty())
+    recuperado, cerradas, fallidas = asyncio.run(_closer().close_empty())
 
-    assert cerradas == 2
+    assert cerradas == 2 and fallidas == 0
     assert fake.sent == [{vacia.pubkey, vacia_2022.pubkey}]  # un único lote
     assert recuperado == pytest.approx((1_513_840 + 2_074_080 - 5_000) / 1e9)
 
@@ -108,7 +108,7 @@ def test_solo_cierra_cuentas_vacias_y_cerrables(rpc):
 def test_con_mint_solo_mira_ese_mint(rpc):
     fake = rpc([_acc(), _acc(mint="Otro111111111111111111111111111111111111111")])
 
-    _, cerradas = asyncio.run(_closer().close_empty(MINT))
+    _, cerradas, _ = asyncio.run(_closer().close_empty(MINT))
 
     assert cerradas == 1
     assert [str(f.mint) for f in fake.filters] == [MINT]
@@ -118,9 +118,9 @@ def test_si_una_no_se_deja_cerrar_cierra_las_demas_de_una_en_una(rpc):
     buena, mala = _acc(), _acc()
     fake = rpc([buena, mala], reject=[mala.pubkey])
 
-    recuperado, cerradas = asyncio.run(_closer().close_empty())
+    recuperado, cerradas, fallidas = asyncio.run(_closer().close_empty())
 
-    assert cerradas == 1
+    assert cerradas == 1 and fallidas == 1
     assert fake.sent == [{buena.pubkey}]
     assert recuperado == pytest.approx((1_513_840 - 5_000) / 1e9)
 
@@ -128,7 +128,7 @@ def test_si_una_no_se_deja_cerrar_cierra_las_demas_de_una_en_una(rpc):
 def test_lotes_de_como_mucho_veinte(rpc):
     fake = rpc([_acc() for _ in range(25)])
 
-    _, cerradas = asyncio.run(_closer().close_empty())
+    _, cerradas, _ = asyncio.run(_closer().close_empty())
 
     assert cerradas == 25
     assert [len(lote) for lote in fake.sent] == [20, 5]
@@ -158,8 +158,11 @@ class FakeLightning:
 
 
 class FakeCloser:
-    def __init__(self, recovered=0.00150884, fail=False):
-        self.recovered = recovered
+    """`results`: lo que devuelve cada llamada, (recuperado, cerradas,
+    fallidas); se queda en el último. `fail`: todas lanzan."""
+
+    def __init__(self, recovered=0.00150884, fail=False, results=None):
+        self.results = results or [(recovered, 1, 0)]
         self.fail = fail
         self.calls = []
 
@@ -167,12 +170,13 @@ class FakeCloser:
         self.calls.append(mint)
         if self.fail:
             raise RuntimeError("RPC caído (fake)")
-        return self.recovered, 1
+        return self.results[min(len(self.calls), len(self.results)) - 1]
 
 
 def _sell(result, closer, tmp_path):
     cfg = make_config(live=True, trade_history_csv=str(tmp_path / "h.csv"))
     executor = TradeExecutor(client=FakeLightning(result), live=True, config=cfg, closer=closer)
+    executor.CLOSE_ACCOUNT_RETRY_SECONDS = 0.0
     pos = Position(mint=MINT, entry_price=1.4362841631e-06, sol_amount=0.023718053, token_amount=15459.484669)
     asyncio.run(executor.sell(pos, 1.53e-06, "trailing"))
     return pos
@@ -214,3 +218,41 @@ def test_en_simulado_no_se_toca_la_wallet(tmp_path):
     asyncio.run(executor.sell(pos, 1e-6, "trailing"))
 
     assert closer.calls == []
+
+
+def test_si_el_nodo_aun_no_ve_la_venta_reintenta_el_cierre(tmp_path, caplog):
+    """Caso real: justo tras vender, el cierre falló con NonNativeHasBalance
+    (0xb) porque el nodo aún veía los tokens. Se reintenta."""
+    closer = FakeCloser(results=[(0.0, 0, 1), (0.0, 0, 0), (0.00150884, 1, 0)])
+    pos = _sell({"signature": "S", "actual_sol_delta": 0.020364574, "actual_token_delta": -1108.253805},
+                closer, tmp_path)
+
+    assert len(closer.calls) == 3
+    assert pos.proceeds_sol == pytest.approx(0.020364574 + 0.00150884)
+    assert "No se pudo cerrar" not in caplog.text
+
+
+def test_si_no_se_puede_cerrar_avisa_una_sola_vez(tmp_path, caplog):
+    closer = FakeCloser(results=[(0.0, 0, 1)])
+    _sell({"signature": "S", "actual_sol_delta": 0.02, "actual_token_delta": -1000.0}, closer, tmp_path)
+
+    assert len(closer.calls) == 3
+    assert caplog.text.count("No se pudo cerrar la cuenta vacía") == 1
+
+
+def test_la_simulacion_va_contra_confirmed(rpc):
+    """solana-py simula contra "finalized" por defecto: justo tras vender,
+    ahí la cuenta todavía tiene los tokens."""
+    from solana.rpc.commitment import Confirmed
+    fake = rpc([_acc()])
+    opts_vistos = []
+    original = fake.send_raw_transaction
+
+    async def espia(raw, opts=None):
+        opts_vistos.append(opts)
+        return await original(raw, opts)
+    fake.send_raw_transaction = espia
+
+    asyncio.run(_closer().close_empty())
+
+    assert opts_vistos[0].preflight_commitment == Confirmed and not opts_vistos[0].skip_preflight
