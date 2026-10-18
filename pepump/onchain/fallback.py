@@ -99,35 +99,48 @@ class OnchainFallback:
         onchain = PumpSwapOnChainClient(self.rpc_url)
         return await onchain.fetch_price_for_migrated_mint(self.mint)
 
-    async def confirm_not_listed(self) -> bool:
-        """Comprobación temprana y SIN efectos secundarios (no toca
-        self.source, a diferencia de resolve_reference):
-        confirma lo antes posible si este mint NUNCA se lanzó en
-        pump.fun, consultando en paralelo con la espera del feed en vivo
-        desde el arranque de bot._get_reference_price -en vez de solo
-        después de `live_feed_timeout_seconds`, que existe para tolerar
-        tokens de poco volumen y no tiene nada que ver con esta pregunta.
+    async def early_resolve(self) -> tuple[Optional[float], bool]:
+        """Consulta temprana, en paralelo con la espera del feed en vivo
+        desde el arranque de bot._get_reference_price: ¿dónde cotiza este
+        mint? Devuelve (price, not_listed):
 
-        Devuelve True solo si TODAS las consultas on-chain (PumpSwap,
-        bonding curve, Raydium CPMM y Meteora DLMM) respondieron bien y confirmaron
-        ausencia -nunca ante un fallo de RPC (ver PumpSwapOnChainClient.
-        fetch_price_or_confirm_absent y PumpCurveOnChainClient.
-        fetch_price_or_status), para no abortar una entrada válida por
-        un problema transitorio de conexión."""
-        onchain = PumpSwapOnChainClient(self.rpc_url)
-        _, pool_confirmed_absent = await onchain.fetch_price_or_confirm_absent(self.mint)
+          - price no-None: el mint ya no está en la curva de pump.fun (migró
+            a PumpSwap) o no es de pump.fun y cotiza contra SOL en Raydium
+            CPMM o Meteora. Deja `self.source` puesto y el bot usa este
+            precio YA: el feed de PumpPortal no cubre esos pools, y esperar
+            `live_feed_timeout_seconds` a que no llegue nada era perder
+            tiempo.
+          - not_listed True: TODAS las consultas respondieron bien y
+            confirmaron que no está en ningún sitio (nunca ante un fallo de
+            RPC, para no abortar una entrada válida por un problema
+            transitorio de conexión).
+          - (None, False): sigue en la curva de pump.fun (el feed es la
+            fuente), la curva completó y el pool aún no aparece, o no se
+            pudo saber: se sigue esperando el feed como siempre."""
+        swap = PumpSwapOnChainClient(self.rpc_url)
+        price, pool_confirmed_absent = await swap.fetch_price_or_confirm_absent(self.mint)
+        if price is not None:
+            logger.info(f"Precio de referencia (on-chain PumpSwap, el token ya migró): {price:.10f} SOL/token")
+            self.source = "pumpswap"
+            return price, False
         if not pool_confirmed_absent:
-            return False
+            return None, False
         curve = PumpCurveOnChainClient(self.rpc_url)
-        _, _, exists = await curve.fetch_price_or_status(self.mint)
-        if exists is not False:
-            return False
-        cpmm = RaydiumCpmmOnChainClient(self.rpc_url)
-        _, cpmm_confirmed_absent = await cpmm.fetch_price_or_confirm_absent(self.mint)
-        if not cpmm_confirmed_absent:
-            return False
-        _, meteora_confirmed_absent = await self._best_meteora()
-        return meteora_confirmed_absent
+        _, complete, exists = await curve.fetch_price_or_status(self.mint)
+        if exists is None or (exists and not complete):
+            return None, False
+        cpmm_confirmed_absent = True
+        if exists is False:
+            cpmm = RaydiumCpmmOnChainClient(self.rpc_url)
+            cpmm_price, cpmm_confirmed_absent = await cpmm.fetch_price_or_confirm_absent(self.mint)
+            if cpmm_price is not None:
+                logger.info(f"Precio de referencia (on-chain Raydium CPMM): {cpmm_price:.10f} SOL/token")
+                self.source = "raydium-cpmm"
+                return cpmm_price, False
+        meteora_price, meteora_confirmed_absent = await self._try_meteora()
+        if meteora_price is not None:
+            return meteora_price, False
+        return None, exists is False and cpmm_confirmed_absent and meteora_confirmed_absent
 
     async def _best_meteora(self) -> tuple[Optional[tuple[str, float]], bool]:
         """Mejor pool de Meteora contra SOL entre DLMM y DAMM v2: el de más

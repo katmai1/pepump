@@ -194,8 +194,11 @@ on-chain que se activan solos cuando ese feed deja de entregar trades:
 - **Bonding curve** (`PumpCurveOnChainClient`): lee las reservas virtuales
   de la cuenta PDA de pump.fun para mints que todavía no migraron.
 - **PumpSwap** (`PumpSwapOnChainClient`): lee las reservas del pool para
-  mints ya migrados. `subscribeTokenTrade` no cubre esos mints y deja de
-  mandar trades en silencio, así que el bot lo detecta por timeout
+  mints ya migrados. `subscribeTokenTrade` no cubre esos mints. Al abrir la
+  posición, el bot mira on-chain en paralelo con el feed y, si el mint ya
+  migró (o cotiza en Raydium CPMM / Meteora), usa ese precio enseguida sin
+  esperar al feed. Si migra a mitad de posición, el feed deja de mandar
+  trades en silencio: el bot lo detecta por timeout
   (`stall_timeout_seconds`) y lo confirma on-chain antes de cambiar de
   fuente.
 - **Raydium CPMM / Meteora** (`RaydiumCpmmOnChainClient`,

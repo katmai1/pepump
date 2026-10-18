@@ -181,10 +181,11 @@ close_empty_token_accounts = true
 [onchain]
 # Cuántos segundos se espera el precio por el feed en vivo ANTES de recurrir
 # al fallback on-chain, PARA LA ENTRADA (todavía sin posición abierta). Solo
-# cuenta desde que llegó el ack de suscripción: si ya llegó el ack pero no
-# aparece ningún trade real, lo más probable es que el mint ya haya migrado
-# a PumpSwap, caso que subscribeTokenTrade no cubre. Mientras el mint sigue
-# en bonding curve el feed funciona bien y esto casi nunca se cumple.
+# cuenta desde que llegó el ack de suscripción. Los mints ya migrados a
+# PumpSwap (o en Raydium CPMM / Meteora) no esperan esto: se miran on-chain
+# en paralelo desde el arranque y se usa ese precio en cuanto llega. Esto
+# queda para la curva de pump.fun sin trades (poco volumen) o si la consulta
+# on-chain no pudo responder.
 live_feed_timeout_seconds = 5.0
 
 # Si pasan estos segundos sin ningún trade nuevo por subscribeTokenTrade

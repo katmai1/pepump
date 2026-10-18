@@ -177,10 +177,48 @@ def test_pool_encontrado_con_precio_usa_fallback_onchain(monkeypatch):
 
     assert price == 0.0042
     assert bot.onchain.source == "pumpswap"
-    # 2 llamadas: la comprobación temprana de existencia en paralelo (ver
-    # _confirm_mint_not_pumpfun) más el fallback oficial que sí terminó
-    # usando el precio.
-    assert fake_onchain.calls == 2
+    # 1 llamada: la consulta temprana en paralelo (early_resolve) ya da el
+    # precio; no hace falta esperar al timeout del feed ni repetirla.
+    assert fake_onchain.calls == 1
+
+
+def test_mint_migrado_no_espera_al_feed(monkeypatch):
+    """El feed de PumpPortal no cubre los pools de PumpSwap: antes se
+    esperaban `live_feed_timeout_seconds` (5 s por defecto) a que no
+    llegara nada. Ahora el precio on-chain se usa en cuanto llega, incluso
+    antes del ack de la suscripción."""
+    async def _sin_ack():
+        await asyncio.Future()
+        yield {}  # pragma: no cover
+
+    bot = TrailingTakeProfitBot(client=FakeTradeStreamClient(), executor=SpyExecutor(),
+                                config=make_config(live_feed_timeout_seconds=5.0))
+    bot._stream.events = _sin_ack()
+    fake_onchain = FakeOnChainClient(bot.cfg.solana_rpc_url, [(0.0042, False)])
+    monkeypatch.setattr(fallback_module, "PumpSwapOnChainClient", lambda rpc_url: fake_onchain)
+
+    start = time.monotonic()
+    price = asyncio.run(asyncio.wait_for(bot._get_reference_price(), timeout=5))
+
+    assert price == 0.0042 and bot.onchain.source == "pumpswap"
+    assert time.monotonic() - start < 1.0
+
+
+def test_mint_en_la_curva_sigue_esperando_al_feed(monkeypatch):
+    """En la curva de pump.fun el feed es la fuente: la consulta temprana no
+    debe adelantarse con el precio de la curva."""
+    bot = TrailingTakeProfitBot(client=FakeTradeStreamClient(), executor=SpyExecutor(),
+                                config=make_config(live_feed_timeout_seconds=5.0))
+    bot._stream.events = _ack_then_hang_then_trade(delay=0.3, price=1.23)
+    monkeypatch.setattr(fallback_module, "PumpSwapOnChainClient",
+                        lambda rpc_url: FakeOnChainClient(rpc_url, [(None, True)]))
+    monkeypatch.setattr(fallback_module, "PumpCurveOnChainClient",
+                        lambda rpc_url: FakeCurveOnChainClient(rpc_url, [(0.0001, False, True)]))
+
+    price = asyncio.run(asyncio.wait_for(bot._get_reference_price(), timeout=5))
+
+    assert price == 1.23
+    assert bot.onchain.source is None
 
 
 def test_sin_pool_pero_bonding_curve_activa_usa_precio_de_bonding_curve(monkeypatch):
@@ -206,7 +244,7 @@ def test_sin_pool_pero_bonding_curve_activa_usa_precio_de_bonding_curve(monkeypa
     assert price == pytest.approx(0.0000000279)
     assert bot.onchain.source == "bondingcurve"
     # 2 llamadas: la comprobación temprana de existencia en paralelo (ver
-    # _confirm_mint_not_pumpfun) más el fallback oficial que sí terminó
+    # early_resolve) más el fallback oficial que sí terminó
     # usando el precio de la bonding curve.
     assert fake_curve.calls == 2
 
@@ -349,7 +387,7 @@ def test_mint_sin_bonding_curve_ni_pool_aborta_sin_esperar_live_feed_timeout(mon
     (más el tiempo de la consulta on-chain) antes de siquiera intentar
     confirmarlo -tarde para algo que no depende de ningún timeout de
     volumen. Con la comprobación temprana en paralelo
-    (_confirm_mint_not_pumpfun), la detección no debe depender de
+    (early_resolve), la detección no debe depender de
     `live_feed_timeout_seconds`: aquí lo dejamos deliberadamente grande y
     el bot debe abortar de todos modos casi de inmediato."""
     client = FakeTradeStreamClient()

@@ -40,7 +40,7 @@ _PRICE_SAMPLE_JUMP = 0.03
 _PRICE_HISTORY_MAX = 20_000
 
 # Mientras la comprobación temprana de existencia on-chain (ver
-# OnchainFallback.confirm_not_listed / _get_reference_price) todavía no terminó,
+# OnchainFallback.early_resolve / _get_reference_price) todavía no terminó,
 # cada espera de un trade del feed en vivo se corta en rebanadas de
 # esta duración en vez de esperar de golpe todo `live_feed_timeout_seconds`
 # -así, apenas esa comprobación confirma que el mint no es de pump.fun, el
@@ -622,20 +622,20 @@ class TrailingTakeProfitBot:
              (OnchainFallback.resolve_reference).
 
         En PARALELO con lo anterior, desde el arranque, corre
-        OnchainFallback.confirm_not_listed() en segundo plano (ver ese método):
-        confirma cuanto antes -sin esperar ningún timeout pensado para
-        tolerar tokens de poco volumen- si el mint directamente NO es de
-        pump.fun/PumpSwap (ni bonding curve ni pool, ambas consultas
-        confirmando ausencia). Es una pregunta que no depende de cuánto
-        volumen tenga el token, así que no tiene sentido esperar a
-        `live_feed_timeout_seconds` para hacerla.
+        OnchainFallback.early_resolve() en segundo plano (ver ese método):
+        si el mint ya migró a PumpSwap o cotiza en Raydium CPMM / Meteora,
+        se usa ese precio en cuanto llega, sin esperar al feed (que no
+        cubre esos pools); y si no está en ningún sitio, se aborta (o se
+        prueba Jupiter) sin esperar `live_feed_timeout_seconds`, que existe
+        para tolerar tokens de poco volumen en la curva.
 
         En cualquier momento de esta espera, Ctrl+C/SIGTERM corta todo de
         inmediato y devuelve None (todavía no hay posición abierta, así que no
         hay nada que vender).
         """
-        logger.info("Esperando el primer trade en vivo del feed de PumpPortal (subscribe_trade) "
-                    "para fijar el precio de entrada. Esto puede tardar si el token tiene poco volumen.")
+        logger.info("Buscando el precio de entrada: feed en vivo de PumpPortal (solo para el precio) y, "
+                    "en paralelo, pools on-chain. En la curva de pump.fun puede tardar si el token tiene "
+                    "poco volumen.")
         start = time.monotonic()
         last_reminder = start
         recibio_ack = False
@@ -643,13 +643,15 @@ class TrailingTakeProfitBot:
         sin_precio = 0
 
         existence_check_task: Optional[asyncio.Task] = asyncio.ensure_future(
-            self.onchain.confirm_not_listed()
+            self.onchain.early_resolve()
         )
         try:
             while True:
                 if existence_check_task is not None and existence_check_task.done():
-                    mint_not_pumpfun = existence_check_task.result()
+                    early_price, mint_not_pumpfun = existence_check_task.result()
                     existence_check_task = None
+                    if early_price is not None:
+                        return early_price
                     if mint_not_pumpfun:
                         price = await self._jupiter_reference()
                         if price is not None:
@@ -704,6 +706,10 @@ class TrailingTakeProfitBot:
                         # del loop) y abortar apenas confirme que el
                         # mint no es de pump.fun.
                         timeout = min(timeout, _EXISTENCE_CHECK_POLL_SECONDS)
+                elif existence_check_task is not None:
+                    # Igual antes del ack: si el precio on-chain llega
+                    # primero, se usa sin esperar al feed.
+                    timeout = _EXISTENCE_CHECK_POLL_SECONDS
 
                 try:
                     event = await self._stream.next_event(timeout=timeout)
