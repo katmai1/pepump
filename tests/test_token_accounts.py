@@ -43,6 +43,7 @@ class FakeRpc:
         self.accounts = accounts
         self.reject = set(reject)
         self.sent: list = []
+        self.instrucciones: list = []
         self.filters: list = []
 
     async def __aenter__(self):
@@ -68,6 +69,7 @@ class FakeRpc:
         if cerradas & self.reject:
             raise RuntimeError("simulación fallida (fake)")
         self.sent.append(cerradas)
+        self.instrucciones.append(len(tx.message.instructions))
         return SimpleNamespace(value=Signature.default())
 
 
@@ -298,3 +300,61 @@ def test_close_after_sale_pendiente_si_el_token_aun_tiene_saldo(rpc):
     rpc([_acc(amount="1000")])
     _, cerradas, _, pendiente = asyncio.run(_closer().close_after_sale(MINT))
     assert cerradas == 0 and pendiente
+
+
+
+# --------------------------------------------------------------------------- #
+# Restos en cuentas de tokens intermedios
+# --------------------------------------------------------------------------- #
+
+def _closer_con_valor(valor=None, error=None):
+    async def valorar(mint, amount):
+        if error is not None:
+            raise error
+        return valor
+    return TokenAccountCloser(Keypair(), "http://rpc", dust_valuer=valorar)
+
+
+def test_resto_sin_valor_en_una_intermedia_se_quema_y_se_cierra(rpc):
+    """Caso real: la ruta SOL -> USDC -> TTWO -> Macca dejó 0.000167 USDC en
+    la cuenta de USDC, que así no se podía cerrar (0.0015 SOL de rent)."""
+    usdc = str(Pubkey.new_unique())
+    resto = _acc(mint=usdc, amount="167", lamports=1_488_440)
+    token = _acc()
+    fake = rpc([token, resto])
+
+    recuperado, cerradas, fallidas, _ = asyncio.run(_closer_con_valor(None).close_after_sale(MINT, [usdc]))
+
+    assert cerradas == 2 and fallidas == 0
+    assert fake.sent == [{token.pubkey, resto.pubkey}]
+    assert fake.instrucciones == [3]  # cerrar token + quemar resto + cerrar resto
+    assert recuperado == pytest.approx((1_513_840 + 1_488_440 - 5_000) / 1e9)
+
+
+@pytest.mark.parametrize("closer_factory", [
+    lambda: _closer_con_valor(0.001),                           # vale más del 10% del rent
+    lambda: _closer_con_valor(error=RuntimeError("429 (fake)")),  # no se sabe cuánto vale
+    lambda: TokenAccountCloser(Keypair(), "http://rpc"),         # sin valorador
+])
+def test_saldo_que_vale_algo_o_que_no_se_puede_valorar_no_se_toca(rpc, closer_factory):
+    usdc = str(Pubkey.new_unique())
+    fake = rpc([_acc(), _acc(mint=usdc, amount="5000000", lamports=1_488_440)])
+
+    _, cerradas, _, _ = asyncio.run(closer_factory().close_after_sale(MINT, [usdc]))
+
+    assert cerradas == 1  # solo la del token vendido
+    assert fake.instrucciones == [1]
+
+
+def test_no_se_quema_nada_del_token_vendido_ni_en_el_barrido(rpc):
+    """El resto se quema solo en intermedias de la ruta de la operación:
+    ni en el token vendido (si tiene saldo, la venta aún no se ve) ni en el
+    barrido del arranque, que no sabe qué es de quién."""
+    fake = rpc([_acc(amount="1000"), _acc(mint=str(Pubkey.new_unique()), amount="1")])
+    closer = _closer_con_valor(None)
+
+    _, cerradas, _, pendiente = asyncio.run(closer.close_after_sale(MINT))
+    assert cerradas == 0 and pendiente
+    _, cerradas, _ = asyncio.run(closer.close_empty())
+    assert cerradas == 0
+    assert fake.sent == []

@@ -175,7 +175,11 @@ wallet_private_key = ""
 # queda vacía para recuperar su rent (~0.0015-0.002 SOL, un 7-10% de una
 # compra de 0.02 SOL). Ni PumpPortal ni Jupiter la cierran al vender. Al
 # arrancar también se cierran las cuentas vacías que quedaron de antes. Solo
-# toca cuentas con saldo 0; el rent vuelve a la propia wallet.
+# toca cuentas con saldo 0; el rent vuelve a la propia wallet. Excepción: si
+# una ruta de Jupiter pasa por un token intermedio (p. ej. USDC) y deja en su
+# cuenta un resto que vale menos del 10% del rent (0.000167 USDC, por
+# ejemplo), ese resto se quema para poder cerrarla. Lo que valga algo no se
+# toca.
 close_empty_token_accounts = true
 
 [onchain]

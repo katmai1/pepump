@@ -191,7 +191,7 @@ if __name__ == "__main__":
         # Misma wallet para las dos APIs: con la clave ya se conoce.
         client.wallet_address = jupiter.wallet_address
     try:
-        closer = build_token_account_closer(config)
+        closer = build_token_account_closer(config, jupiter)
     except ValueError as e:
         logger.error(str(e))
         sys.exit(1)

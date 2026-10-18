@@ -180,7 +180,10 @@ PumpPortal ni Jupiter la cierran al venderlo todo: el rent se queda dentro y
 el historial lo registraba como pérdida. Con `wallet_private_key`, el bot
 cierra la cuenta tras cada venta real y suma el rent recuperado a lo
 recibido; al arrancar, cierra también las cuentas vacías que quedaron de
-antes (`close_empty_token_accounts`, sección `[jupiter]`). El rent no cuenta
+antes (`close_empty_token_accounts`, sección `[jupiter]`). Una ruta de
+Jupiter por tokens intermedios (SOL → USDC → TTWO → token) crea también sus
+cuentas: se cierran tras la venta, y si la ruta dejó un resto que vale menos
+del 10% del rent (según Jupiter), se quema para poder cerrarlas. El rent no cuenta
 en el precio de entrada ni en el PnL neto mientras la posición está abierta.
 
 Cada orden cerrada se registra en el CSV de `general.trade_history_csv`

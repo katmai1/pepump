@@ -630,3 +630,20 @@ def test_curva_completada_sin_jupiter_avisa(_migrado_contra_otro_token, caplog):
     asyncio.run(asyncio.wait_for(bot._get_reference_price(), timeout=5))
 
     assert "con jupiter_api_key se podría operar por Jupiter" in caplog.text
+
+
+
+def test_dust_value_sol(monkeypatch):
+    monkeypatch.setattr(requests, "get", lambda *a, **k: FakeResponse(body={"outAmount": "1234"}))
+    assert asyncio.run(_client().dust_value_sol(MINT, 167)) == pytest.approx(1234 / 1e9)
+
+
+def test_dust_value_sol_sin_ruta_no_vale_nada(monkeypatch):
+    monkeypatch.setattr(requests, "get", lambda *a, **k: FakeResponse(body={"outAmount": "0"}))
+    assert asyncio.run(_client().dust_value_sol(MINT, 1)) is None
+
+
+def test_dust_value_sol_con_error_de_red_no_dice_que_no_vale_nada(monkeypatch):
+    monkeypatch.setattr(requests, "get", lambda *a, **k: FakeResponse(500, body={"error": "x"}))
+    with pytest.raises(JupiterError):
+        asyncio.run(_client().dust_value_sol(MINT, 1))

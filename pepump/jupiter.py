@@ -64,6 +64,10 @@ class JupiterError(RuntimeError):
     de peticiones agotado...). Nunca significa que se haya enviado nada."""
 
 
+class NoRouteError(JupiterError):
+    """Jupiter contestó bien, pero no hay ruta para esa cantidad."""
+
+
 def load_keypair(secret: str) -> Keypair:
     """Clave privada en base58 (la que exportan Phantom, Solflare o
     PumpPortal) o como lista JSON de 64 bytes (formato de solana-keygen).
@@ -177,7 +181,7 @@ class JupiterClient:
                                           "amount": str(amount_raw)}, priority)
         if _as_int(data.get("outAmount")) <= 0:
             motivo = data.get("errorMessage") or data.get("error") or "sin ruta"
-            raise JupiterError(f"Jupiter no encontró ruta {input_mint} -> {output_mint}: {motivo}")
+            raise NoRouteError(f"Jupiter no encontró ruta {input_mint} -> {output_mint}: {motivo}")
         return data
 
     # ---- Precio ----------------------------------------------------------- #
@@ -214,6 +218,16 @@ class JupiterClient:
             raise JupiterError(f"Cantidad de tokens demasiado pequeña para cotizar ({token_amount}).")
         data = await self.quote(mint, WSOL_MINT, raw, priority)
         return _as_int(data["outAmount"]) / _LAMPORTS_PER_SOL / (raw / 10 ** decimals)
+
+    async def dust_value_sol(self, mint: str, amount_raw: int) -> Optional[float]:
+        """SOL que darían por `amount_raw` unidades crudas de `mint`, o None
+        si no hay ruta para esa cantidad (no vale nada). Otros errores
+        (límite de peticiones, red) se propagan: no se sabe cuánto vale."""
+        try:
+            data = await self.quote(mint, WSOL_MINT, amount_raw, PRIORITY_PRICE)
+        except NoRouteError:
+            return None
+        return _as_int(data["outAmount"]) / _LAMPORTS_PER_SOL
 
     # ---- Órdenes ---------------------------------------------------------- #
 
