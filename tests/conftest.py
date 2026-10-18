@@ -173,3 +173,12 @@ def _sin_raydium_cpmm_real(monkeypatch):
 def open_position():
     return Position(mint="TestMint1111111111111111111111111111111111",
                      entry_price=1.0, sol_amount=0.05, token_amount=0.05)
+
+
+@pytest.fixture
+def store(tmp_path):
+    """Base de datos de posiciones en un archivo temporal."""
+    from pepump.store import PositionStore
+    s = PositionStore(str(tmp_path / "estado.db"))
+    yield s
+    s.close()

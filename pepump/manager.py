@@ -78,9 +78,14 @@ PositionRef = Union[int, str]
 BUY_OVERHEAD_SOL = 0.004
 # El saldo de la wallet se recuerda unos segundos (la web lo pide a menudo).
 WALLET_CACHE_SECONDS = 20.0
+# Tras vender, cuánto tiempo más se sigue registrando el precio (ver
+# TrailingTakeProfitBot.follow_after_close).
+FOLLOW_AFTER_CLOSE_SECONDS = 30 * 60
 
 
 class PositionManager:
+    FOLLOW_AFTER_CLOSE_SECONDS = FOLLOW_AFTER_CLOSE_SECONDS
+
     def __init__(self, base_config: AppConfig, client, feed: Optional[SharedTradeFeed] = None,
                  metadata_client=None, panel_factory: Optional[Callable[["ManagedPosition"], object]] = None,
                  executor_factory: Optional[Callable[[AppConfig], object]] = None,
@@ -105,6 +110,8 @@ class PositionManager:
         self._changed = asyncio.Event()
         self._wallet_cache: Optional[tuple] = None  # (monotonic, address, sol)
         self._wallet_mismatch_warned = False
+        # Tareas que siguen registrando el precio de posiciones ya vendidas.
+        self._followers: set = set()
 
     # --- control ------------------------------------------------------------ #
     def open(self, mint: str, **overrides) -> ManagedPosition:
@@ -189,6 +196,7 @@ class PositionManager:
         servicio sigue vivo."""
         if block_new:
             self._closing_all = True
+            self._cancel_followers()
         pedidas = 0
         for managed in list(self._positions.values()):
             if managed.closable:
@@ -197,12 +205,17 @@ class PositionManager:
         self._notify()
         return pedidas
 
+    def _cancel_followers(self) -> None:
+        for task in self._followers:
+            task.cancel()
+
     def stop_all(self, reason: str = "bot detenido") -> int:
         """Detiene todos los bots SIN vender (lo que hace Ctrl+C por
         defecto): las posiciones abiertas quedan guardadas y se retoman al
         volver a arrancar; las que esperaban entrada se cancelan. No se
         abren posiciones nuevas desde ese momento."""
         self._closing_all = True
+        self._cancel_followers()
         pedidas = 0
         for managed in list(self._positions.values()):
             if managed.closable:
@@ -221,7 +234,11 @@ class PositionManager:
             await asyncio.gather(*pendientes, return_exceptions=True)
 
     async def aclose(self) -> None:
-        """Al apagar el proceso, después de wait_all(): cierra el feed."""
+        """Al apagar el proceso, después de wait_all(): corta el registro de
+        precios tras la venta y cierra el feed."""
+        self._cancel_followers()
+        if self._followers:
+            await asyncio.gather(*self._followers, return_exceptions=True)
         await self.feed.close()
 
     # --- persistencia -------------------------------------------------------- #
@@ -500,4 +517,17 @@ class PositionManager:
             logger.error(f"⚠️  La posición #{managed.id} ({managed.mint}) terminó con la posición "
                          f"ABIERTA: los tokens siguen en la wallet. Revísala a mano: "
                          f"https://pump.fun/{managed.mint}")
+        self._maybe_follow(managed)
         self._notify()
+
+    def _maybe_follow(self, managed: ManagedPosition) -> None:
+        """Tras una venta, sigue registrando el precio un rato (ver
+        follow_after_close). Solo con base de datos, que es donde sirve, y
+        no si el proceso se está apagando."""
+        pos = managed.bot.position
+        if self.store is None or self._closing_all or pos is None or not pos.closed:
+            return
+        task = asyncio.create_task(managed.bot.follow_after_close(self.FOLLOW_AFTER_CLOSE_SECONDS),
+                                   name=f"pepump-follow-{managed.id}")
+        self._followers.add(task)
+        task.add_done_callback(self._followers.discard)

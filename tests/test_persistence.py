@@ -57,13 +57,6 @@ async def _precio(manager, conns, mint, price):
     conns.sockets[-1].push({"mint": mint, "price": price})
 
 
-@pytest.fixture
-def store(tmp_path):
-    s = PositionStore(str(tmp_path / "estado.db"))
-    yield s
-    s.close()
-
-
 def test_store_basico(tmp_path):
     path = str(tmp_path / "x.db")
     s = PositionStore(path)

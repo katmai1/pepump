@@ -909,6 +909,38 @@ class TrailingTakeProfitBot:
         self._show_status(f"⏳ Esperando la baja de entrada | precio actual {self.latest_price:.10f} "
                           f"| objetivo {target_price:.10f} | falta bajar {falta_pct:.2f}% más")
 
+    async def follow_after_close(self, seconds: float) -> None:
+        """Con la posición YA vendida, sigue registrando el precio
+        `seconds` más (gráfico e historial en la base de datos), para poder
+        analizar después qué habría pasado con otros ajustes de trailing o
+        stop. No toca la posición ni el estado del bot.
+
+        Lee el precio on-chain cada `onchain_poll_interval_seconds` en vez
+        de seguir suscrito al feed de PumpPortal: el feed se paga por
+        evento, y un token activo puede mandar miles de trades en ese rato.
+        Lo lanza el gestor en una tarea aparte (ver PositionManager), así
+        que el mint queda libre aunque esto siga corriendo. Nunca lanza."""
+        ctx = current_mint.set(self.mint)
+        # Copia propia: no cambia la fuente que muestra el snapshot. Si el
+        # precio venía del feed, el mint estaba en la bonding curve, y
+        # fetch_price ya pasa solo a PumpSwap si la curva completa.
+        onchain = OnchainFallback(self.mint, self.cfg.solana_rpc_url, self.onchain.source or "bondingcurve")
+        deadline = time.monotonic() + seconds
+        logger.info(f"Registrando el precio {seconds / 60:.0f} min más tras la venta (para análisis).")
+        try:
+            while (left := deadline - time.monotonic()) > 0:
+                try:
+                    price = await onchain.fetch_price()
+                except Exception as e:
+                    logger.debug(f"[Tras la venta] no se pudo leer el precio on-chain: {e}")
+                    price = None
+                if price is not None and price > 0:
+                    self._record_price(time.time(), price)
+                await asyncio.sleep(min(self.cfg.onchain_poll_interval_seconds, left))
+            logger.debug("[Tras la venta] fin del registro de precios.")
+        finally:
+            current_mint.reset(ctx)
+
     async def _poll_onchain_price_loop(self) -> None:
         """Reemplazo de _consume_trade_stream para cuando la posición se
         abrió (o se detectó una migración a mitad de posición, ver

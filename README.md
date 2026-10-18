@@ -99,7 +99,11 @@ que quedaron abiertas) y todo se hace desde el navegador:
   logs filtrables por token. Al pulsar una posición, su **gráfico de
   precio** con la entrada, la activación, el stop y el nivel de venta del
   trailing, y las marcas de compra, armado y venta (los precios se guardan:
-  el gráfico sobrevive a un reinicio).
+  el gráfico sobrevive a un reinicio). Tras vender, el precio se sigue
+  registrando 30 minutos más, leído on-chain y no por el feed (que se paga
+  por evento), para poder analizar después qué habría pasado con otros
+  ajustes. Solo mientras el proceso siga en marcha: sin `--web`, el bot sale
+  en cuanto se cierran las posiciones.
 - **Historial** (pestaña de arriba): todas las posiciones terminadas.
 - **Saldo de la wallet** arriba a la derecha, y antes de cada compra real se
   comprueba que haya SOL suficiente. Para verlo desde el arranque, pon la
