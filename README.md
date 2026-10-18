@@ -171,10 +171,17 @@ en el log y en el panel web.
 En modo simulado se cobran por defecto los costes que tendría la operación
 en real (comisiones de pump.fun y PumpPortal, un 1% de slippage en contra,
 priority fee y rent de la cuenta del token), para que el PnL simulado no
-salga más optimista que el real. El rent (~0.002 SOL) se paga al comprar y
-vuelve al vender: sale en el saldo, pero no cuenta en el precio de entrada
-ni en el PnL neto mientras la posición está abierta. Se ajustan con `sim_fee_pct` /
+salga más optimista que el real. Se ajustan con `sim_fee_pct` /
 `sim_slippage_pct`, o se apagan con `sim_costs = false` (sección `[general]`).
+
+**Rent de la cuenta del token.** Cada compra crea una cuenta para el token,
+con ~0.0015-0.002 SOL de rent (un 7-10% de una compra de 0.02 SOL). Ni
+PumpPortal ni Jupiter la cierran al venderlo todo: el rent se queda dentro y
+el historial lo registraba como pérdida. Con `wallet_private_key`, el bot
+cierra la cuenta tras cada venta real y suma el rent recuperado a lo
+recibido; al arrancar, cierra también las cuentas vacías que quedaron de
+antes (`close_empty_token_accounts`, sección `[jupiter]`). El rent no cuenta
+en el precio de entrada ni en el PnL neto mientras la posición está abierta.
 
 Cada orden cerrada se registra en el CSV de `general.trade_history_csv`
 (`""` desactiva el historial).

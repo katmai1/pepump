@@ -23,7 +23,8 @@ class Position:
     # datos reales de fill, `entry_price` es el precio EFECTIVO pagado
     # e incluye los costes de la tx (fee de pump.fun, priority fee...).
     # NO incluye el rent de crear la cuenta del token (~0.002 SOL, un 4%
-    # de una compra de 0.05 SOL): vuelve al venderlo todo, así que no es
+    # de una compra de 0.05 SOL): se recupera al cerrar la cuenta tras
+    # venderlo todo (ver token_accounts.py), así que no es
     # un coste. Sí está en `sol_amount` (lo que salió de la wallet), y el
     # PnL realizado (proceeds - sol_amount) lo cuenta según haya vuelto o
     # no. Ese precio efectivo es el
@@ -128,8 +129,9 @@ SELL_PRIORITY_FEE_FACTOR = 4.0
 # Costes fijos de una operación real que también se cobran al simular
 # (ver simulated_buy / simulated_sell).
 NETWORK_FEE_SOL = 0.000005  # fee base de una tx de Solana (una firma)
-# Rent de la cuenta del token: se paga al comprar y vuelve al vender (la
-# venta del 100% cierra la cuenta).
+# Rent de la cuenta del token: se paga al comprar y vuelve al vender. Ni
+# PumpPortal ni Jupiter cierran la cuenta: la cierra el bot tras la venta
+# (ver token_accounts.py; en real, con wallet_private_key).
 TOKEN_ACCOUNT_RENT_SOL = 0.00203928
 
 
@@ -199,11 +201,14 @@ class TradeExecutor:
     JupiterClient si la posición va por Jupiter: pool_override="jupiter").
     """
 
-    def __init__(self, client, live: bool, config, jupiter=None):
+    def __init__(self, client, live: bool, config, jupiter=None, closer=None):
         self.client = client
         self.live = live
         self.cfg = config
         self.jupiter = jupiter
+        # TokenAccountCloser (ver token_accounts.py), o None: cierra la
+        # cuenta del token que queda vacía tras una venta real.
+        self.closer = closer
 
     def _jupiter(self):
         if self.jupiter is None:
@@ -230,6 +235,22 @@ class TradeExecutor:
         tokens *= 1 - self.cfg.sim_slippage_pct / 100.0
         spent = self.cfg.buy_sol + self.cfg.priority_fee + NETWORK_FEE_SOL + TOKEN_ACCOUNT_RENT_SOL
         return spent, tokens, entry_price_without_rent(spent, tokens, TOKEN_ACCOUNT_RENT_SOL)
+
+    async def _recover_token_account_rent(self, mint: str) -> float:
+        """Tras una venta real: cierra la cuenta del token si quedó vacía y
+        devuelve los SOL recuperados (netos del fee). 0 si no hay closer o si
+        falla (lo recoge el barrido del próximo arranque)."""
+        if self.closer is None:
+            return 0.0
+        try:
+            recuperado, cerradas = await self.closer.close_empty(mint)
+        except Exception as e:
+            logger.warning(f"[REAL] No se pudo cerrar la cuenta vacía de {mint} ({e}); su rent se "
+                           f"recupera al volver a arrancar el bot.")
+            return 0.0
+        if cerradas:
+            logger.info(f"[REAL] Cuenta del token cerrada: recuperados {recuperado:.9f} SOL de rent.")
+        return recuperado
 
     async def _simulated_jupiter_sell(self, mint: str, tokens: float, price: float,
                                       priority_fee: Optional[float]) -> tuple[float, float]:
@@ -315,7 +336,7 @@ class TradeExecutor:
                             f"tokens -> precio efectivo real: {entry_price:.10f} SOL/token "
                             f"({sobrecoste_pct:+.2f}% vs. el precio de mercado de referencia "
                             f"{price:.10f}).")
-                renta = (f" y {rent:.9f} SOL de rent de la cuenta del token (vuelve al venderlo todo; "
+                renta = (f" y {rent:.9f} SOL de rent de la cuenta del token (se recupera al cerrarla tras vender; "
                          f"no cuenta en el precio de entrada)" if rent else "")
                 logger.info(f"[REAL] Coste de entrar: {sobrecoste_sol:+.9f} SOL sobre los "
                             f"{self.cfg.buy_sol:.9f} SOL de la orden (comisiones del pool y del "
@@ -467,6 +488,12 @@ class TradeExecutor:
                 logger.warning("[REAL] No se pudieron confirmar los datos reales de la venta; "
                                "se usa el ESTIMADO (precio de referencia y token_amount de la "
                                "posición) para el PnL.")
+
+            # Ni PumpPortal ni Jupiter cierran la cuenta del token al vender
+            # todo: su rent se queda dentro. Se cierra aquí y se suma a lo
+            # recibido (el precio de salida no cambia: no cuenta el rent).
+            if not (isinstance(result, dict) and result.get("actual_rent_refund_sol")):
+                proceeds += await self._recover_token_account_rent(position.mint)
 
         # PnL calculado en SOL real gastado vs. SOL real recibido -no
         # como ratio de precios-, para que en modo REAL con datos reales

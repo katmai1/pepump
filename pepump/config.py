@@ -105,6 +105,10 @@ class AppConfig:
     # la variable de entorno PEPUMP_WALLET_PRIVATE_KEY. repr=False: que no
     # salga nunca en un log ni en un traceback que muestre la config.
     wallet_private_key: str = field(default="", repr=False)
+    # Con wallet_private_key: cerrar la cuenta del token que queda vacía
+    # tras cada venta real (y, al arrancar, las que quedaron de antes) para
+    # recuperar su rent. Ni PumpPortal ni Jupiter la cierran.
+    close_empty_token_accounts: bool = True
     # Mínimo de segundos entre dos peticiones a Jupiter, para TODA la
     # cuenta (precio de todas las posiciones + órdenes). 2.0 es el plan
     # gratuito; con un plan de pago se puede bajar.

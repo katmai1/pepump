@@ -171,6 +171,13 @@ jupiter_for_all = false
 # aquí, también se busca la variable de entorno PEPUMP_WALLET_PRIVATE_KEY.
 wallet_private_key = ""
 
+# Con wallet_private_key: tras cada venta REAL, cerrar la cuenta del token que
+# queda vacía para recuperar su rent (~0.0015-0.002 SOL, un 7-10% de una
+# compra de 0.02 SOL). Ni PumpPortal ni Jupiter la cierran al vender. Al
+# arrancar también se cierran las cuentas vacías que quedaron de antes. Solo
+# toca cuentas con saldo 0; el rent vuelve a la propia wallet.
+close_empty_token_accounts = true
+
 [onchain]
 # Cuántos segundos se espera el precio por el feed en vivo ANTES de recurrir
 # al fallback on-chain, PARA LA ENTRADA (todavía sin posición abierta). Solo

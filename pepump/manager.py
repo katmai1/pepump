@@ -90,7 +90,7 @@ class PositionManager:
     def __init__(self, base_config: AppConfig, client, feed: Optional[SharedTradeFeed] = None,
                  metadata_client=None, panel_factory: Optional[Callable[["ManagedPosition"], object]] = None,
                  executor_factory: Optional[Callable[[AppConfig], object]] = None,
-                 store: Optional[PositionStore] = None, jupiter=None):
+                 store: Optional[PositionStore] = None, jupiter=None, closer=None):
         """`client` es el PumpPortalClient real (trades de la Lightning API,
         balances); el precio llega por `feed` (uno compartido sobre ese
         mismo cliente si no se pasa). `panel_factory(managed)` devuelve el
@@ -98,7 +98,8 @@ class PositionManager:
         `executor_factory` existe para los tests. `store` guarda las
         posiciones para retomarlas (None = sin persistencia). `jupiter` es el
         JupiterClient (None = sin Jupiter): lo comparten todas las
-        posiciones, con un único cupo de peticiones."""
+        posiciones, con un único cupo de peticiones. `closer` cierra la cuenta
+        del token que queda vacía tras una venta real (ver token_accounts.py)."""
         self.base_config = base_config
         self.client = client
         self.feed = feed if feed is not None else SharedTradeFeed(client)
@@ -106,7 +107,8 @@ class PositionManager:
         self.panel_factory = panel_factory
         self.jupiter = jupiter
         self.executor_factory = executor_factory or (
-            lambda cfg: TradeExecutor(client=client, live=cfg.live, config=cfg, jupiter=jupiter))
+            lambda cfg: TradeExecutor(client=client, live=cfg.live, config=cfg, jupiter=jupiter,
+                                      closer=closer))
         self.store = store
         self._positions: Dict[int, ManagedPosition] = {}
         self._next_id = 1  # solo sin store; con store, el id lo da la base de datos

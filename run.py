@@ -71,6 +71,7 @@ from pepump.manager import PositionManager
 from pepump.onchain.metadata import TokenMetadataOnChainClient
 from pepump.pumpportal import PumpPortalClient
 from pepump.shutdown import run_with_shutdown_signals_for
+from pepump.token_accounts import build_token_account_closer, sweep_empty_token_accounts
 
 logger = logging.getLogger(__name__)
 
@@ -189,6 +190,11 @@ if __name__ == "__main__":
     if jupiter is not None and jupiter.wallet_address and not client.wallet_address:
         # Misma wallet para las dos APIs: con la clave ya se conoce.
         client.wallet_address = jupiter.wallet_address
+    try:
+        closer = build_token_account_closer(config)
+    except ValueError as e:
+        logger.error(str(e))
+        sys.exit(1)
 
     store = None
     if config.state_db:
@@ -205,7 +211,7 @@ if __name__ == "__main__":
     async def main():
         manager = PositionManager(base_config=config, client=client, store=store,
                                   metadata_client=TokenMetadataOnChainClient(config.solana_rpc_url),
-                                  jupiter=jupiter)
+                                  jupiter=jupiter, closer=closer)
         if panel is not None:
             multi = MultiPositionPanel(panel, manager.snapshot, live=config.live)
             if args.sell_on_exit:
@@ -226,6 +232,7 @@ if __name__ == "__main__":
         # Con --web el proceso es un servicio: sigue vivo sin posiciones
         # (se abren desde la web) hasta que se pide salir.
         salir = asyncio.Event()
+        sweep_tasks: set = set()
 
         def on_signal(sig_name: str) -> None:
             salir.set()
@@ -236,6 +243,10 @@ if __name__ == "__main__":
 
         async def run_all():
             retomadas = await manager.recover()
+            if closer is not None:
+                # En segundo plano: no tiene por qué retrasar nada. Después de
+                # recover(), que mira la wallet antes de que se toque nada.
+                sweep_tasks.add(asyncio.create_task(sweep_empty_token_accounts(closer)))
             for mint in mints:
                 existente = manager.get(mint)
                 if existente is not None and existente.active:
@@ -265,6 +276,8 @@ if __name__ == "__main__":
         try:
             await run_with_shutdown_signals_for(run_all(), on_signal)
         finally:
+            for task in sweep_tasks:
+                task.cancel()
             if web is not None:
                 await web.stop()
             await manager.aclose()
