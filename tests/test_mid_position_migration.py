@@ -13,9 +13,9 @@ import asyncio
 
 import pytest
 
-from pepump import bot as bot_module
 from pepump.bot import TrailingTakeProfitBot
 from pepump.executor import Position
+from pepump.onchain import fallback as fallback_module
 from tests.conftest import SpyExecutor, make_config
 
 
@@ -75,21 +75,21 @@ def test_migracion_a_mitad_de_posicion_pasa_a_polling_onchain(monkeypatch):
     )
     bot = TrailingTakeProfitBot(client=None, executor=executor, config=cfg)
     bot.position = Position(mint=cfg.mint, entry_price=1.0, sol_amount=0.05, token_amount=0.05)
-    bot._trade_events = _hanging_stream()  # nunca entrega otro trade -> dispara el stall
+    bot._stream.events = _hanging_stream()  # nunca entrega otro trade -> dispara el stall
 
     # 1.20 arma el trailing (>= +10% de entrada); 1.30 pone nuevo máximo
     # (stop en 1.30*0.85=1.105); 1.10 retrocede por debajo de ese stop -> vende.
     fake_onchain = FakeOnChainClient(cfg.solana_rpc_url, [1.20, 1.30, 1.10])
-    monkeypatch.setattr(bot_module, "PumpSwapOnChainClient", lambda rpc_url: fake_onchain)
+    monkeypatch.setattr(fallback_module, "PumpSwapOnChainClient", lambda rpc_url: fake_onchain)
     # No debería llegar a consultarse (el fake de PumpSwap ya da precio
     # válido de inmediato), pero lo dejamos parcheado de todos modos para
     # no tocar la red real si algo cambia.
-    monkeypatch.setattr(bot_module, "PumpCurveOnChainClient",
+    monkeypatch.setattr(fallback_module, "PumpCurveOnChainClient",
                          lambda rpc_url: FakeCurveOnChainClient(rpc_url))
 
     asyncio.run(asyncio.wait_for(bot._consume_trade_stream(), timeout=2.0))
 
-    assert bot._onchain_source == "pumpswap"
+    assert bot.onchain.source == "pumpswap"
     assert executor.sell_calls == 1
     assert bot.position.closed is True
     assert bot.latest_price == pytest.approx(1.10)
@@ -107,14 +107,14 @@ def test_handle_feed_stall_sin_pool_ni_bonding_curve_no_migra(monkeypatch):
     bot.position = Position(mint=cfg.mint, entry_price=1.0, sol_amount=0.05, token_amount=0.05)
 
     fake_onchain = FakeOnChainClient(cfg.solana_rpc_url, [None])
-    monkeypatch.setattr(bot_module, "PumpSwapOnChainClient", lambda rpc_url: fake_onchain)
+    monkeypatch.setattr(fallback_module, "PumpSwapOnChainClient", lambda rpc_url: fake_onchain)
     fake_curve = FakeCurveOnChainClient(cfg.solana_rpc_url, price=None, complete=False, exists=False)
-    monkeypatch.setattr(bot_module, "PumpCurveOnChainClient", lambda rpc_url: fake_curve)
+    monkeypatch.setattr(fallback_module, "PumpCurveOnChainClient", lambda rpc_url: fake_curve)
 
     result = asyncio.run(bot._handle_feed_stall())
 
     assert result is False
-    assert bot._onchain_source is None
+    assert bot.onchain.source is None
     assert bot.position.closed is False
     assert executor.sell_calls == 0
     assert bot.latest_price is None  # no se tocó: no había ningún precio legible
@@ -133,14 +133,14 @@ def test_handle_feed_stall_bonding_curve_da_precio_de_seguridad(monkeypatch):
     bot.position = Position(mint=cfg.mint, entry_price=1.0, sol_amount=0.05, token_amount=0.05)
 
     fake_onchain = FakeOnChainClient(cfg.solana_rpc_url, [None])
-    monkeypatch.setattr(bot_module, "PumpSwapOnChainClient", lambda rpc_url: fake_onchain)
+    monkeypatch.setattr(fallback_module, "PumpSwapOnChainClient", lambda rpc_url: fake_onchain)
     fake_curve = FakeCurveOnChainClient(cfg.solana_rpc_url, price=1.05, complete=False, exists=True)
-    monkeypatch.setattr(bot_module, "PumpCurveOnChainClient", lambda rpc_url: fake_curve)
+    monkeypatch.setattr(fallback_module, "PumpCurveOnChainClient", lambda rpc_url: fake_curve)
 
     result = asyncio.run(bot._handle_feed_stall())
 
     assert result is False
-    assert bot._onchain_source is None  # NO pasa a modo polling on-chain
+    assert bot.onchain.source is None  # NO pasa a modo polling on-chain
     assert bot.latest_price == pytest.approx(1.05)
     assert bot.position.closed is False  # 1.05 no dispara ni stop-loss ni trailing
 
@@ -168,7 +168,7 @@ def test_stalls_repetidos_con_la_curva_viva_pasan_a_polling_onchain(monkeypatch)
     bot.position = Position(mint=cfg.mint, entry_price=1.0, sol_amount=0.05, token_amount=0.05)
 
     # Nunca hay pool de PumpSwap: el mint sigue en bonding curve.
-    monkeypatch.setattr(bot_module, "PumpSwapOnChainClient",
+    monkeypatch.setattr(fallback_module, "PumpSwapOnChainClient",
                          lambda rpc_url: FakeOnChainClient(rpc_url, [None]))
 
     # La curva responde: 1.02 (primer stall, solo red de seguridad),
@@ -183,14 +183,14 @@ def test_stalls_repetidos_con_la_curva_viva_pasan_a_polling_onchain(monkeypatch)
             ultimo[0] = next(precios, ultimo[0])
             return ultimo[0], False, True
 
-    monkeypatch.setattr(bot_module, "PumpCurveOnChainClient",
+    monkeypatch.setattr(fallback_module, "PumpCurveOnChainClient",
                          lambda rpc_url: CurvaConSecuencia(rpc_url))
 
     async def escenario():
         # Primer stall: red de seguridad, sigue esperando el feed en vivo.
         primero = await bot._handle_feed_stall()
         assert primero is False
-        assert bot._onchain_source is None
+        assert bot.onchain.source is None
         assert bot.latest_price == pytest.approx(1.02)
 
         # Segundo stall seguido: deja el feed y hace polling hasta cerrar.
@@ -199,7 +199,7 @@ def test_stalls_repetidos_con_la_curva_viva_pasan_a_polling_onchain(monkeypatch)
     resultado = asyncio.run(asyncio.wait_for(escenario(), timeout=2.0))
 
     assert resultado is True
-    assert bot._onchain_source == "bondingcurve"
+    assert bot.onchain.source == "bondingcurve"
     assert executor.sell_calls == 1
     assert bot.position.closed is True
 
@@ -215,7 +215,7 @@ def test_un_trade_real_reinicia_el_contador_de_stalls():
     async def un_evento():
         yield {"price": 1.01}
 
-    bot._trade_events = un_evento()
+    bot._stream.events = un_evento()
     bot.client = type("C", (), {"extract_price": staticmethod(lambda e: e.get("price"))})()
 
     # El stream entrega un trade y después se agota (StopAsyncIteration ->

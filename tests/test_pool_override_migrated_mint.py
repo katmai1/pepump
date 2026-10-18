@@ -39,7 +39,7 @@ def test_compra_via_fallback_de_entrada_fuerza_pool_pump_amm():
 
     # Simula lo que hace _try_onchain_fallback cuando SÍ encuentra un
     # pool de PumpSwap con precio real: marca la fuente antes de comprar.
-    bot._onchain_source = "pumpswap"
+    bot.onchain.source = "pumpswap"
 
     asyncio.run(bot._on_first_price(0.0000009138))
 
@@ -57,7 +57,7 @@ def test_compra_por_feed_en_vivo_no_fuerza_pool():
     cfg = make_config(pool="auto")
     bot = TrailingTakeProfitBot(client=None, executor=executor, config=cfg)
 
-    assert bot._onchain_source is None  # default
+    assert bot.onchain.source is None  # default
 
     asyncio.run(bot._on_first_price(0.0000009138))
 
@@ -73,7 +73,7 @@ def test_venta_con_fallback_pumpswap_activo_fuerza_pool_pump_amm():
     executor = SpyExecutor()
     cfg = make_config(pool="auto", activation_pct=10.0, trailing_pct=15.0, initial_stop_pct=25.0)
     bot = TrailingTakeProfitBot(client=None, executor=executor, config=cfg)
-    bot._onchain_source = "pumpswap"
+    bot.onchain.source = "pumpswap"
     bot.position = Position(mint=cfg.mint, entry_price=1.0, sol_amount=0.05, token_amount=0.05)
 
     # Precio por debajo del stop-loss inicial -> dispara _try_sell.
@@ -96,7 +96,7 @@ def test_venta_con_bonding_curve_fallback_no_fuerza_pool_amm():
     executor = SpyExecutor()
     cfg = make_config(pool="auto", activation_pct=10.0, trailing_pct=15.0, initial_stop_pct=25.0)
     bot = TrailingTakeProfitBot(client=None, executor=executor, config=cfg)
-    bot._onchain_source = "bondingcurve"
+    bot.onchain.source = "bondingcurve"
     bot.position = Position(mint=cfg.mint, entry_price=1.0, sol_amount=0.05, token_amount=0.05)
 
     asyncio.run(bot._on_price_update(0.70))

@@ -3,15 +3,13 @@ import contextlib
 import logging
 import time
 from collections import deque
-from typing import Any, AsyncIterator, Callable, Optional
+from typing import Callable, Optional
 
 from pepump.executor import Position
 from pepump.log_context import current_mint, set_mint_label
-from pepump.onchain.meteora_dlmm import MeteoraDlmmOnChainClient
-from pepump.onchain.pump_curve import PumpCurveOnChainClient
-from pepump.onchain.pumpswap import PumpSwapOnChainClient
-from pepump.onchain.raydium_cpmm import RaydiumCpmmOnChainClient
+from pepump.onchain.fallback import OnchainFallback
 from pepump.strategy import Action, TrailingStrategy
+from pepump.trade_stream import ShutdownRequested, TradeStream
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +39,7 @@ _PRICE_SAMPLE_JUMP = 0.03
 _PRICE_HISTORY_MAX = 20_000
 
 # Mientras la comprobación temprana de existencia on-chain (ver
-# _confirm_mint_not_pumpfun / _get_reference_price) todavía no terminó,
+# OnchainFallback.confirm_not_listed / _get_reference_price) todavía no terminó,
 # cada espera de un trade del feed en vivo se corta en rebanadas de
 # esta duración en vez de esperar de golpe todo `live_feed_timeout_seconds`
 # -así, apenas esa comprobación confirma que el mint no es de pump.fun, el
@@ -49,12 +47,6 @@ _PRICE_HISTORY_MAX = 20_000
 # los live_feed_timeout_seconds completos (pensados para tolerar
 # tokens de poco volumen, no para esto).
 _EXISTENCE_CHECK_POLL_SECONDS = 0.5
-
-
-class _ShutdownRequested(Exception):
-    """Señal interna: se pidió apagado (Ctrl+C/SIGTERM) mientras se
-    esperaba otra cosa (un evento del feed, el cierre de la posición).
-    Nunca se propaga fuera de este módulo."""
 
 
 class TrailingTakeProfitBot:
@@ -83,31 +75,10 @@ class TrailingTakeProfitBot:
         self._price_cb: Optional[Callable[[float, float], None]] = None
         self._latest_price: Optional[float] = None
         self._closed_event = asyncio.Event()
-        self._ws: Any = None
-        self._trade_events: Optional[AsyncIterator[dict]] = None
-        # BUGFIX (generador cerrado por timeout): ver _next_trade_event.
-        # Tarea pendiente de `self._trade_events.__anext__()` que puede
-        # sobrevivir a un timeout sin cancelarse, para poder seguir
-        # esperando el MISMO evento en la próxima llamada en vez de
-        # cortar el generador async subyacente.
-        self._pending_next_event_task: Optional[asyncio.Task] = None
-        # Si tuvimos que resolver el precio (de entrada, o durante el
-        # monitoreo de una posición ya abierta) por un fallback on-chain
-        # en vez del feed en vivo de PumpPortal -> qué fallback está
-        # activo ahora mismo, para que el resto del código sepa con qué
-        # cliente/lógica seguir consultando (ver _onchain_fetch_price,
-        # _poll_onchain_price_loop, _wait_for_dip_entry,
-        # _resolve_shutdown_price):
-        #   None           -> no se usó ningún fallback, todo por el feed en vivo.
-        #   "bondingcurve" -> el mint sigue en bonding curve pero
-        #                     subscribeTokenTrade no entregó nada (ack
-        #                     recibido, sin trades reales); se lee el
-        #                     precio directo de la cuenta de la bonding
-        #                     curve on-chain (ver PumpCurveOnChainClient).
-        #   "pumpswap"     -> el mint ya migró a PumpSwap; se lee el
-        #                     precio directo del pool on-chain (ver
-        #                     PumpSwapOnChainClient).
-        self._onchain_source: Optional[str] = resume_onchain_source
+        # Fallback on-chain (ver onchain/fallback.py): si el precio no sale
+        # del feed en vivo, de dónde sale ahora (`self.onchain.source`) y
+        # por qué pool hay que rutear la orden.
+        self.onchain = OnchainFallback(self.mint, config.solana_rpc_url, resume_onchain_source)
         # Si _get_reference_price (o algo que llame desde ahí) ya
         # logueó un motivo específico para devolver None -mint que no es
         # de pump.fun, timeout total, fallback on-chain sin precio,
@@ -131,6 +102,8 @@ class TrailingTakeProfitBot:
         # manejador de señales que solo marca este asyncio.Event, el
         # apagado se coordina de forma confiable.
         self._shutdown_requested = asyncio.Event()
+        # Conexión al feed de trades (ver trade_stream.py).
+        self._stream = TradeStream(client, self.mint, self._shutdown_requested)
         # Motivo con el que se pidió close() (None si nadie lo pidió:
         # p. ej. la venta de cierre porque murió el monitor de precios).
         self._close_reason: Optional[str] = None
@@ -345,7 +318,7 @@ class TrailingTakeProfitBot:
         # antes de que el finally pueda correr, la conexión queda
         # suscripta pero abandonada del lado del servidor (no se le avisa
         # con un cierre limpio de WebSocket, solo se corta el TCP cuando
-        # el proceso muere). Por eso TODO lo que dependa de self._ws vive
+        # el proceso muere). Por eso TODO lo que dependa del feed vive
         # dentro de este try/finally, sin excepciones: así cualquier
         # crash -incluso uno inesperado que no previmos- cierra el socket
         # de forma ordenada en vez de dejarlo zombie.
@@ -358,7 +331,7 @@ class TrailingTakeProfitBot:
             # loguea el error y se sale ordenadamente (todavía no hay
             # posición abierta, así que no hay nada que vender).
             try:
-                self._ws = await self.client.connect_trade_stream(self.mint)
+                await self._stream.connect()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -366,7 +339,6 @@ class TrailingTakeProfitBot:
                              f"({self.client.DATA_WS_URL}): {e}")
                 self.end_reason = f"no se pudo conectar al feed de PumpPortal: {e}"
                 return
-            self._trade_events = self.client.iter_trade_events(self._ws)
             if self.position is None:
                 if not await self._enter():
                     return
@@ -382,7 +354,7 @@ class TrailingTakeProfitBot:
                             f"{pos.token_amount:,.2f} tokens, {estado}.")
             self._persist()
 
-            if self._onchain_source is not None:
+            if self.onchain.source is not None:
                 # subscribeTokenTrade no está entregando nada útil para
                 # este mint (ya migrado, o bonding curve pero el feed no
                 # entrega precios) -> el monitoreo de la posición usa
@@ -426,19 +398,7 @@ class TrailingTakeProfitBot:
         finally:
             if name_task is not None:
                 name_task.cancel()
-            if self._pending_next_event_task is not None:
-                self._pending_next_event_task.cancel()
-                self._pending_next_event_task = None
-            if self._ws is not None:
-                # Un fallo al cerrar (socket ya roto del otro lado) no
-                # puede reventar el cierre del bot: si esto lanza, la
-                # excepción sale de run() por el finally y run.py -que
-                # solo atrapa KeyboardInterrupt- muere con un traceback
-                # crudo DESPUÉS de una operación que salió bien.
-                try:
-                    await self._ws.close()
-                except Exception as e:
-                    logger.debug(f"No se pudo cerrar limpiamente el websocket: {e}")
+            await self._stream.close()
 
         logger.info("Bot finalizado.")
 
@@ -572,7 +532,7 @@ class TrailingTakeProfitBot:
                     return
                 try:
                     await self.executor.sell(self.position, price, self._shutdown_sell_reason(),
-                                              pool_override=self._current_pool_override())
+                                              pool_override=self.onchain.pool_override())
                     self._persist()
                     return
                 except Exception as e:
@@ -592,9 +552,9 @@ class TrailingTakeProfitBot:
         return "monitor de precios caído"
 
     async def _resolve_shutdown_price(self) -> Optional[float]:
-        if self._onchain_source is not None:
+        if self.onchain.source is not None:
             try:
-                price = await self._onchain_fetch_price()
+                price = await self.onchain.fetch_price()
             except Exception as e:
                 logger.debug(f"[On-chain] Falló la consulta fresca al cerrar: {e}")
                 price = None
@@ -603,123 +563,6 @@ class TrailingTakeProfitBot:
             logger.debug("[On-chain] No se pudo refrescar el precio al cerrar; "
                          "uso el último precio conocido.")
         return self.latest_price
-
-    async def _onchain_fetch_price(self) -> Optional[float]:
-        """Consulta puntual al fallback on-chain ACTUALMENTE activo
-        (self._onchain_source), usada para refrescar/pollear el precio
-        de una posición ya resuelta por ese fallback (ver
-        _poll_onchain_price_loop, _resolve_shutdown_price,
-        _wait_for_dip_entry).
-
-        Si el fallback activo es la bonding curve y ésta ya completó
-        (migró mientras estábamos pollando), pasa automáticamente al
-        fallback de PumpSwap para ESTA MISMA consulta y deja
-        `self._onchain_source` en "pumpswap" para las próximas -mismo
-        espíritu que _handle_feed_stall detectando una migración a
-        mitad de posición, pero aquí para el caso en que ya veníamos
-        on-chain por bonding curve."""
-        if self._onchain_source == "raydium-cpmm":
-            cpmm = RaydiumCpmmOnChainClient(self.cfg.solana_rpc_url)
-            return await cpmm.fetch_price(self.mint)
-        if self._onchain_source == "meteora-dlmm":
-            dlmm = MeteoraDlmmOnChainClient(self.cfg.solana_rpc_url)
-            return await dlmm.fetch_price(self.mint)
-        if self._onchain_source == "bondingcurve":
-            curve = PumpCurveOnChainClient(self.cfg.solana_rpc_url)
-            price, complete, exists = await curve.fetch_price_or_status(self.mint)
-            if exists and complete:
-                logger.info("[On-chain bonding curve] La curva completó (migró) mientras se hacía "
-                            "polling -> paso al fallback de PumpSwap.")
-                self._onchain_source = "pumpswap"
-                swap = PumpSwapOnChainClient(self.cfg.solana_rpc_url)
-                return await swap.fetch_price_for_migrated_mint(self.mint)
-            return price
-        onchain = PumpSwapOnChainClient(self.cfg.solana_rpc_url)
-        return await onchain.fetch_price_for_migrated_mint(self.mint)
-
-    async def _next_trade_event(self, timeout: Optional[float] = None) -> dict:
-        """__anext__() de self._trade_events, pero compitiendo contra
-        `_shutdown_requested` (y, si se pasa `timeout`, contra un
-        deadline). Lanza _ShutdownRequested si gana el apagado,
-        asyncio.TimeoutError si gana el timeout, o deja pasar cualquier
-        excepción normal del feed (StopAsyncIteration, errores de red,
-        etc.).
-
-        BUGFIX: antes, cuando ganaba el timeout, se cancelaba
-        directamente la tarea que envolvía `self._trade_events.__anext__()`.
-        Cancelar esa tarea lanza un CancelledError DENTRO del generador
-        async en su punto de espera (ej. el `await websocket.recv()`
-        interno de iter_trade_events) -y como nada lo atrapa ahí dentro,
-        el generador queda CERRADO para siempre: cualquier __anext__()
-        posterior sobre el mismo generador devuelve StopAsyncIteration
-        de inmediato, aunque la conexión siga perfectamente viva. Esto rompía
-        en silencio cualquier código que esperara poder seguir
-        escuchando el mismo feed después de un timeout (ver
-        _get_reference_price reintentando tras confirmar 'sin pool', y
-        _consume_trade_stream retomando el feed tras un stall sin
-        migración real).
-
-        Ahora, si gana el timeout, NO se cancela la tarea: se guarda en
-        self._pending_next_event_task para reutilizarla en la próxima
-        llamada -mismo generador, mismo __anext__() en vuelo, sin
-        cortar nada-. Solo se cancela de verdad si gana el shutdown
-        (ahí sí termina todo)."""
-        # BUGFIX (evento perdido tras un stall): si la tarea que quedó
-        # pendiente de un timeout anterior YA terminó, su resultado es un
-        # trade real que llegó mientras hacíamos otra cosa (típicamente
-        # las consultas RPC de _handle_feed_stall, que tardan). Antes se
-        # descartaba y se creaba un __anext__() nuevo: ese trade se
-        # perdía -y con él, una evaluación del trailing-stop y el reset
-        # de self._curve_stalls-. Si terminó con excepción (conexión
-        # cerrada), .result() la propaga aquí y el llamador reconecta, en
-        # vez de quedar como "Task exception was never retrieved".
-        pending = self._pending_next_event_task
-        if pending is not None and pending.done() and not pending.cancelled():
-            self._pending_next_event_task = None
-            if self._shutdown_requested.is_set():
-                # Se pidió apagado mientras tanto: no devolvemos un
-                # precio que dispararía una compra justo al salir.
-                raise _ShutdownRequested()
-            return pending.result()
-
-        if pending is None or pending.cancelled():
-            if self._trade_events is None:
-                raise RuntimeError("_next_trade_event sin conexión al feed")
-            next_task = asyncio.ensure_future(self._trade_events.__anext__())
-        else:
-            next_task = pending
-        shutdown_task = asyncio.ensure_future(self._shutdown_requested.wait())
-        try:
-            done, _pending = await asyncio.wait(
-                {next_task, shutdown_task}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
-            )
-        except asyncio.CancelledError:
-            # Cancelaron a quien esperaba (run() cancela el monitor de
-            # precios al terminar): el feed ya no se va a leer más, así que
-            # aquí SÍ se cancela el __anext__ en vuelo. Si se dejara
-            # colgado, terminaría solo al cerrarse el feed con una
-            # excepción que nadie recoge ("Task exception was never
-            # retrieved").
-            next_task.cancel()
-            shutdown_task.cancel()
-            self._pending_next_event_task = None
-            raise
-
-        if shutdown_task in done:
-            next_task.cancel()
-            self._pending_next_event_task = None
-            raise _ShutdownRequested()
-
-        shutdown_task.cancel()
-
-        if next_task in done:
-            self._pending_next_event_task = None
-            return next_task.result()  # puede propagar StopAsyncIteration u otra excepción
-
-        # Ganó el timeout: dejamos next_task VIVA (sin cancelar) para
-        # retomarla en la próxima llamada en vez de cerrar el generador.
-        self._pending_next_event_task = next_task
-        raise TimeoutError()
 
     async def _get_initial_price(self) -> Optional[float]:
         """Punto de entrada para conseguir el precio de compra real.
@@ -759,10 +602,10 @@ class TrailingTakeProfitBot:
              de `live_feed_timeout_seconds`, asumimos que el mint ya
              migró a PumpSwap (subscribeTokenTrade no cubre esos casos,
              confirmado a mano) y probamos el fallback on-chain
-             (_try_onchain_fallback).
+             (OnchainFallback.resolve_reference).
 
         En PARALELO con lo anterior, desde el arranque, corre
-        _confirm_mint_not_pumpfun() en segundo plano (ver ese método):
+        OnchainFallback.confirm_not_listed() en segundo plano (ver ese método):
         confirma cuanto antes -sin esperar ningún timeout pensado para
         tolerar tokens de poco volumen- si el mint directamente NO es de
         pump.fun/PumpSwap (ni bonding curve ni pool, ambas consultas
@@ -783,7 +626,7 @@ class TrailingTakeProfitBot:
         sin_precio = 0
 
         existence_check_task: Optional[asyncio.Task] = asyncio.ensure_future(
-            self._confirm_mint_not_pumpfun()
+            self.onchain.confirm_not_listed()
         )
         try:
             while True:
@@ -810,7 +653,7 @@ class TrailingTakeProfitBot:
                         logger.debug(f"[Feed en vivo] pasaron {self.cfg.live_feed_timeout_seconds:.0f}s desde el "
                                      f"ack sin ningún trade real -> probablemente este mint ya migró a PumpSwap "
                                      f"y subscribeTokenTrade no lo cubre. Probando fallback on-chain...")
-                        price, pool_confirmed_absent, mint_not_pumpfun = await self._try_onchain_fallback()
+                        price, pool_confirmed_absent, mint_not_pumpfun = await self.onchain.resolve_reference()
                         if price is not None:
                             return price
                         if mint_not_pumpfun:
@@ -840,8 +683,8 @@ class TrailingTakeProfitBot:
                         timeout = min(timeout, _EXISTENCE_CHECK_POLL_SECONDS)
 
                 try:
-                    event = await self._next_trade_event(timeout=timeout)
-                except _ShutdownRequested:
+                    event = await self._stream.next_event(timeout=timeout)
+                except ShutdownRequested:
                     logger.info("Cancelado por el usuario mientras se esperaba el precio de entrada.")
                     return None
                 except TimeoutError:
@@ -903,7 +746,7 @@ class TrailingTakeProfitBot:
     def _log_mint_not_pumpfun_abort(self) -> None:
         """Único mensaje de error para el caso "este mint no es de
         pump.fun/PumpSwap" -antes se logueaba una vez en
-        _try_onchain_fallback (o en la comprobación temprana) Y OTRA VEZ aquí,
+        OnchainFallback.resolve_reference (o en la comprobación temprana) Y OTRA VEZ aquí,
         con textos parecidos pero no idénticos, lo que se leía como dos
         errores mezclados para un solo problema."""
         logger.error(f"Abortando esta entrada: no hay de dónde sacar el precio de {self.mint} "
@@ -913,145 +756,6 @@ class TrailingTakeProfitBot:
                      f"graduar...), este bot "
                      f"no puede calcular su precio de entrada.")
 
-    async def _confirm_mint_not_pumpfun(self) -> bool:
-        """Comprobación temprana y SIN efectos secundarios (no toca
-        self._onchain_source, a diferencia de _try_onchain_fallback):
-        confirma lo antes posible si este mint NUNCA se lanzó en
-        pump.fun, consultando en paralelo con la espera del feed en vivo
-        desde el arranque de _get_reference_price -en vez de solo
-        después de `live_feed_timeout_seconds`, que existe para tolerar
-        tokens de poco volumen y no tiene nada que ver con esta pregunta.
-
-        Devuelve True solo si TODAS las consultas on-chain (PumpSwap,
-        bonding curve, Raydium CPMM y Meteora DLMM) respondieron bien y confirmaron
-        ausencia -nunca ante un fallo de RPC (ver PumpSwapOnChainClient.
-        fetch_price_or_confirm_absent y PumpCurveOnChainClient.
-        fetch_price_or_status), para no abortar una entrada válida por
-        un problema transitorio de conexión."""
-        onchain = PumpSwapOnChainClient(self.cfg.solana_rpc_url)
-        _, pool_confirmed_absent = await onchain.fetch_price_or_confirm_absent(self.mint)
-        if not pool_confirmed_absent:
-            return False
-        curve = PumpCurveOnChainClient(self.cfg.solana_rpc_url)
-        _, _, exists = await curve.fetch_price_or_status(self.mint)
-        if exists is not False:
-            return False
-        cpmm = RaydiumCpmmOnChainClient(self.cfg.solana_rpc_url)
-        _, cpmm_confirmed_absent = await cpmm.fetch_price_or_confirm_absent(self.mint)
-        if not cpmm_confirmed_absent:
-            return False
-        dlmm = MeteoraDlmmOnChainClient(self.cfg.solana_rpc_url)
-        _, dlmm_confirmed_absent = await dlmm.fetch_price_or_confirm_absent(self.mint)
-        return dlmm_confirmed_absent
-
-    async def _try_meteora_dlmm(self) -> tuple[Optional[float], bool]:
-        """Fallback de Meteora DLMM para las dos ramas de
-        _try_onchain_fallback que no encontraron pool contra SOL en
-        pump.fun/PumpSwap/Raydium CPMM. (price, confirmed_absent); si hay
-        precio, deja `self._onchain_source` en "meteora-dlmm"."""
-        dlmm = MeteoraDlmmOnChainClient(self.cfg.solana_rpc_url)
-        price, confirmed_absent = await dlmm.fetch_price_or_confirm_absent(self.mint)
-        if price is not None:
-            logger.info(f"Precio de referencia (fallback on-chain Meteora DLMM): {price:.10f} SOL/token")
-            self._onchain_source = "meteora-dlmm"
-        return price, confirmed_absent
-
-    async def _try_onchain_fallback(self) -> tuple[Optional[float], bool, bool]:
-        """Consulta puntual a los fallbacks on-chain, en dos pasos:
-
-        1. PumpSwap (ver PumpSwapOnChainClient): si aparece un pool con
-           precio válido, el mint ya migró de verdad -se usa ese precio.
-
-        2. Si PumpSwap confirma que NO hay pool (`pool_confirmed_absent`
-           -el mint sigue en bonding curve), en vez de simplemente
-           volver a esperar a ciegas el feed en vivo -que es
-           precisamente el que no está entregando nada-, leemos el
-           precio DIRECTO de la cuenta de la bonding curve on-chain (ver
-           PumpCurveOnChainClient). Si responde con un precio válido
-           (curva todavía no completada), lo usamos como referencia y
-           quedamos en modo polling on-chain por bonding curve para el
-           resto de la posición.
-
-        Devuelve (price, pool_confirmed_absent, mint_not_pumpfun):
-          - price no-None: se resolvió por alguno de los dos fallbacks
-            -`self._onchain_source` queda seteado ("pumpswap",
-            "bondingcurve", "raydium-cpmm" o "meteora-dlmm") para que el monitoreo posterior de la
-            posición (ver _poll_onchain_price_loop) sepa con cuál seguir.
-          - price None, pool_confirmed_absent True, mint_not_pumpfun
-            True: NI el pool de PumpSwap NI la cuenta de bonding curve
-            existen para este mint (ambas consultas respondieron bien y
-            confirmaron ausencia, no un fallo de RPC) -> este mint NUNCA
-            se lanzó en pump.fun (ej. un mint nativo de Raydium/
-            Meteora/otro DEX). No tiene sentido seguir esperando el feed
-            en vivo ni reintentar este fallback: nunca va a aparecer
-            nada aquí. El llamador (_get_reference_price) debería
-            abortar de inmediato en vez de esperar hasta el timeout.
-          - price None, pool_confirmed_absent True, mint_not_pumpfun
-            False: la bonding curve existe pero no dio un precio
-            utilizable (ya completada y el pool de PumpSwap todavía no
-            está indexado, cuenta con datos ilegibles, o falló la
-            consulta on-chain en sí -RPC caído-). El llamador
-            (_get_reference_price) decide si sigue esperando el feed en
-            vivo un ciclo más.
-          - price None, pool_confirmed_absent False: la consulta de
-            PumpSwap en sí no dio ninguna confirmación útil (se
-            encontró un pool pero no se pudo leer, o falló la query) -
-            no hay nada más que probar aquí, el llamador debe abortar en
-            vez de reintentar a ciegas."""
-        onchain = PumpSwapOnChainClient(self.cfg.solana_rpc_url)
-        price, pool_confirmed_absent = await onchain.fetch_price_or_confirm_absent(self.mint)
-        if price is not None:
-            logger.info(f"Precio de referencia (fallback on-chain PumpSwap): {price:.10f} SOL/token")
-            self._onchain_source = "pumpswap"
-            return price, pool_confirmed_absent, False
-
-        if pool_confirmed_absent:
-            curve = PumpCurveOnChainClient(self.cfg.solana_rpc_url)
-            curve_price, complete, exists = await curve.fetch_price_or_status(self.mint)
-            if curve_price is not None and not complete:
-                logger.info(f"Precio de referencia (fallback on-chain bonding curve): "
-                            f"{curve_price:.10f} SOL/token")
-                self._onchain_source = "bondingcurve"
-                return curve_price, pool_confirmed_absent, False
-            if exists and complete:
-                # Curva completada sin pool oficial de PumpSwap contra SOL:
-                # o todavía no está indexado, o el pool oficial está
-                # cotizado contra otro token y la liquidez contra SOL vive
-                # en Meteora DLMM (caso real Hg5Ja5...pump, pool contra PUMP).
-                dlmm_price, _ = await self._try_meteora_dlmm()
-                if dlmm_price is not None:
-                    return dlmm_price, pool_confirmed_absent, False
-                logger.debug("[On-chain bonding curve] La curva ya completó (migrando a PumpSwap) "
-                             "pero el pool de PumpSwap todavía no aparece indexado. Reintento en el "
-                             "próximo ciclo.")
-            elif exists is False:
-                # Ni bonding curve ni pool oficial de PumpSwap: no es un
-                # token de pump.fun. Último intento: Raydium CPMM contra
-                # SOL (ej. tokens de bonk.fun/LaunchLab ya graduados).
-                cpmm = RaydiumCpmmOnChainClient(self.cfg.solana_rpc_url)
-                cpmm_price, cpmm_confirmed_absent = await cpmm.fetch_price_or_confirm_absent(self.mint)
-                if cpmm_price is not None:
-                    logger.info(f"Precio de referencia (fallback on-chain Raydium CPMM): "
-                                f"{cpmm_price:.10f} SOL/token")
-                    self._onchain_source = "raydium-cpmm"
-                    return cpmm_price, pool_confirmed_absent, False
-                dlmm_price, dlmm_confirmed_absent = await self._try_meteora_dlmm()
-                if dlmm_price is not None:
-                    return dlmm_price, pool_confirmed_absent, False
-                if cpmm_confirmed_absent and dlmm_confirmed_absent:
-                    # Mensaje de error único para este caso: lo loguea el
-                    # llamador (_get_reference_price._log_mint_not_pumpfun_abort),
-                    # no aquí -de lo contrario saldrían dos ERROR casi
-                    # idénticos para un solo problema (esta comprobación
-                    # normalmente ya lo detectó antes vía
-                    # _confirm_mint_not_pumpfun).
-                    logger.debug(f"[On-chain] {self.mint} no tiene bonding curve de pump.fun, NI pool "
-                                 f"de PumpSwap, NI pool de Raydium CPMM/Meteora DLMM utilizable (todas las consultas "
-                                 f"confirmaron ausencia).")
-                    return price, pool_confirmed_absent, True
-
-        return price, pool_confirmed_absent, False
-
     async def _wait_for_dip_entry(self, reference_price: float, target_price: float) -> Optional[float]:
         """Sólo se llama cuando `entry_dip_pct` > 0 (ver _get_initial_price).
 
@@ -1059,7 +763,7 @@ class TrailingTakeProfitBot:
         _get_reference_price) pero todavía NO compramos con él. Aquí
         seguimos mirando el precio -por el mismo canal que produjo esa
         referencia: el feed en vivo ya suscripto, o polling on-chain si
-        se resolvió por algún fallback (self._onchain_source)- hasta que
+        se resolvió por algún fallback (self.onchain.source)- hasta que
         toque `target_price` o baje de ahí, y ESE es el precio real de
         compra.
 
@@ -1082,13 +786,13 @@ class TrailingTakeProfitBot:
         self.latest_price = reference_price
         last_log = time.monotonic()
 
-        if self._onchain_source is not None:
+        if self.onchain.source is not None:
             while True:
                 if self._shutdown_requested.is_set():
                     logger.info("Cancelado por el usuario mientras se esperaba la baja de entrada.")
                     return None
                 try:
-                    price = await self._onchain_fetch_price()
+                    price = await self.onchain.fetch_price()
                 except Exception as e:
                     logger.warning(f"[On-chain] error puntual esperando la baja de entrada, "
                                    f"reintento en el próximo ciclo: {e}")
@@ -1118,7 +822,7 @@ class TrailingTakeProfitBot:
         #
         # OJO: el log periódico de progreso corre en una tarea de fondo
         # aparte (_dip_progress_logger), NO metiendo un timeout en
-        # _next_trade_event() para "despertarnos" cada tanto. Meterle un
+        # TradeStream.next_event() para "despertarnos" cada tanto. Meterle un
         # timeout ahí cancelaría el __anext__() del generador
         # iter_trade_events en pleno vuelo -y cancelar un async generator
         # a mitad de un await lo deja CERRADO para siempre a nivel de
@@ -1132,8 +836,8 @@ class TrailingTakeProfitBot:
         try:
             while True:
                 try:
-                    event = await self._next_trade_event()
-                except _ShutdownRequested:
+                    event = await self._stream.next_event()
+                except ShutdownRequested:
                     logger.info("Cancelado por el usuario mientras se esperaba la baja de entrada.")
                     return None
                 except asyncio.CancelledError:
@@ -1147,19 +851,7 @@ class TrailingTakeProfitBot:
                     logger.warning(f"[Feed en vivo] {motivo} mientras se esperaba la baja de entrada; "
                                    f"reconectando...")
                     try:
-                        if self._ws is not None:
-                            try:
-                                await self._ws.close()
-                            except Exception:
-                                pass
-                        self._ws = await self.client.connect_trade_stream(self.mint)
-                        self._trade_events = self.client.iter_trade_events(self._ws)
-                        # El generador viejo quedó abandonado de verdad aquí
-                        # (nueva conexión, no un timeout) -cualquier tarea
-                        # pendiente de su __anext__() ya no sirve.
-                        if self._pending_next_event_task is not None:
-                            self._pending_next_event_task.cancel()
-                            self._pending_next_event_task = None
+                        await self._stream.reconnect()
                         logger.info("Reconectado al feed de trades de PumpPortal.")
                         continue
                     except Exception as e2:
@@ -1217,8 +909,8 @@ class TrailingTakeProfitBot:
         mint, no hay forma de enterarse de nuevos precios por el feed en
         vivo -así que se consulta on-chain cada
         `onchain_poll_interval_seconds` mientras la posición siga
-        abierta (bonding curve o PumpSwap, según `self._onchain_source`
-        -ver _onchain_fetch_price, que también se encarga de pasar de
+        abierta (bonding curve o PumpSwap, según `self.onchain.source`
+        -ver OnchainFallback.fetch_price, que también se encarga de pasar de
         "bondingcurve" a "pumpswap" solo si la curva completa a mitad
         de este loop), y se alimenta al mismo _on_price_update() que
         usaría el feed en vivo (misma lógica de trailing-stop/stop-loss,
@@ -1231,7 +923,7 @@ class TrailingTakeProfitBot:
         ciclo."""
         while self.position is not None and not self.position.closed:
             try:
-                price = await self._onchain_fetch_price()
+                price = await self.onchain.fetch_price()
                 if price is not None and price > 0:
                     self.latest_price = price
                     await self._on_price_update(price)
@@ -1280,7 +972,7 @@ class TrailingTakeProfitBot:
                     if self.position is None or self.position.closed:
                         return
                     try:
-                        event = await self._next_trade_event(timeout=self.cfg.stall_timeout_seconds)
+                        event = await self._stream.next_event(timeout=self.cfg.stall_timeout_seconds)
                     except TimeoutError:
                         if await self._handle_feed_stall():
                             return  # migró: _handle_feed_stall ya corrió el polling on-chain hasta el cierre
@@ -1295,7 +987,7 @@ class TrailingTakeProfitBot:
                     # no cuentan como "el feed está muerto para este mint".
                     self._curve_stalls = 0
                 # (inalcanzable: el while True interno solo se sale por return)
-            except _ShutdownRequested:
+            except ShutdownRequested:
                 return
             except StopAsyncIteration:
                 # La conexión se cerró de forma "limpia" del lado del server.
@@ -1316,17 +1008,7 @@ class TrailingTakeProfitBot:
             backoff = min(backoff * 2, max_backoff)
 
             try:
-                if self._ws is not None:
-                    try:
-                        await self._ws.close()
-                    except Exception:
-                        pass
-                self._ws = await self.client.connect_trade_stream(self.mint)
-                self._trade_events = self.client.iter_trade_events(self._ws)
-                # Idem: generador viejo abandonado de verdad, no por timeout.
-                if self._pending_next_event_task is not None:
-                    self._pending_next_event_task.cancel()
-                    self._pending_next_event_task = None
+                await self._stream.reconnect()
                 logger.info("Reconectado al feed de trades de PumpPortal.")
             except Exception as e:
                 logger.warning(f"No se pudo reconectar todavía: {e}. Reintento en {backoff:.0f}s...")
@@ -1339,7 +1021,7 @@ class TrailingTakeProfitBot:
           1. Primero comprueba si hay un pool de PumpSwap con precio
              válido -es una migración real (no solo una pausa de
              volumen). Si lo hay: aplica ese precio de inmediato, marca
-             `_onchain_source = "pumpswap"` y corre el polling on-chain
+             `onchain.source = "pumpswap"` y corre el polling on-chain
              (_poll_onchain_price_loop) hasta que la posición se cierre
              -> devuelve True (el llamador debe dejar de esperar el
              feed en vivo, que ya sabemos que no va a entregar nada más
@@ -1363,15 +1045,14 @@ class TrailingTakeProfitBot:
              momentáneo -> devuelve False sin tocar el precio."""
         if self.position is None or self.position.closed:
             return True
-        onchain = PumpSwapOnChainClient(self.cfg.solana_rpc_url)
-        price = await onchain.fetch_price_for_migrated_mint(self.mint)
+        price = await self.onchain.migrated_price()
         if price is not None and price > 0:
             logger.warning(f"[Feed de trades de PumpPortal] sin trades nuevos hace "
                            f"{self.cfg.stall_timeout_seconds:.0f}s y se confirmó un pool de PumpSwap "
                            f"con precio válido -> el mint migró a mitad de la posición "
                            f"(subscribeTokenTrade no lo va a cubrir más). Paso a polling on-chain cada "
                            f"{self.cfg.onchain_poll_interval_seconds:.0f}s para no perder el precio.")
-            self._onchain_source = "pumpswap"
+            self.onchain.source = "pumpswap"
             self.latest_price = price
             await self._on_price_update(price)
             if self.position is None or self.position.closed:
@@ -1379,8 +1060,7 @@ class TrailingTakeProfitBot:
             await self._poll_onchain_price_loop()
             return True
 
-        curve = PumpCurveOnChainClient(self.cfg.solana_rpc_url)
-        curve_price, complete, _exists = await curve.fetch_price_or_status(self.mint)
+        curve_price, complete, _exists = await self.onchain.curve_status()
         if curve_price is not None and not complete:
             self._curve_stalls += 1
             if self._curve_stalls >= _MAX_CURVE_STALLS_BEFORE_POLLING:
@@ -1396,7 +1076,7 @@ class TrailingTakeProfitBot:
                                f"bonding curve todavía activa -> dejo de depender del feed en vivo "
                                f"para esta posición y paso a leer el precio de la curva on-chain cada "
                                f"{self.cfg.onchain_poll_interval_seconds:.0f}s.")
-                self._onchain_source = "bondingcurve"
+                self.onchain.source = "bondingcurve"
                 self.latest_price = curve_price
                 await self._on_price_update(curve_price)
                 if self.position is None or self.position.closed:
@@ -1460,8 +1140,8 @@ class TrailingTakeProfitBot:
             "finished_at": self.finished_at,
             "latest_price": price,
             # "feed" = subscribeTokenTrade en vivo; si no, qué fallback
-            # on-chain está dando el precio (ver _onchain_source).
-            "price_source": self._onchain_source or "feed",
+            # on-chain está dando el precio (ver OnchainFallback.source).
+            "price_source": self.onchain.source or "feed",
             "entry_target_price": self._dip_target,
             "entry_reference_price": self._dip_reference,
             "settings": {
@@ -1588,39 +1268,8 @@ class TrailingTakeProfitBot:
                                   f"precio {self.latest_price:.10f} | entrada {pos.market_entry_price:.10f}"
                                   f"{coste} | mercado: {pnl:+.2f}%{neto}")
 
-    def _current_pool_override(self) -> Optional[str]:
-        """Si ya confirmamos -sea al entrar (_try_onchain_fallback) o a
-        mitad de posición (_handle_feed_stall)- que este mint migró de
-        la bonding curve a PumpSwap, hay que decírselo explícito a la
-        Lightning API con pool="pump-amm" en vez de confiar en
-        self.cfg.pool="auto".
-
-        Motivo: pool="auto" le pide a PumpPortal que resuelva solo por
-        dónde rutear la orden, y esa resolución puede quedar pisada con
-        la bonding curve vieja para un mint recién migrado. Ahí la orden
-        revierte on-chain con el error 6005 (BondingCurveComplete) del
-        programa Pump, porque esa curva ya no existe para este mint -
-        aunque nosotros ya confirmamos el pool de PumpSwap on-chain.
-
-        OJO: esto es DISTINTO de `self._onchain_source == "bondingcurve"`
-        -ese caso es el mint SIGUE en bonding curve (solo cambió de
-        dónde sacamos el precio, no de dónde hay que rutear el trade),
-        así que ahí NO hay que overridear nada -> None, se deja que
-        cfg.pool decida como siempre. Overridear a "pump-amm" en ese
-        caso rompería exactamente el mismo BondingCurveComplete que este
-        override existe para evitar, pero al revés."""
-        # Raydium CPMM: se rutea explícito al mismo tipo de pool del que
-        # sacamos el precio, en vez de dejar que "auto" lo adivine.
-        # Meteora DLMM: la Lightning API no tiene un pool "meteora", así que
-        # se fuerza "auto" (aunque cfg.pool diga otra cosa) y PumpPortal
-        # decide por dónde rutear.
-        if self._onchain_source is None:
-            return None
-        return {"pumpswap": "pump-amm", "raydium-cpmm": "raydium-cpmm",
-                "meteora-dlmm": "auto"}.get(self._onchain_source)
-
     async def _on_first_price(self, price: float) -> None:
-        self.position = await self.executor.buy(self.mint, price, pool_override=self._current_pool_override())
+        self.position = await self.executor.buy(self.mint, price, pool_override=self.onchain.pool_override())
         self._update_panel_fixed()
         logger.info(f"Activación del trailing-stop: +{self.cfg.activation_pct}% "
                     f"| ancho del trailing una vez armado: {self.cfg.trailing_pct}% "
@@ -1670,7 +1319,7 @@ class TrailingTakeProfitBot:
             if pos.closed:
                 return
             try:
-                await self.executor.sell(pos, price, reason, pool_override=self._current_pool_override())
+                await self.executor.sell(pos, price, reason, pool_override=self.onchain.pool_override())
             except Exception as e:
                 logger.warning(f"⚠️  Venta fallida ({reason}): {e}. La posición SIGUE ABIERTA, "
                                f"se reintentará con el próximo precio que llegue.")

@@ -55,7 +55,7 @@ async def test_run_happy_path_buys_and_closes_when_stop_loss_hits():
     assert executor.buy_calls == 1
     assert executor.sell_calls == 1
     assert bot.position.closed is True
-    assert bot._ws.close_calls == 1  # el socket se cierra ordenadamente en el finally
+    assert bot._stream.ws.close_calls == 1  # el socket se cierra ordenadamente en el finally
 
 
 async def test_run_cancels_monitor_before_selling_on_shutdown():

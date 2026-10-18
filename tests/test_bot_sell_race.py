@@ -20,8 +20,7 @@ def test_entry_dip_pct_zero_compra_en_la_referencia():
     bot = TrailingTakeProfitBot(client, executor, cfg)
 
     async def scenario():
-        bot._ws = await client.connect_trade_stream(cfg.mint)
-        bot._trade_events = client.iter_trade_events(bot._ws)
+        await bot._stream.connect()
         return await bot._get_initial_price()
 
     price = asyncio.run(scenario())
@@ -43,8 +42,7 @@ def test_entry_dip_pct_espera_la_baja_antes_de_entrar():
     bot = TrailingTakeProfitBot(client, executor, cfg)
 
     async def scenario():
-        bot._ws = await client.connect_trade_stream(cfg.mint)
-        bot._trade_events = client.iter_trade_events(bot._ws)
+        await bot._stream.connect()
         return await bot._get_initial_price()
 
     price = asyncio.run(scenario())
@@ -64,8 +62,7 @@ def test_entry_dip_pct_reconecta_si_se_corta_mientras_espera_la_baja():
     bot = TrailingTakeProfitBot(client, executor, cfg)
 
     async def scenario():
-        bot._ws = await client.connect_trade_stream(cfg.mint)
-        bot._trade_events = client.iter_trade_events(bot._ws)
+        await bot._stream.connect()
         return await bot._get_initial_price()
 
     price = asyncio.run(scenario())

@@ -149,12 +149,12 @@ class _RaydiumCpmmSinPools:
 
 @pytest.fixture(autouse=True)
 def _sin_raydium_cpmm_real(monkeypatch):
-    """Ningún test de bot.py le pega al RPC real de Raydium CPMM ni de
+    """Ningún test del bot le pega al RPC real de Raydium CPMM ni de
     Meteora DLMM por accidente: por defecto 'no hay pool'. Los tests que
     necesitan otra cosa lo pisan con su propio monkeypatch."""
-    from pepump import bot as bot_module
-    monkeypatch.setattr(bot_module, "RaydiumCpmmOnChainClient", _RaydiumCpmmSinPools)
-    monkeypatch.setattr(bot_module, "MeteoraDlmmOnChainClient", _RaydiumCpmmSinPools)
+    from pepump.onchain import fallback as fallback_module
+    monkeypatch.setattr(fallback_module, "RaydiumCpmmOnChainClient", _RaydiumCpmmSinPools)
+    monkeypatch.setattr(fallback_module, "MeteoraDlmmOnChainClient", _RaydiumCpmmSinPools)
 
 
 @pytest.fixture

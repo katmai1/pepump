@@ -21,8 +21,7 @@ def test_entry_dip_pct_zero_compra_en_la_referencia():
     bot = TrailingTakeProfitBot(client, executor, cfg)
 
     async def scenario():
-        bot._ws = await client.connect_trade_stream(cfg.mint)
-        bot._trade_events = client.iter_trade_events(bot._ws)
+        await bot._stream.connect()
         return await bot._get_initial_price()
 
     price = asyncio.run(scenario())
@@ -44,8 +43,7 @@ def test_entry_dip_pct_espera_la_baja_antes_de_entrar():
     bot = TrailingTakeProfitBot(client, executor, cfg)
 
     async def scenario():
-        bot._ws = await client.connect_trade_stream(cfg.mint)
-        bot._trade_events = client.iter_trade_events(bot._ws)
+        await bot._stream.connect()
         return await bot._get_initial_price()
 
     price = asyncio.run(scenario())
@@ -65,8 +63,7 @@ def test_entry_dip_pct_reconecta_si_se_corta_mientras_espera_la_baja():
     bot = TrailingTakeProfitBot(client, executor, cfg)
 
     async def scenario():
-        bot._ws = await client.connect_trade_stream(cfg.mint)
-        bot._trade_events = client.iter_trade_events(bot._ws)
+        await bot._stream.connect()
         return await bot._get_initial_price()
 
     price = asyncio.run(scenario())
@@ -97,8 +94,7 @@ def test_entry_dip_pct_reconecta_ante_un_error_de_red_no_limpio(caplog):
     bot = TrailingTakeProfitBot(client, executor, cfg)
 
     async def scenario():
-        bot._ws = await client.connect_trade_stream(cfg.mint)
-        bot._trade_events = client.iter_trade_events(bot._ws)
+        await bot._stream.connect()
         return await bot._get_initial_price()
 
     with caplog.at_level(logging.WARNING):
@@ -177,8 +173,7 @@ def test_entry_dip_pct_loguea_progreso_periodicamente_end_to_end(caplog):
     bot = TrailingTakeProfitBot(client, executor, cfg)
 
     async def scenario():
-        bot._ws = await client.connect_trade_stream(cfg.mint)
-        bot._trade_events = client.iter_trade_events(bot._ws)
+        await bot._stream.connect()
         return await bot._get_initial_price()
 
     with caplog.at_level(logging.INFO):

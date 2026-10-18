@@ -244,7 +244,7 @@ class PositionManager:
             "status": status,
             "token_name": bot.token_name,
             "token_symbol": bot.token_symbol,
-            "onchain_source": bot._onchain_source,
+            "onchain_source": bot.onchain.source,
             "end_reason": bot.end_reason,
         }
         if pos is not None:
