@@ -529,3 +529,24 @@ def test_sin_account_index_no_se_descuenta_rent(monkeypatch):
     resp = _make_resp(sol_delta_lamports=-50_500_000, pre_tokens=None, post_tokens=1_234.5)
     fill = _fill(monkeypatch, resp)
     assert fill["rent_paid_sol"] == 0.0 and fill["rent_refund_sol"] == 0.0
+
+
+
+def test_la_ruta_por_tokens_intermedios_cuenta_su_rent_y_sus_mints(monkeypatch):
+    """Caso real: SOL -> USDC -> TTWO -> Macca por Jupiter creó cuentas de
+    USDC y TTWO en la wallet (y las dejó abiertas): su rent tampoco es coste."""
+    usdc, ttwo = "USDC" + "1" * 40, "TTWO" + "1" * 40
+    meta = FakeMeta(
+        pre_balances=[1_000_000_000, 0, 0, 0],
+        post_balances=[965_429_107, 1_513_840, 1_488_440, 1_559_560],
+        pre_token_balances=[],
+        post_token_balances=[FakeTokenBalance(MINT, WALLET, 13719.75, 1),
+                             FakeTokenBalance(usdc, WALLET, 0.0, 2),
+                             FakeTokenBalance(ttwo, WALLET, 0.0, 3)],
+    )
+    resp = FakeGetTransactionResp(FakeConfirmedTx(meta, [WALLET, "A", "B", "C"]))
+
+    fill = _fill(monkeypatch, resp)
+
+    assert fill["rent_paid_sol"] == pytest.approx(0.00456184)
+    assert fill["created_mints"] == sorted([MINT, usdc, ttwo])

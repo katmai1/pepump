@@ -58,16 +58,24 @@ class TokenAccountCloser:
         """Cuentas de token de la wallet con saldo 0 (de `mint`, o todas) que
         se pueden cerrar. Se saltan las congeladas y las de Token-2022 con
         comisiones de transferencia retenidas: el programa no deja cerrarlas."""
+        vacias, _con_saldo = await self._scan(mint)
+        return vacias
+
+    async def _scan(self, mint: Optional[str]) -> tuple[list[EmptyTokenAccount], int]:
+        """(cuentas vacías cerrables, cuentas con saldo) de `mint`, o de todos."""
         owner = self.keypair.pubkey()
         filtros = ([TokenAccountOpts(mint=Pubkey.from_string(mint))] if mint else
                    [TokenAccountOpts(program_id=TOKEN_PROGRAM_ID), TokenAccountOpts(program_id=TOKEN_2022_PROGRAM_ID)])
-        vacias = []
+        vacias, con_saldo = [], 0
         async with AsyncClient(self.rpc_url) as client:
             for opts in filtros:
                 resp = await client.get_token_accounts_by_owner_json_parsed(owner, opts, commitment=Confirmed)
                 for acc in resp.value:
                     info: Any = acc.account.data.parsed["info"]
-                    if str(info["tokenAmount"].get("amount")) != "0" or info.get("state") == "frozen":
+                    if str(info["tokenAmount"].get("amount")) != "0":
+                        con_saldo += 1
+                        continue
+                    if info.get("state") == "frozen":
                         continue
                     if _withheld_fees(info) > 0:
                         logger.debug(f"[Cuentas de token] {acc.pubkey} tiene comisiones retenidas; no se "
@@ -75,14 +83,29 @@ class TokenAccountCloser:
                         continue
                     vacias.append(EmptyTokenAccount(acc.pubkey, acc.account.owner, info["mint"],
                                                     acc.account.lamports))
-        return vacias
+        return vacias, con_saldo
 
     async def close_empty(self, mint: Optional[str] = None) -> tuple[float, int, int]:
         """Cierra las cuentas vacías (de `mint`, o todas). Devuelve (SOL
         recuperados netos del fee de las tx, cuentas cerradas, cuentas que no
         se pudieron cerrar). Una cuenta que no se deja cerrar no impide cerrar
         las demás; el motivo va al log en DEBUG y quien llama decide si avisa."""
-        cuentas = await self.find_empty(mint)
+        return await self._close_accounts(await self.find_empty(mint))
+
+    async def close_after_sale(self, mint: str, route_mints=()) -> tuple[float, int, int, bool]:
+        """Tras vender todo `mint`: cierra su cuenta y las de los tokens
+        intermedios de la ruta (`route_mints`) que hayan quedado vacías.
+        Devuelve (recuperado, cerradas, fallidas, pendiente): `pendiente` es
+        True si la cuenta de `mint` todavía tiene saldo para el nodo (aún no
+        ve la venta), y entonces conviene reintentar."""
+        vacias, con_saldo = await self._scan(mint)
+        for otro in sorted(set(route_mints) - {mint}):
+            # Sus cuentas con saldo (p. ej. USDC propios) no se tocan.
+            vacias.extend((await self._scan(otro))[0])
+        recuperado, cerradas, fallidas = await self._close_accounts(vacias)
+        return recuperado, cerradas, fallidas, con_saldo > 0
+
+    async def _close_accounts(self, cuentas: list[EmptyTokenAccount]) -> tuple[float, int, int]:
         recuperado, cerradas, fallidas = 0, 0, 0
         for i in range(0, len(cuentas), self.MAX_CLOSES_PER_TX):
             lote = cuentas[i:i + self.MAX_CLOSES_PER_TX]

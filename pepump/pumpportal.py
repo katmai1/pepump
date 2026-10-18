@@ -277,6 +277,7 @@ class PumpPortalClient:
             data["actual_token_delta"] = fill["token_delta"]
             data["actual_rent_paid_sol"] = fill.get("rent_paid_sol", 0.0)
             data["actual_rent_refund_sol"] = fill.get("rent_refund_sol", 0.0)
+            data["actual_created_mints"] = fill.get("created_mints", [])
         else:
             logger.warning(f"[REAL] No se pudieron leer los datos reales de fill de la tx "
                             f"{signature}; se van a usar los valores estimados para esta operación.")

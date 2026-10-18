@@ -648,11 +648,22 @@ class TrailingTakeProfitBot:
         try:
             while True:
                 if existence_check_task is not None and existence_check_task.done():
-                    early_price, mint_not_pumpfun = existence_check_task.result()
+                    early_price, early_status = existence_check_task.result()
                     existence_check_task = None
                     if early_price is not None:
                         return early_price
-                    if mint_not_pumpfun:
+                    if early_status == "no_sol_pool":
+                        # Si Jupiter no tiene ruta, se sigue esperando: puede
+                        # ser un pool recién migrado que aún no aparece.
+                        price = await self._jupiter_reference()
+                        if price is not None:
+                            return price
+                        if self.onchain.jupiter is None:
+                            logger.warning("La curva de pump.fun ya completó y no hay pool contra SOL: o "
+                                           "acaba de migrar y el pool aún no aparece, o cotiza contra otro "
+                                           "token. En ese caso, con jupiter_api_key se podría operar por "
+                                           "Jupiter. Sigo esperando...")
+                    if early_status == "not_listed":
                         price = await self._jupiter_reference()
                         if price is not None:
                             return price
@@ -783,7 +794,7 @@ class TrailingTakeProfitBot:
             logger.error("Este token solo se puede operar por Jupiter, y para hacerlo en REAL falta la "
                          "clave privada de la wallet (wallet_private_key en [jupiter] del .toml).")
             return None
-        logger.info("No cotiza contra SOL en pump.fun, PumpSwap, Raydium CPMM ni Meteora DLMM: "
+        logger.info("No cotiza contra SOL en pump.fun, PumpSwap, Raydium CPMM ni Meteora: "
                     "pruebo con Jupiter...")
         return await self.onchain.resolve_jupiter(self.cfg.buy_sol)
 

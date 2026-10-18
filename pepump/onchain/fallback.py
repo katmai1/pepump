@@ -99,10 +99,10 @@ class OnchainFallback:
         onchain = PumpSwapOnChainClient(self.rpc_url)
         return await onchain.fetch_price_for_migrated_mint(self.mint)
 
-    async def early_resolve(self) -> tuple[Optional[float], bool]:
+    async def early_resolve(self) -> tuple[Optional[float], Optional[str]]:
         """Consulta temprana, en paralelo con la espera del feed en vivo
         desde el arranque de bot._get_reference_price: ¿dónde cotiza este
-        mint? Devuelve (price, not_listed):
+        mint? Devuelve (price, status):
 
           - price no-None: el mint ya no está en la curva de pump.fun (migró
             a PumpSwap) o no es de pump.fun y cotiza contra SOL en Raydium
@@ -110,25 +110,29 @@ class OnchainFallback:
             precio YA: el feed de PumpPortal no cubre esos pools, y esperar
             `live_feed_timeout_seconds` a que no llegue nada era perder
             tiempo.
-          - not_listed True: TODAS las consultas respondieron bien y
+          - status "not_listed": TODAS las consultas respondieron bien y
             confirmaron que no está en ningún sitio (nunca ante un fallo de
             RPC, para no abortar una entrada válida por un problema
             transitorio de conexión).
-          - (None, False): sigue en la curva de pump.fun (el feed es la
-            fuente), la curva completó y el pool aún no aparece, o no se
+          - status "no_sol_pool": la curva de pump.fun completó y no hay
+            pool contra SOL. O el pool aún no aparece (recién migrado), o el
+            pool oficial cotiza contra otro token: pump.fun ya lo permite
+            (caso real AKotzk...pump, en PumpSwap contra TTWO). Ahí solo
+            queda Jupiter.
+          - (None, None): sigue en la curva (el feed es la fuente) o no se
             pudo saber: se sigue esperando el feed como siempre."""
         swap = PumpSwapOnChainClient(self.rpc_url)
         price, pool_confirmed_absent = await swap.fetch_price_or_confirm_absent(self.mint)
         if price is not None:
             logger.info(f"Precio de referencia (on-chain PumpSwap, el token ya migró): {price:.10f} SOL/token")
             self.source = "pumpswap"
-            return price, False
+            return price, None
         if not pool_confirmed_absent:
-            return None, False
+            return None, None
         curve = PumpCurveOnChainClient(self.rpc_url)
         _, complete, exists = await curve.fetch_price_or_status(self.mint)
         if exists is None or (exists and not complete):
-            return None, False
+            return None, None
         cpmm_confirmed_absent = True
         if exists is False:
             cpmm = RaydiumCpmmOnChainClient(self.rpc_url)
@@ -136,11 +140,13 @@ class OnchainFallback:
             if cpmm_price is not None:
                 logger.info(f"Precio de referencia (on-chain Raydium CPMM): {cpmm_price:.10f} SOL/token")
                 self.source = "raydium-cpmm"
-                return cpmm_price, False
+                return cpmm_price, None
         meteora_price, meteora_confirmed_absent = await self._try_meteora()
         if meteora_price is not None:
-            return meteora_price, False
-        return None, exists is False and cpmm_confirmed_absent and meteora_confirmed_absent
+            return meteora_price, None
+        if exists:
+            return None, "no_sol_pool"
+        return None, "not_listed" if cpmm_confirmed_absent and meteora_confirmed_absent else None
 
     async def _best_meteora(self) -> tuple[Optional[tuple[str, float]], bool]:
         """Mejor pool de Meteora contra SOL entre DLMM y DAMM v2: el de más

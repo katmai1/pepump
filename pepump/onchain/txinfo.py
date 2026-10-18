@@ -197,26 +197,35 @@ def _wallet_token_delta(meta, mint: str, wallet: str) -> Optional[float]:
     return (post_tokens or 0.0) - (pre_tokens or 0.0)
 
 
-def _token_account_rent(meta, mint: str, wallet: str) -> tuple[float, float]:
-    """(rent pagado, rent devuelto), en SOL, por la cuenta de `mint` de LA
-    WALLET en esta tx: si la tx la creó (no está en los token balances de
-    antes y sí en los de después), pagó sus lamports; si la cerró (al
-    revés), se los devolvió. Es parte de sol_delta, pero no es coste de
-    la operación: el rent de una cuenta vuelve al cerrarla.
+def _token_account_rent(meta, wallet: str) -> tuple[float, float, list]:
+    """(rent pagado, rent devuelto, mints de las cuentas creadas), en SOL,
+    por las cuentas de token de LA WALLET en esta tx: si la tx creó una (no
+    está en los token balances de antes y sí en los de después), pagó sus
+    lamports; si la cerró (al revés), se los devolvió. Es parte de
+    sol_delta, pero no es coste de la operación: el rent vuelve al cerrarla.
+
+    De TODAS las cuentas de la wallet, no solo la del token que se compra:
+    una ruta de Jupiter por tokens intermedios crea también sus cuentas y
+    las deja abiertas y vacías (caso real: SOL -> USDC -> TTWO -> Macca dejó
+    0.003 SOL de rent en las de USDC y TTWO, un 10% de una compra de 0.03
+    SOL, contado como coste). Las cuentas que se crean y se cierran dentro
+    de la misma tx (el WSOL temporal) no aparecen y no cuentan.
 
     Exacto (los lamports de esa cuenta en la propia tx), no la constante de
     una cuenta SPL: las de Token-2022 con extensiones cuestan algo más. 0.0
     de cada lado si no se puede saber (el nodo no manda `owner` o
     `account_index`): entonces se trata como coste, como antes."""
-    def nuestras(balances) -> set:
-        return {b.account_index for b in (balances or [])
-                if str(b.mint) == mint and getattr(b, "owner", None) is not None
-                and str(b.owner) == wallet and getattr(b, "account_index", None) is not None}
+    def nuestras(balances) -> dict:
+        return {b.account_index: str(b.mint) for b in (balances or [])
+                if getattr(b, "owner", None) is not None and str(b.owner) == wallet
+                and getattr(b, "account_index", None) is not None}
 
     pre, post = nuestras(meta.pre_token_balances), nuestras(meta.post_token_balances)
-    pagado = sum(meta.post_balances[i] for i in post - pre if i < len(meta.post_balances))
-    devuelto = sum(meta.pre_balances[i] for i in pre - post if i < len(meta.pre_balances))
-    return pagado / 1_000_000_000.0, devuelto / 1_000_000_000.0
+    creadas = [i for i in post.keys() - pre.keys() if i < len(meta.post_balances)]
+    cerradas = [i for i in pre.keys() - post.keys() if i < len(meta.pre_balances)]
+    pagado = sum(meta.post_balances[i] for i in creadas)
+    devuelto = sum(meta.pre_balances[i] for i in cerradas)
+    return pagado / 1_000_000_000.0, devuelto / 1_000_000_000.0, sorted({post[i] for i in creadas})
 
 
 async def fetch_actual_fill(signature: str, rpc_url: str, mint: str,
@@ -252,7 +261,9 @@ async def fetch_actual_fill(signature: str, rpc_url: str, mint: str,
       - token_delta: tokens del `mint` ganados (positivo) o gastados
         (negativo) por la wallet, en unidades de token (no raw/atomic).
       - rent_paid_sol / rent_refund_sol: la parte de sol_delta que es rent
-        de la cuenta del token (ver _token_account_rent).
+        de las cuentas de token de la wallet (ver _token_account_rent).
+      - created_mints: mints de las cuentas de token que la tx creó en la
+        wallet y siguen abiertas (el del token y los intermedios de la ruta).
 
     `max_attempts`/`retry_delay_seconds`: get_transaction puede no
     encontrar todavía la tx (resp.value/transaction en None) aunque
@@ -310,9 +321,9 @@ async def fetch_actual_fill(signature: str, rpc_url: str, mint: str,
             if token_delta is None:
                 return None
 
-            rent_paid, rent_refund = _token_account_rent(meta, mint, payer)
+            rent_paid, rent_refund, created_mints = _token_account_rent(meta, payer)
             return {"sol_delta": sol_delta, "token_delta": token_delta, "rent_paid_sol": rent_paid,
-                    "rent_refund_sol": rent_refund, "wallet": payer}
+                    "rent_refund_sol": rent_refund, "created_mints": created_mints, "wallet": payer}
         except Exception as e:
             if attempt < max_attempts:
                 await asyncio.sleep(retry_delay_seconds)

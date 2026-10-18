@@ -578,3 +578,55 @@ def test_jupiter_for_all_sin_api_key_avisa(caplog):
 def test_jupiter_for_all_sin_clave_avisa_que_en_real_va_por_pumpportal(caplog):
     build_jupiter_client(make_config(jupiter_api_key="jup", jupiter_for_all=True))
     assert "en REAL las órdenes siguen yendo por PumpPortal" in caplog.text
+
+
+# --------------------------------------------------------------------------- #
+# Curva completada sin pool contra SOL (pool oficial contra otro token)
+# --------------------------------------------------------------------------- #
+
+class _CurvaCompletada:
+    def __init__(self, rpc_url):
+        pass
+
+    async def fetch_price_or_status(self, mint):
+        return None, True, True
+
+
+@pytest.fixture
+def _migrado_contra_otro_token(monkeypatch):
+    """Caso real AKotzk...pump (Macca): curva completada, pool de PumpSwap
+    contra TTWO (no contra SOL) y solo pools de relleno en Meteora."""
+    monkeypatch.setattr(fallback_module, "PumpSwapOnChainClient", _SinNada)
+    monkeypatch.setattr(fallback_module, "PumpCurveOnChainClient", _CurvaCompletada)
+
+
+def test_curva_completada_sin_pool_contra_sol_entra_por_jupiter(_migrado_contra_otro_token):
+    bot = _bot(make_config(live_feed_timeout_seconds=5.0), FakeJupiter(tokens=1000.0, price=0.00002))
+
+    start = time.monotonic()
+    price = asyncio.run(asyncio.wait_for(bot._get_reference_price(), timeout=5))
+
+    assert price == 0.00002
+    assert bot.onchain.source == "jupiter"
+    assert time.monotonic() - start < 1.0  # sin esperar al feed
+
+
+def test_curva_completada_sin_ruta_en_jupiter_sigue_esperando(_migrado_contra_otro_token):
+    """Puede ser un token recién migrado cuyo pool aún no aparece: no se
+    aborta enseguida, se sigue esperando como siempre."""
+    bot = _bot(make_config(live_feed_timeout_seconds=0.05, entry_wait_timeout_seconds=0.4),
+               FakeJupiter(fail_quote=True))
+
+    start = time.monotonic()
+    price = asyncio.run(asyncio.wait_for(bot._get_reference_price(), timeout=5))
+
+    assert price is None
+    assert time.monotonic() - start >= 0.4
+
+
+def test_curva_completada_sin_jupiter_avisa(_migrado_contra_otro_token, caplog):
+    bot = _bot(make_config(live_feed_timeout_seconds=0.05, entry_wait_timeout_seconds=0.2), None)
+
+    asyncio.run(asyncio.wait_for(bot._get_reference_price(), timeout=5))
+
+    assert "con jupiter_api_key se podría operar por Jupiter" in caplog.text

@@ -337,6 +337,7 @@ class JupiterClient:
             result["actual_token_delta"] = fill["token_delta"]
             result["actual_rent_paid_sol"] = fill.get("rent_paid_sol", 0.0)
             result["actual_rent_refund_sol"] = fill.get("rent_refund_sol", 0.0)
+            result["actual_created_mints"] = fill.get("created_mints", [])
         else:
             logger.warning(f"[Jupiter] No se pudieron leer los datos reales de fill de {signature}; "
                            f"se usa el estimado.")

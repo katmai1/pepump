@@ -158,16 +158,17 @@ class FakeLightning:
 
 
 class FakeCloser:
-    """`results`: lo que devuelve cada llamada, (recuperado, cerradas,
-    fallidas); se queda en el último. `fail`: todas lanzan."""
+    """`results`: lo que devuelve cada llamada a close_after_sale,
+    (recuperado, cerradas, fallidas, pendiente); se queda en el último.
+    `fail`: todas lanzan."""
 
     def __init__(self, recovered=0.00150884, fail=False, results=None):
-        self.results = results or [(recovered, 1, 0)]
+        self.results = results or [(recovered, 1, 0, False)]
         self.fail = fail
         self.calls = []
 
-    async def close_empty(self, mint=None):
-        self.calls.append(mint)
+    async def close_after_sale(self, mint, route_mints=()):
+        self.calls.append((mint, set(route_mints)))
         if self.fail:
             raise RuntimeError("RPC caído (fake)")
         return self.results[min(len(self.calls), len(self.results)) - 1]
@@ -187,18 +188,38 @@ def test_el_caso_real_cierra_la_cuenta_y_el_historial_sale_en_positivo(tmp_path)
     pos = _sell({"signature": "S", "actual_sol_delta": 0.0235873, "actual_token_delta": -15459.484669},
                 closer, tmp_path)
 
-    assert closer.calls == [MINT]
+    assert closer.calls == [(MINT, set())]
     assert pos.proceeds_sol == pytest.approx(0.0235873 + 0.00150884)
     assert pos.realized_pnl_sol > 0
     # El precio de salida no cuenta el rent.
     assert pos.exit_price == pytest.approx(0.0235873 / 15459.484669)
 
 
-def test_si_la_venta_ya_cerro_la_cuenta_no_hace_nada(tmp_path):
-    closer = FakeCloser()
-    _sell({"signature": "S", "actual_sol_delta": 0.025, "actual_token_delta": -15459.484669,
-           "actual_rent_refund_sol": 0.0015}, closer, tmp_path)
-    assert closer.calls == []
+def test_si_la_venta_ya_cerro_la_cuenta_no_hay_nada_mas_que_recuperar(tmp_path):
+    closer = FakeCloser(results=[(0.0, 0, 0, False)])
+    pos = _sell({"signature": "S", "actual_sol_delta": 0.025, "actual_token_delta": -15459.484669,
+                 "actual_rent_refund_sol": 0.0015}, closer, tmp_path)
+    assert len(closer.calls) == 1  # sin reintentos: no queda nada pendiente
+    assert pos.proceeds_sol == pytest.approx(0.025)
+
+
+def test_cierra_tambien_las_cuentas_intermedias_de_la_ruta(tmp_path):
+    """Caso real: SOL -> USDC -> TTWO -> Macca por Jupiter dejó abiertas
+    las cuentas de USDC y TTWO (0.003 SOL de rent)."""
+    usdc, ttwo, otro = "USDC" + "1" * 40, "TTWO" + "1" * 40, "Otro" + "1" * 40
+    closer = FakeCloser(results=[(0.00454, 3, 0, False)])
+    cfg = make_config(live=True, trade_history_csv=str(tmp_path / "h.csv"))
+    executor = TradeExecutor(client=FakeLightning({"signature": "S", "actual_sol_delta": 0.034,
+                                                   "actual_token_delta": -1000.0,
+                                                   "actual_created_mints": [otro]}),
+                             live=True, config=cfg, closer=closer)
+    pos = Position(mint=MINT, entry_price=2e-6, sol_amount=0.0345, token_amount=1000.0,
+                   route_mints=[usdc, ttwo])
+
+    asyncio.run(executor.sell(pos, 2e-6, "trailing"))
+
+    assert closer.calls == [(MINT, {usdc, ttwo, otro})]
+    assert pos.proceeds_sol == pytest.approx(0.034 + 0.00454)
 
 
 def test_si_el_cierre_falla_la_venta_se_registra_igual(tmp_path):
@@ -223,7 +244,7 @@ def test_en_simulado_no_se_toca_la_wallet(tmp_path):
 def test_si_el_nodo_aun_no_ve_la_venta_reintenta_el_cierre(tmp_path, caplog):
     """Caso real: justo tras vender, el cierre falló con NonNativeHasBalance
     (0xb) porque el nodo aún veía los tokens. Se reintenta."""
-    closer = FakeCloser(results=[(0.0, 0, 1), (0.0, 0, 0), (0.00150884, 1, 0)])
+    closer = FakeCloser(results=[(0.0, 0, 1, False), (0.0, 0, 0, True), (0.00150884, 1, 0, False)])
     pos = _sell({"signature": "S", "actual_sol_delta": 0.020364574, "actual_token_delta": -1108.253805},
                 closer, tmp_path)
 
@@ -233,11 +254,11 @@ def test_si_el_nodo_aun_no_ve_la_venta_reintenta_el_cierre(tmp_path, caplog):
 
 
 def test_si_no_se_puede_cerrar_avisa_una_sola_vez(tmp_path, caplog):
-    closer = FakeCloser(results=[(0.0, 0, 1)])
+    closer = FakeCloser(results=[(0.0, 0, 1, False)])
     _sell({"signature": "S", "actual_sol_delta": 0.02, "actual_token_delta": -1000.0}, closer, tmp_path)
 
     assert len(closer.calls) == 3
-    assert caplog.text.count("No se pudo cerrar la cuenta vacía") == 1
+    assert caplog.text.count("No se pudieron cerrar todas las cuentas vacías") == 1
 
 
 def test_la_simulacion_va_contra_confirmed(rpc):
@@ -256,3 +277,24 @@ def test_la_simulacion_va_contra_confirmed(rpc):
     asyncio.run(_closer().close_empty())
 
     assert opts_vistos[0].preflight_commitment == Confirmed and not opts_vistos[0].skip_preflight
+
+
+
+def test_close_after_sale_cierra_el_token_y_los_intermedios_vacios(rpc):
+    usdc = str(Pubkey.new_unique())
+    usdc_vacia = _acc(mint=usdc)
+    usdc_con_saldo = _acc(mint=usdc, amount="5000000")  # USDC propios: no se tocan
+    token = _acc()
+    fake = rpc([token, usdc_vacia, usdc_con_saldo])
+
+    recuperado, cerradas, fallidas, pendiente = asyncio.run(
+        _closer().close_after_sale(MINT, [usdc, MINT]))
+
+    assert (cerradas, fallidas, pendiente) == (2, 0, False)
+    assert fake.sent == [{token.pubkey, usdc_vacia.pubkey}]
+
+
+def test_close_after_sale_pendiente_si_el_token_aun_tiene_saldo(rpc):
+    rpc([_acc(amount="1000")])
+    _, cerradas, _, pendiente = asyncio.run(_closer().close_after_sale(MINT))
+    assert cerradas == 0 and pendiente

@@ -351,3 +351,17 @@ async def test_el_rent_devuelto_no_cuenta_en_el_precio_de_salida():
     assert pos.exit_price == pytest.approx(0.00006)
     # El PnL realizado es lo que pasó en la wallet, rent incluido.
     assert pos.realized_pnl_sol == pytest.approx(0.06204 - 0.0521)
+
+
+
+async def test_la_compra_guarda_los_tokens_intermedios_de_la_ruta():
+    client = FakeLightningClient(result={"signature": "abc", "actual_sol_delta": -0.0345709,
+                                         "actual_token_delta": 13719.755, "actual_rent_paid_sol": 0.00456184,
+                                         "actual_created_mints": ["MintABC", "USDC", "TTWO"]})
+    executor = TradeExecutor(client=client, live=True, config=DummyConfig())
+
+    pos = await executor.buy("MintABC", price=2.1251574e-06)
+
+    assert pos.route_mints == ["USDC", "TTWO"]
+    # Sin el rent de las tres cuentas, el coste de entrada es el del swap.
+    assert pos.entry_price == pytest.approx((0.0345709 - 0.00456184) / 13719.755)

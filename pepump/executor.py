@@ -63,6 +63,11 @@ class Position:
     realized_pnl_pct: Optional[float] = None
     close_reason: Optional[str] = None
     exit_is_real_fill: bool = False
+    # Tokens intermedios de la ruta de compra (Jupiter: SOL -> USDC -> TTWO
+    # -> token) cuyas cuentas creó la compra en la wallet: se cierran tras
+    # vender para recuperar su rent. No se guarda en la base de datos: si el
+    # bot se reinicia entre medias, las recoge el barrido del arranque.
+    route_mints: list = field(default_factory=list)
 
     def __post_init__(self):
         if not self.market_entry_price or self.market_entry_price <= 0:
@@ -241,29 +246,34 @@ class TradeExecutor:
     CLOSE_ACCOUNT_ATTEMPTS = 3
     CLOSE_ACCOUNT_RETRY_SECONDS = 2.0
 
-    async def _recover_token_account_rent(self, mint: str) -> float:
-        """Tras una venta real: cierra la cuenta del token si quedó vacía y
-        devuelve los SOL recuperados (netos del fee). 0 si no hay closer o si
-        no se pudo (lo recoge el barrido del próximo arranque)."""
+    async def _recover_token_account_rent(self, mint: str, route_mints=()) -> float:
+        """Tras una venta real: cierra la cuenta del token y las de los
+        tokens intermedios de la ruta que hayan quedado vacías, y devuelve
+        los SOL recuperados (netos del fee). Reintenta mientras el nodo aún
+        no vea la venta o algún cierre falle. 0 si no hay closer o si no se
+        pudo (lo recoge el barrido del próximo arranque)."""
         if self.closer is None:
             return 0.0
-        motivo = "la cuenta todavía no aparece vacía"
+        total, motivo = 0.0, ""
         for intento in range(1, self.CLOSE_ACCOUNT_ATTEMPTS + 1):
             try:
-                recuperado, cerradas, fallidas = await self.closer.close_empty(mint)
+                recuperado, cerradas, fallidas, pendiente = await self.closer.close_after_sale(mint, route_mints)
             except Exception as e:
-                cerradas, fallidas, motivo = 0, 1, str(e)
+                fallidas, pendiente, motivo = 1, False, str(e)
             else:
+                total += recuperado
                 if cerradas:
-                    logger.info(f"[REAL] Cuenta del token cerrada: recuperados {recuperado:.9f} SOL de rent.")
-                    return recuperado
-                if fallidas:
-                    motivo = "el cierre falló (ejecuta con -v para ver el motivo)"
+                    logger.info(f"[REAL] {cerradas} cuenta(s) de token cerradas: recuperados "
+                                f"{recuperado:.9f} SOL de rent.")
+                if not fallidas and not pendiente:
+                    return total
+                motivo = ("la cuenta del token todavía no aparece vacía" if pendiente else
+                          "el cierre falló (ejecuta con -v para ver el motivo)")
             if intento < self.CLOSE_ACCOUNT_ATTEMPTS:
                 await asyncio.sleep(self.CLOSE_ACCOUNT_RETRY_SECONDS)
-        logger.warning(f"[REAL] No se pudo cerrar la cuenta vacía de {mint} ({motivo}); su rent se "
-                       f"recupera al volver a arrancar el bot.")
-        return 0.0
+        logger.warning(f"[REAL] No se pudieron cerrar todas las cuentas vacías de la operación de {mint} "
+                       f"({motivo}); su rent se recupera al volver a arrancar el bot.")
+        return total
 
     async def _simulated_jupiter_sell(self, mint: str, tokens: float, price: float,
                                       priority_fee: Optional[float]) -> tuple[float, float]:
@@ -289,6 +299,7 @@ class TradeExecutor:
         entry_price = price
         token_amount = sol_amount / price if price > 0 else 0.0
         real_fill = False
+        route_mints: list = []
 
         if not self.live and self.cfg.sim_costs:
             if pool_override == JUPITER_POOL:
@@ -336,6 +347,7 @@ class TradeExecutor:
                 real_sol_spent = abs(actual_sol_delta)  # gastamos SOL -> sol_delta viene negativo
                 real_token_amount = actual_token_delta
                 rent = result.get("actual_rent_paid_sol") or 0.0
+                route_mints = [m for m in (result.get("actual_created_mints") or []) if m != mint]
                 if not 0 <= rent < real_sol_spent:
                     rent = 0.0
                 sol_amount = real_sol_spent
@@ -367,7 +379,7 @@ class TradeExecutor:
                     f"{entry_price:.10f} SOL/token (~{token_amount:,.2f} tokens){sufijo}")
         return Position(mint=mint, entry_price=entry_price, sol_amount=sol_amount,
                          token_amount=token_amount, market_entry_price=price,
-                         entry_is_real_fill=real_fill)
+                         entry_is_real_fill=real_fill, route_mints=route_mints)
 
     def _fill_suffix(self, real_fill: bool) -> str:
         if self.live:
@@ -503,10 +515,12 @@ class TradeExecutor:
                                "posición) para el PnL.")
 
             # Ni PumpPortal ni Jupiter cierran la cuenta del token al vender
-            # todo: su rent se queda dentro. Se cierra aquí y se suma a lo
-            # recibido (el precio de salida no cambia: no cuenta el rent).
-            if not (isinstance(result, dict) and result.get("actual_rent_refund_sol")):
-                proceeds += await self._recover_token_account_rent(position.mint)
+            # todo, ni las de los tokens intermedios de la ruta: su rent se
+            # queda dentro. Se cierran aquí y se suma a lo recibido (el precio
+            # de salida no cambia: no cuenta el rent).
+            creadas = result.get("actual_created_mints") if isinstance(result, dict) else None
+            route_mints = set(position.route_mints) | set(creadas or [])
+            proceeds += await self._recover_token_account_rent(position.mint, route_mints)
 
         # PnL calculado en SOL real gastado vs. SOL real recibido -no
         # como ratio de precios-, para que en modo REAL con datos reales
