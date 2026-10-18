@@ -16,18 +16,25 @@ logger = logging.getLogger(__name__)
 class Position:
     mint: str
     entry_price: float                 # precio en SOL por token, al comprar
-    sol_amount: float                  # SOL invertidos
+    sol_amount: float                  # SOL invertidos (sin rent, ver abajo)
     token_amount: float                # tokens obtenidos
     # Precio de MERCADO de referencia en el momento de comprar (el que
     # venía del feed/on-chain). Se separa de `entry_price` porque, con
     # datos reales de fill, `entry_price` es el precio EFECTIVO pagado
-    # e incluye los costes de la tx (fee de pump.fun, priority fee...).
-    # NO incluye el rent de crear la cuenta del token (~0.002 SOL, un 4%
-    # de una compra de 0.05 SOL): se recupera al cerrar la cuenta tras
-    # venderlo todo (ver token_accounts.py), así que no es
-    # un coste. Sí está en `sol_amount` (lo que salió de la wallet), y el
-    # PnL realizado (proceeds - sol_amount) lo cuenta según haya vuelto o
-    # no. Ese precio efectivo es el
+    # e incluye los costes de la tx (comisiones, priority fee...).
+    #
+    # El RENT de las cuentas de token no cuenta en NADA de la posición
+    # (entry_price, sol_amount, proceeds_sol, PnL): es un depósito de la
+    # wallet, no un coste. Las compras y ventas lo pagan o lo recuperan
+    # al crear y cerrar cuentas -la del token y las de los tokens
+    # intermedios de una ruta de Jupiter-, y el bot lo recupera aparte
+    # cerrando las cuentas vacías (ver token_accounts.py). Intentar
+    # atribuirlo a cada posición no cuadraba nunca: el barrido del
+    # arranque cerraba cuentas de posiciones abiertas, la venta las volvía
+    # a crear... (caso real: un swap de +3.7% registrado como -4.9%). Así,
+    # el PnL es el del swap, el mismo que enseña Jupiter.
+    #
+    # Ese precio efectivo es el
     # correcto para calcular el PnL real, pero NO para los umbrales de
     # la estrategia: comparar el precio de mercado actual contra un
     # precio inflado por comisiones desplaza en silencio la activación
@@ -65,8 +72,9 @@ class Position:
     exit_is_real_fill: bool = False
     # Tokens intermedios de la ruta de compra (Jupiter: SOL -> USDC -> TTWO
     # -> token) cuyas cuentas creó la compra en la wallet: se cierran tras
-    # vender para recuperar su rent. No se guarda en la base de datos: si el
-    # bot se reinicia entre medias, las recoge el barrido del arranque.
+    # vender para recuperar su rent en la wallet. No se guarda en la base de
+    # datos: si el bot se reinicia entre medias, las recoge el barrido del
+    # arranque (y como el rent no cuenta en el PnL, da igual quién las cierre).
     route_mints: list = field(default_factory=list)
 
     def __post_init__(self):
@@ -79,10 +87,9 @@ class Position:
     def pnl_pct(self, price: float) -> float:
         """PnL NETO: cuánto ganarías/perderías de verdad si vendieras a
         `price`, medido contra el precio EFECTIVO que pagaste. Con datos
-        reales de fill eso incluye la comisión de pump.fun, la de
-        PumpPortal, el priority fee y el rent de crear la cuenta de
-        token -por eso arranca en negativo aunque el precio no se haya
-        movido."""
+        reales de fill eso incluye las comisiones y el priority fee -por
+        eso arranca en negativo aunque el precio no se haya movido-, pero
+        no el rent (ver market_entry_price)."""
         return (price / self.entry_price - 1.0) * 100.0
 
     def market_pnl_pct(self, price: float) -> float:
@@ -132,33 +139,22 @@ SELL_PRIORITY_FEE_FACTOR = 4.0
 
 
 # Costes fijos de una operación real que también se cobran al simular
-# (ver simulated_buy / simulated_sell).
+# (ver simulated_buy / simulated_sell). El rent de la cuenta del token no:
+# no es un coste (ver Position.market_entry_price).
 NETWORK_FEE_SOL = 0.000005  # fee base de una tx de Solana (una firma)
-# Rent de la cuenta del token: se paga al comprar y vuelve al vender. Ni
-# PumpPortal ni Jupiter cierran la cuenta: la cierra el bot tras la venta
-# (ver token_accounts.py; en real, con wallet_private_key).
-TOKEN_ACCOUNT_RENT_SOL = 0.00203928
-
-
-def entry_price_without_rent(spent: float, tokens: float, rent: float) -> float:
-    """Precio efectivo de entrada: SOL gastados MENOS el rent de la cuenta
-    del token (vuelve al vender), por token."""
-    return (spent - rent) / tokens
 
 
 def simulated_buy(cfg, price: float) -> tuple[float, float, float]:
     """Compra SIMULADA con los costes de una real (con cfg.sim_costs):
     se paga `sim_slippage_pct` % por encima del precio de mercado, más
     `sim_fee_pct` % de comisiones (pump.fun + PumpPortal) sobre buy_sol,
-    el priority fee, el fee de red y el rent de la cuenta del token.
-    Devuelve (SOL gastados, tokens recibidos, precio efectivo), los mismos
-    tres números que da una compra real con datos de fill. El precio
-    efectivo no incluye el rent (ver Position.market_entry_price)."""
+    el priority fee y el fee de red. Devuelve (SOL gastados, tokens
+    recibidos, precio efectivo), los mismos tres números que da una compra
+    real con datos de fill."""
     fill_price = price * (1 + cfg.sim_slippage_pct / 100.0)
     tokens = cfg.buy_sol / fill_price
-    spent = (cfg.buy_sol * (1 + cfg.sim_fee_pct / 100.0) + cfg.priority_fee
-             + NETWORK_FEE_SOL + TOKEN_ACCOUNT_RENT_SOL)
-    return spent, tokens, entry_price_without_rent(spent, tokens, TOKEN_ACCOUNT_RENT_SOL)
+    spent = cfg.buy_sol * (1 + cfg.sim_fee_pct / 100.0) + cfg.priority_fee + NETWORK_FEE_SOL
+    return spent, tokens, spent / tokens
 
 
 def simulated_sell(cfg, tokens: float, price: float,
@@ -166,18 +162,23 @@ def simulated_sell(cfg, tokens: float, price: float,
     """Venta SIMULADA con los costes de una real (con cfg.sim_costs): se
     cobra `sim_slippage_pct` % por debajo del precio de mercado, menos
     `sim_fee_pct` % de comisiones (o `fee_pct`), el priority fee y el fee
-    de red, y vuelve el rent de la cuenta del token. Devuelve (SOL
-    recibidos, precio efectivo); el precio efectivo no cuenta el rent
-    devuelto, igual que el de entrada no cuenta el pagado."""
+    de red. Devuelve (SOL recibidos, precio efectivo)."""
     fee = cfg.priority_fee if priority_fee is None else priority_fee
     fee_pct = cfg.sim_fee_pct if fee_pct is None else fee_pct
     gross = tokens * price * (1 - cfg.sim_slippage_pct / 100.0)
-    proceeds = gross * (1 - fee_pct / 100.0) - fee - NETWORK_FEE_SOL + TOKEN_ACCOUNT_RENT_SOL
+    proceeds = gross * (1 - fee_pct / 100.0) - fee - NETWORK_FEE_SOL
     # Sin ingresos netos no hay precio de salida con sentido (igual que en
     # una venta real): se deja el de mercado.
-    sin_rent = proceeds - TOKEN_ACCOUNT_RENT_SOL
-    exit_price = sin_rent / tokens if sin_rent > 0 and tokens > 0 else price
+    exit_price = proceeds / tokens if proceeds > 0 and tokens > 0 else price
     return proceeds, exit_price
+
+
+def _rent_delta(result) -> float:
+    """Rent neto que pagó una tx (pagado al crear cuentas de token de la
+    wallet menos devuelto al cerrarlas), según el fill real."""
+    if not isinstance(result, dict):
+        return 0.0
+    return (result.get("actual_rent_paid_sol") or 0.0) - (result.get("actual_rent_refund_sol") or 0.0)
 
 
 def sell_retry_params(cfg, failures: int) -> tuple[float, float]:
@@ -238,20 +239,22 @@ class TradeExecutor:
                            f"se simula con el precio de referencia.")
             return simulated_buy(self.cfg, price)
         tokens *= 1 - self.cfg.sim_slippage_pct / 100.0
-        spent = self.cfg.buy_sol + self.cfg.priority_fee + NETWORK_FEE_SOL + TOKEN_ACCOUNT_RENT_SOL
-        return spent, tokens, entry_price_without_rent(spent, tokens, TOKEN_ACCOUNT_RENT_SOL)
+        spent = self.cfg.buy_sol + self.cfg.priority_fee + NETWORK_FEE_SOL
+        return spent, tokens, spent / tokens
 
     # Intentos de cerrar la cuenta del token justo después de vender, y pausa
     # entre ellos: el nodo RPC puede tardar un poco en ver la venta.
     CLOSE_ACCOUNT_ATTEMPTS = 3
     CLOSE_ACCOUNT_RETRY_SECONDS = 2.0
 
-    async def _recover_token_account_rent(self, mint: str, route_mints=()) -> float:
+    async def _close_token_accounts(self, mint: str, route_mints=()) -> float:
         """Tras una venta real: cierra la cuenta del token y las de los
-        tokens intermedios de la ruta que hayan quedado vacías, y devuelve
-        los SOL recuperados (netos del fee). Reintenta mientras el nodo aún
-        no vea la venta o algún cierre falle. 0 si no hay closer o si no se
-        pudo (lo recoge el barrido del próximo arranque)."""
+        tokens intermedios de la ruta que hayan quedado vacías, para
+        recuperar su rent en la wallet. Reintenta mientras el nodo aún no
+        vea la venta o algún cierre falle. Devuelve los SOL recuperados, solo
+        para el log: el rent no cuenta en el PnL (ver
+        Position.market_entry_price). Lo que no se pueda cerrar lo recoge el
+        barrido del próximo arranque."""
         if self.closer is None:
             return 0.0
         total, motivo = 0.0, ""
@@ -264,7 +267,7 @@ class TradeExecutor:
                 total += recuperado
                 if cerradas:
                     logger.info(f"[REAL] {cerradas} cuenta(s) de token cerradas: recuperados "
-                                f"{recuperado:.9f} SOL de rent.")
+                                f"{recuperado:.9f} SOL de rent en la wallet.")
                 if not fallidas and not pendiente:
                     return total
                 motivo = ("la cuenta del token todavía no aparece vacía" if pendiente else
@@ -344,15 +347,17 @@ class TradeExecutor:
             # estimado que un precio de entrada inventado.
             if (actual_sol_delta is not None and actual_token_delta is not None
                     and actual_token_delta > 0 and actual_sol_delta < 0):
-                real_sol_spent = abs(actual_sol_delta)  # gastamos SOL -> sol_delta viene negativo
+                # El rent de las cuentas que crea (o cierra) la compra no es
+                # coste: se descuenta (ver Position.market_entry_price).
+                rent = _rent_delta(result)
+                real_sol_spent = abs(actual_sol_delta) - rent
+                if real_sol_spent <= 0:
+                    real_sol_spent, rent = abs(actual_sol_delta), 0.0
                 real_token_amount = actual_token_delta
-                rent = result.get("actual_rent_paid_sol") or 0.0
                 route_mints = [m for m in (result.get("actual_created_mints") or []) if m != mint]
-                if not 0 <= rent < real_sol_spent:
-                    rent = 0.0
                 sol_amount = real_sol_spent
                 token_amount = real_token_amount
-                entry_price = entry_price_without_rent(real_sol_spent, real_token_amount, rent)
+                entry_price = real_sol_spent / real_token_amount
                 real_fill = True
                 sobrecoste_pct = ((entry_price / price - 1.0) * 100.0) if price > 0 else 0.0
                 sobrecoste_sol = real_sol_spent - self.cfg.buy_sol
@@ -361,8 +366,8 @@ class TradeExecutor:
                             f"tokens -> precio efectivo real: {entry_price:.10f} SOL/token "
                             f"({sobrecoste_pct:+.2f}% vs. el precio de mercado de referencia "
                             f"{price:.10f}).")
-                renta = (f" y {rent:.9f} SOL de rent de la cuenta del token (se recupera al cerrarla tras vender; "
-                         f"no cuenta en el precio de entrada)" if rent else "")
+                renta = (f". Aparte, {rent:.9f} SOL de rent de las cuentas de token creadas: es un "
+                         f"depósito que se recupera al cerrarlas, no un coste" if rent else "")
                 logger.info(f"[REAL] Coste de entrar: {sobrecoste_sol:+.9f} SOL sobre los "
                             f"{self.cfg.buy_sol:.9f} SOL de la orden (comisiones del pool y del "
                             f"intermediario, priority fee y fee de red){renta}. Por eso el % que "
@@ -487,15 +492,15 @@ class TradeExecutor:
             # peor que se puede hacer, porque el CSV registraría unos
             # ingresos que nunca existieron.
             if actual_sol_delta is not None and actual_token_delta is not None and actual_token_delta < 0:
-                real_sol_received = actual_sol_delta  # recibimos SOL -> sol_delta viene positivo
+                # recibimos SOL -> sol_delta viene positivo. Sin el rent de
+                # las cuentas que la venta crea (la ruta puede volver a crear
+                # las intermedias) o cierra (ver Position.market_entry_price).
+                real_sol_received = actual_sol_delta + _rent_delta(result)
                 real_token_amount_sold = abs(actual_token_delta)  # vendimos tokens -> viene negativo
                 proceeds = real_sol_received
                 token_amount_sold = real_token_amount_sold
-                refund = result.get("actual_rent_refund_sol") or 0.0
-                if not 0 <= refund < real_sol_received:
-                    refund = 0.0
-                if real_sol_received - refund > 0 and real_token_amount_sold > 0:
-                    exit_price = (real_sol_received - refund) / real_token_amount_sold
+                if real_sol_received > 0 and real_token_amount_sold > 0:
+                    exit_price = real_sol_received / real_token_amount_sold
                 else:
                     # Sin ingresos netos no hay "precio de salida" que
                     # tenga sentido: se deja el de mercado para el log/CSV
@@ -516,11 +521,10 @@ class TradeExecutor:
 
             # Ni PumpPortal ni Jupiter cierran la cuenta del token al vender
             # todo, ni las de los tokens intermedios de la ruta: su rent se
-            # queda dentro. Se cierran aquí y se suma a lo recibido (el precio
-            # de salida no cambia: no cuenta el rent).
+            # queda dentro. Se cierran aquí para recuperarlo en la wallet; no
+            # cuenta en el PnL (ver Position.market_entry_price).
             creadas = result.get("actual_created_mints") if isinstance(result, dict) else None
-            route_mints = set(position.route_mints) | set(creadas or [])
-            proceeds += await self._recover_token_account_rent(position.mint, route_mints)
+            await self._close_token_accounts(position.mint, set(position.route_mints) | set(creadas or []))
 
         # PnL calculado en SOL real gastado vs. SOL real recibido -no
         # como ratio de precios-, para que en modo REAL con datos reales

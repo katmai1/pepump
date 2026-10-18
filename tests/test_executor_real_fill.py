@@ -327,20 +327,20 @@ async def test_log_de_venta_muestra_mercado_y_neto(caplog):
     assert "PnL neto:" in caplog.text
 
 
-async def test_el_rent_pagado_no_cuenta_en_el_precio_de_entrada():
-    """El rent de la cuenta del token vuelve al venderlo todo: está en
-    sol_amount (salió de la wallet) pero no en el precio de entrada."""
+async def test_el_rent_pagado_no_cuenta_en_la_entrada():
+    """El rent de la cuenta del token es un depósito, no un coste: ni en el
+    precio de entrada ni en lo invertido."""
     client = FakeLightningClient(result={"signature": "abc", "actual_sol_delta": -0.0521,
                                          "actual_token_delta": 1000.0, "actual_rent_paid_sol": 0.00204})
     executor = TradeExecutor(client=client, live=True, config=DummyConfig())
 
     pos = await executor.buy("MintABC", price=0.00005)
 
-    assert pos.sol_amount == pytest.approx(0.0521)
+    assert pos.sol_amount == pytest.approx(0.0521 - 0.00204)
     assert pos.entry_price == pytest.approx((0.0521 - 0.00204) / 1000.0)
 
 
-async def test_el_rent_devuelto_no_cuenta_en_el_precio_de_salida():
+async def test_el_rent_devuelto_no_cuenta_en_la_salida():
     client = FakeLightningClient(result={"signature": "abc", "actual_sol_delta": 0.06204,
                                          "actual_token_delta": -1000.0, "actual_rent_refund_sol": 0.00204})
     executor = TradeExecutor(client=client, live=True, config=DummyConfig())
@@ -349,8 +349,25 @@ async def test_el_rent_devuelto_no_cuenta_en_el_precio_de_salida():
     await executor.sell(pos, 0.00006, "trailing")
 
     assert pos.exit_price == pytest.approx(0.00006)
-    # El PnL realizado es lo que pasó en la wallet, rent incluido.
-    assert pos.realized_pnl_sol == pytest.approx(0.06204 - 0.0521)
+    assert pos.proceeds_sol == pytest.approx(0.06)
+    assert pos.realized_pnl_sol == pytest.approx(0.06 - 0.0521)
+
+
+async def test_caso_real_35_el_pnl_es_el_del_swap_pase_lo_que_pase_con_el_rent():
+    """Compra SOL -> USDC -> TTWO -> Macca (crea 3 cuentas), reinicio cuyo
+    barrido cierra las intermedias, y venta que las vuelve a crear. Antes:
+    -4.9%. El swap: 0.050015 SOL -> 0.051883 SOL, +3.7%."""
+    compra = FakeLightningClient(result={"signature": "a", "actual_sol_delta": -0.05457684,
+                                         "actual_token_delta": 25493.010806, "actual_rent_paid_sol": 0.00456184})
+    pos = await TradeExecutor(client=compra, live=True, config=DummyConfig()).buy("Macca", price=1.9063e-06)
+    venta = FakeLightningClient(result={"signature": "b", "actual_sol_delta": 0.048834853,
+                                        "actual_token_delta": -25493.010806, "actual_rent_paid_sol": 0.003048})
+
+    await TradeExecutor(client=venta, live=True, config=DummyConfig()).sell(pos, 2.0e-06, "manual")
+
+    assert pos.sol_amount == pytest.approx(0.050015)
+    assert pos.proceeds_sol == pytest.approx(0.051882853)
+    assert pos.realized_pnl_pct == pytest.approx(3.734, abs=0.01)
 
 
 

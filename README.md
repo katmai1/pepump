@@ -174,17 +174,21 @@ priority fee y rent de la cuenta del token), para que el PnL simulado no
 salga más optimista que el real. Se ajustan con `sim_fee_pct` /
 `sim_slippage_pct`, o se apagan con `sim_costs = false` (sección `[general]`).
 
-**Rent de la cuenta del token.** Cada compra crea una cuenta para el token,
-con ~0.0015-0.002 SOL de rent (un 7-10% de una compra de 0.02 SOL). Ni
-PumpPortal ni Jupiter la cierran al venderlo todo: el rent se queda dentro y
-el historial lo registraba como pérdida. Con `wallet_private_key`, el bot
-cierra la cuenta tras cada venta real y suma el rent recuperado a lo
-recibido; al arrancar, cierra también las cuentas vacías que quedaron de
-antes (`close_empty_token_accounts`, sección `[jupiter]`). Una ruta de
-Jupiter por tokens intermedios (SOL → USDC → TTWO → token) crea también sus
-cuentas: se cierran tras la venta, y si la ruta dejó un resto que vale menos
-del 10% del rent (según Jupiter), se quema para poder cerrarlas. El rent no cuenta
-en el precio de entrada ni en el PnL neto mientras la posición está abierta.
+**Rent de las cuentas de token.** Cada compra crea en la wallet una cuenta
+para el token (y, si la ruta de Jupiter pasa por tokens intermedios como
+USDC o TTWO, también para ellos), con ~0.0015-0.002 SOL de rent cada una: un
+7-10% de una compra de 0.02 SOL. Ese rent **no cuenta en el PnL** de ninguna
+posición (ni en la entrada, ni en la salida, ni en el historial): es un
+depósito de la wallet, no un coste. El PnL es el del swap, el mismo que
+enseña Jupiter.
+
+Ni PumpPortal ni Jupiter cierran esas cuentas al vender, así que el bot lo
+hace aparte para recuperar el rent: con `wallet_private_key`, tras cada venta
+real cierra la cuenta del token y las intermedias que hayan quedado vacías, y
+al arrancar cierra las cuentas vacías que quedaron de antes
+(`close_empty_token_accounts`, sección `[jupiter]`). Si una ruta deja en una
+cuenta intermedia un resto que vale menos del 10% del rent (según Jupiter),
+se quema para poder cerrarla.
 
 Cada orden cerrada se registra en el CSV de `general.trade_history_csv`
 (`""` desactiva el historial).

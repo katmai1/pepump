@@ -185,14 +185,15 @@ def _sell(result, closer, tmp_path):
     return pos
 
 
-def test_el_caso_real_cierra_la_cuenta_y_el_historial_sale_en_positivo(tmp_path):
+def test_tras_vender_cierra_la_cuenta_sin_tocar_el_pnl(tmp_path):
+    """El rent recuperado vuelve a la wallet, pero no es parte del PnL: no
+    lo era en la entrada, tampoco en la salida."""
     closer = FakeCloser()
     pos = _sell({"signature": "S", "actual_sol_delta": 0.0235873, "actual_token_delta": -15459.484669},
                 closer, tmp_path)
 
     assert closer.calls == [(MINT, set())]
-    assert pos.proceeds_sol == pytest.approx(0.0235873 + 0.00150884)
-    assert pos.realized_pnl_sol > 0
+    assert pos.proceeds_sol == pytest.approx(0.0235873)
     # El precio de salida no cuenta el rent.
     assert pos.exit_price == pytest.approx(0.0235873 / 15459.484669)
 
@@ -202,7 +203,7 @@ def test_si_la_venta_ya_cerro_la_cuenta_no_hay_nada_mas_que_recuperar(tmp_path):
     pos = _sell({"signature": "S", "actual_sol_delta": 0.025, "actual_token_delta": -15459.484669,
                  "actual_rent_refund_sol": 0.0015}, closer, tmp_path)
     assert len(closer.calls) == 1  # sin reintentos: no queda nada pendiente
-    assert pos.proceeds_sol == pytest.approx(0.025)
+    assert pos.proceeds_sol == pytest.approx(0.025 - 0.0015)  # sin el rent devuelto
 
 
 def test_cierra_tambien_las_cuentas_intermedias_de_la_ruta(tmp_path):
@@ -221,7 +222,7 @@ def test_cierra_tambien_las_cuentas_intermedias_de_la_ruta(tmp_path):
     asyncio.run(executor.sell(pos, 2e-6, "trailing"))
 
     assert closer.calls == [(MINT, {usdc, ttwo, otro})]
-    assert pos.proceeds_sol == pytest.approx(0.034 + 0.00454)
+    assert pos.proceeds_sol == pytest.approx(0.034)
 
 
 def test_si_el_cierre_falla_la_venta_se_registra_igual(tmp_path):
@@ -251,8 +252,8 @@ def test_si_el_nodo_aun_no_ve_la_venta_reintenta_el_cierre(tmp_path, caplog):
                 closer, tmp_path)
 
     assert len(closer.calls) == 3
-    assert pos.proceeds_sol == pytest.approx(0.020364574 + 0.00150884)
-    assert "No se pudo cerrar" not in caplog.text
+    assert pos.proceeds_sol == pytest.approx(0.020364574)
+    assert "No se pudieron cerrar" not in caplog.text
 
 
 def test_si_no_se_puede_cerrar_avisa_una_sola_vez(tmp_path, caplog):

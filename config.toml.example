@@ -173,7 +173,9 @@ wallet_private_key = ""
 
 # Con wallet_private_key: tras cada venta REAL, cerrar la cuenta del token que
 # queda vacía para recuperar su rent (~0.0015-0.002 SOL, un 7-10% de una
-# compra de 0.02 SOL). Ni PumpPortal ni Jupiter la cierran al vender. Al
+# compra de 0.02 SOL). Ni PumpPortal ni Jupiter la cierran al vender. El rent
+# no cuenta en el PnL (es un depósito, no un coste): esto solo lo devuelve a
+# la wallet. Al
 # arrancar también se cierran las cuentas vacías que quedaron de antes. Solo
 # toca cuentas con saldo 0; el rent vuelve a la propia wallet. Excepción: si
 # una ruta de Jupiter pasa por un token intermedio (p. ej. USDC) y deja en su

@@ -397,8 +397,8 @@ def test_executor_simulado_vende_a_lo_que_cotiza_jupiter(tmp_path):
 
     # Lo que cotiza Jupiter por los 1000 tokens (0.00004 x 1000 = 0.04 SOL),
     # no el precio de mercado (0.0001), y sin el 2% de sim_fee_pct encima.
-    from pepump.executor import NETWORK_FEE_SOL, TOKEN_ACCOUNT_RENT_SOL
-    assert pos.proceeds_sol == pytest.approx(0.04 - NETWORK_FEE_SOL + TOKEN_ACCOUNT_RENT_SOL)
+    from pepump.executor import NETWORK_FEE_SOL
+    assert pos.proceeds_sol == pytest.approx(0.04 - NETWORK_FEE_SOL)
     assert pos.close_reason == "trailing"
 
 
@@ -412,8 +412,8 @@ def test_executor_simulado_si_jupiter_no_cotiza_la_venta_cobra_las_comisiones(tm
 
     asyncio.run(executor.sell(pos, 0.0001, "trailing", pool_override=JUPITER_POOL))
 
-    from pepump.executor import NETWORK_FEE_SOL, TOKEN_ACCOUNT_RENT_SOL
-    assert pos.proceeds_sol == pytest.approx(0.1 * 0.98 - NETWORK_FEE_SOL + TOKEN_ACCOUNT_RENT_SOL)
+    from pepump.executor import NETWORK_FEE_SOL
+    assert pos.proceeds_sol == pytest.approx(0.1 * 0.98 - NETWORK_FEE_SOL)
 
 
 # --------------------------------------------------------------------------- #
