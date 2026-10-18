@@ -15,14 +15,18 @@ Valores de `source`:
   "pumpswap"     -> el mint ya migró; se lee el pool oficial de PumpSwap.
   "raydium-cpmm" -> no es de pump.fun; pool de Raydium CPMM contra SOL.
   "meteora-dlmm" -> la liquidez contra SOL está en Meteora DLMM.
+  "meteora-damm-v2" -> la liquidez contra SOL está en Meteora DAMM v2 (de
+                    los dos de Meteora se usa el pool con más SOL).
   "jupiter"      -> ninguno de los anteriores: el precio es la cotización de
                     venta de Jupiter y las órdenes van por Jupiter (ver
                     jupiter.py). Solo si hay jupiter_api_key.
 """
+import asyncio
 import logging
 from typing import Optional
 
 from pepump.jupiter import JUPITER_POOL, PRIORITY_PRICE
+from pepump.onchain.meteora_damm_v2 import MeteoraDammV2OnChainClient
 from pepump.onchain.meteora_dlmm import MeteoraDlmmOnChainClient
 from pepump.onchain.pump_curve import PumpCurveOnChainClient
 from pepump.onchain.pumpswap import PumpSwapOnChainClient
@@ -32,12 +36,16 @@ logger = logging.getLogger(__name__)
 
 
 class OnchainFallback:
-    def __init__(self, mint: str, rpc_url: str, source: Optional[str] = None, jupiter=None):
+    def __init__(self, mint: str, rpc_url: str, source: Optional[str] = None, jupiter=None,
+                 live: bool = False):
         self.mint = mint
         self.rpc_url = rpc_url
         self.source: Optional[str] = source
         # JupiterClient, o None si no hay jupiter_api_key.
         self.jupiter = jupiter
+        # Para decidir si las órdenes de Meteora pueden ir por Jupiter: en
+        # REAL solo si hay clave con la que firmar (ver pool_override).
+        self.live = live
         # Tokens con los que se cotiza la venta en Jupiter: los de la
         # posición una vez comprada (los pone bot.py), y antes de comprar
         # los que darían por buy_sol (ver resolve_jupiter). El precio de
@@ -73,6 +81,9 @@ class OnchainFallback:
         if self.source == "meteora-dlmm":
             dlmm = MeteoraDlmmOnChainClient(self.rpc_url)
             return await dlmm.fetch_price(self.mint)
+        if self.source == "meteora-damm-v2":
+            damm = MeteoraDammV2OnChainClient(self.rpc_url)
+            return await damm.fetch_price(self.mint)
         if self.source == "bondingcurve":
             curve = PumpCurveOnChainClient(self.rpc_url)
             price, complete, exists = await curve.fetch_price_or_status(self.mint)
@@ -113,21 +124,41 @@ class OnchainFallback:
         _, cpmm_confirmed_absent = await cpmm.fetch_price_or_confirm_absent(self.mint)
         if not cpmm_confirmed_absent:
             return False
-        dlmm = MeteoraDlmmOnChainClient(self.rpc_url)
-        _, dlmm_confirmed_absent = await dlmm.fetch_price_or_confirm_absent(self.mint)
-        return dlmm_confirmed_absent
+        _, meteora_confirmed_absent = await self._best_meteora()
+        return meteora_confirmed_absent
 
-    async def _try_meteora_dlmm(self) -> tuple[Optional[float], bool]:
-        """Fallback de Meteora DLMM para las dos ramas de
-        resolve_reference que no encontraron pool contra SOL en
+    async def _best_meteora(self) -> tuple[Optional[tuple[str, float]], bool]:
+        """Mejor pool de Meteora contra SOL entre DLMM y DAMM v2: el de más
+        SOL. Un token puede tener los dos, y el que manda es donde está la
+        liquidez: en un DLMM pequeño el precio solo se mueve a saltos de un
+        bin (2% con bin_step 200) y se queda quieto entre medias.
+        ((source, price) o None, confirmed_absent): ausencia confirmada solo
+        si los DOS lo confirman."""
+        (dlmm_price, dlmm_sol, dlmm_absent), (damm_price, damm_sol, damm_absent) = await asyncio.gather(
+            MeteoraDlmmOnChainClient(self.rpc_url).fetch_price_reserve_or_confirm_absent(self.mint),
+            MeteoraDammV2OnChainClient(self.rpc_url).fetch_price_reserve_or_confirm_absent(self.mint),
+        )
+        options = [(sol or 0.0, source, price) for source, price, sol in
+                   (("meteora-dlmm", dlmm_price, dlmm_sol), ("meteora-damm-v2", damm_price, damm_sol))
+                   if price is not None]
+        if not options:
+            return None, dlmm_absent and damm_absent
+        _sol, source, price = max(options)
+        return (source, price), False
+
+    async def _try_meteora(self) -> tuple[Optional[float], bool]:
+        """Fallback de Meteora (DLMM o DAMM v2, ver _best_meteora) para las
+        dos ramas de resolve_reference que no encontraron pool contra SOL en
         pump.fun/PumpSwap/Raydium CPMM. (price, confirmed_absent); si hay
-        precio, deja `self.source` en "meteora-dlmm"."""
-        dlmm = MeteoraDlmmOnChainClient(self.rpc_url)
-        price, confirmed_absent = await dlmm.fetch_price_or_confirm_absent(self.mint)
-        if price is not None:
-            logger.info(f"Precio de referencia (fallback on-chain Meteora DLMM): {price:.10f} SOL/token")
-            self.source = "meteora-dlmm"
-        return price, confirmed_absent
+        precio, deja `self.source` en "meteora-dlmm" o "meteora-damm-v2"."""
+        best, confirmed_absent = await self._best_meteora()
+        if best is None:
+            return None, confirmed_absent
+        source, price = best
+        nombre = "Meteora DLMM" if source == "meteora-dlmm" else "Meteora DAMM v2"
+        logger.info(f"Precio de referencia (fallback on-chain {nombre}): {price:.10f} SOL/token")
+        self.source = source
+        return price, False
 
     async def resolve_reference(self) -> tuple[Optional[float], bool, bool]:
         """Consulta puntual a los fallbacks on-chain, en dos pasos:
@@ -191,7 +222,7 @@ class OnchainFallback:
                 # o todavía no está indexado, o el pool oficial está
                 # cotizado contra otro token y la liquidez contra SOL vive
                 # en Meteora DLMM (caso real Hg5Ja5...pump, pool contra PUMP).
-                dlmm_price, _ = await self._try_meteora_dlmm()
+                dlmm_price, _ = await self._try_meteora()
                 if dlmm_price is not None:
                     return dlmm_price, pool_confirmed_absent, False
                 logger.debug("[On-chain bonding curve] La curva ya completó (migrando a PumpSwap) "
@@ -208,7 +239,7 @@ class OnchainFallback:
                                 f"{cpmm_price:.10f} SOL/token")
                     self.source = "raydium-cpmm"
                     return cpmm_price, pool_confirmed_absent, False
-                dlmm_price, dlmm_confirmed_absent = await self._try_meteora_dlmm()
+                dlmm_price, dlmm_confirmed_absent = await self._try_meteora()
                 if dlmm_price is not None:
                     return dlmm_price, pool_confirmed_absent, False
                 if cpmm_confirmed_absent and dlmm_confirmed_absent:
@@ -267,13 +298,18 @@ class OnchainFallback:
         override existe para evitar, pero al revés."""
         # Raydium CPMM: se rutea explícito al mismo tipo de pool del que
         # sacamos el precio, en vez de dejar que "auto" lo adivine.
-        # Meteora DLMM: la Lightning API no tiene un pool "meteora", así que
-        # se fuerza "auto" (aunque cfg.pool diga otra cosa) y PumpPortal
-        # decide por dónde rutear.
+        # Meteora: la Lightning API no tiene un pool "meteora", así que va
+        # por Jupiter si se puede (en REAL, solo con clave para firmar), y
+        # si no se fuerza "auto" (aunque cfg.pool diga otra cosa) y
+        # PumpPortal decide por dónde rutear.
         if self.source is None:
             return None
+        if self.source in ("meteora-dlmm", "meteora-damm-v2"):
+            if self.jupiter is not None and (self.jupiter.can_sign or not self.live):
+                return JUPITER_POOL
+            return "auto"
         return {"pumpswap": "pump-amm", "raydium-cpmm": "raydium-cpmm",
-                "meteora-dlmm": "auto", "jupiter": JUPITER_POOL}.get(self.source)
+                "jupiter": JUPITER_POOL}.get(self.source)
 
     # ---- Consultas puntuales para detectar una migración a mitad de posición ---- #
 

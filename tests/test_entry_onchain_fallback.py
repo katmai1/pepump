@@ -259,6 +259,11 @@ class FakeCpmmOnChainClient:
         price, _ = await self.fetch_price_or_confirm_absent(mint)
         return price
 
+    async def fetch_price_reserve_or_confirm_absent(self, mint: str):
+        """Para usarlo como doble de los clientes de Meteora."""
+        price, confirmed_absent = await self.fetch_price_or_confirm_absent(mint)
+        return price, (10.0 if price is not None else None), confirmed_absent
+
 
 def test_mint_de_raydium_cpmm_usa_precio_del_pool_y_rutea_por_raydium_cpmm(monkeypatch):
     """Caso real (Dz9mQ9...bonk, bonk.fun graduado a Raydium CPMM): ni

@@ -78,12 +78,19 @@ class MeteoraDlmmOnChainClient:
         self.rpc_url = rpc_url
 
     async def fetch_price(self, mint: str) -> Optional[float]:
-        price, _confirmed_absent = await self.fetch_price_or_confirm_absent(mint)
+        price, _sol_reserve, _confirmed_absent = await self.fetch_price_reserve_or_confirm_absent(mint)
         return price
 
     async def fetch_price_or_confirm_absent(self, mint: str) -> tuple[Optional[float], bool]:
         """(price, confirmed_absent), mismo contrato que
         RaydiumCpmmOnChainClient.fetch_price_or_confirm_absent."""
+        price, _sol_reserve, confirmed_absent = await self.fetch_price_reserve_or_confirm_absent(mint)
+        return price, confirmed_absent
+
+    async def fetch_price_reserve_or_confirm_absent(
+            self, mint: str) -> tuple[Optional[float], Optional[float], bool]:
+        """Lo mismo más los SOL del pool elegido, para poder compararlo con
+        el mejor pool de Meteora DAMM v2 (ver OnchainFallback._try_meteora)."""
         try:
             async with AsyncClient(self.rpc_url) as client:
                 cached = self._best_pool_by_mint.get(mint)
@@ -94,7 +101,7 @@ class MeteoraDlmmOnChainClient:
                     if pool is not None:
                         best = await self._best_priced_pool(client, mint, [(cached, pool)])
                         if best is not None:
-                            return best[1], False
+                            return best[1], best[2], False
                     self._best_pool_by_mint.pop(mint, None)
 
                 candidates = await self._find_candidates(client, mint)
@@ -102,16 +109,16 @@ class MeteoraDlmmOnChainClient:
                 if best is None:
                     logger.debug(f"[On-chain Meteora DLMM] {len(candidates)} pools {mint}/SOL, ninguno "
                                  f"con al menos {self.MIN_SOL_RESERVE:g} SOL de liquidez.")
-                    return None, True
+                    return None, None, True
 
                 address, price, sol_reserve = best
                 self._best_pool_by_mint[mint] = address
                 logger.debug(f"[On-chain Meteora DLMM] Pool {address} | {sol_reserve:,.3f} SOL de "
                              f"liquidez (de {len(candidates)} pools {mint}/SOL)")
-                return price, False
+                return price, sol_reserve, False
         except Exception as e:
             logger.warning(f"[On-chain Meteora DLMM] Falló la consulta on-chain para {mint}: {e}")
-            return None, False
+            return None, None, False
 
     async def _find_candidates(self, client: AsyncClient, mint: str) -> list[tuple[str, dict]]:
         """Pools mint/WSOL en los dos órdenes posibles (x/y), con doble

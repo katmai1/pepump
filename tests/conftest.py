@@ -138,7 +138,7 @@ class SpyExecutor:
 
 
 class _RaydiumCpmmSinPools:
-    """Doble de RaydiumCpmmOnChainClient / MeteoraDlmmOnChainClient que
+    """Doble de RaydiumCpmmOnChainClient y de los clientes de Meteora que
     siempre confirma 'no hay pool'."""
 
     def __init__(self, rpc_url):
@@ -149,6 +149,9 @@ class _RaydiumCpmmSinPools:
 
     async def fetch_price(self, mint: str):
         return None
+
+    async def fetch_price_reserve_or_confirm_absent(self, mint: str):
+        return None, None, True
 
 
 @pytest.fixture(autouse=True)
@@ -162,11 +165,12 @@ def _reintentos_de_venta_sin_pausa(monkeypatch):
 @pytest.fixture(autouse=True)
 def _sin_raydium_cpmm_real(monkeypatch):
     """Ningún test del bot le pega al RPC real de Raydium CPMM ni de
-    Meteora DLMM por accidente: por defecto 'no hay pool'. Los tests que
+    Meteora (DLMM, DAMM v2) por accidente: por defecto 'no hay pool'. Los tests que
     necesitan otra cosa lo pisan con su propio monkeypatch."""
     from pepump.onchain import fallback as fallback_module
     monkeypatch.setattr(fallback_module, "RaydiumCpmmOnChainClient", _RaydiumCpmmSinPools)
     monkeypatch.setattr(fallback_module, "MeteoraDlmmOnChainClient", _RaydiumCpmmSinPools)
+    monkeypatch.setattr(fallback_module, "MeteoraDammV2OnChainClient", _RaydiumCpmmSinPools)
 
 
 @pytest.fixture

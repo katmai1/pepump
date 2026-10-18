@@ -219,6 +219,22 @@ class TradeExecutor:
         spent = self.cfg.buy_sol + self.cfg.priority_fee + NETWORK_FEE_SOL + TOKEN_ACCOUNT_RENT_SOL
         return spent, tokens, spent / tokens
 
+    async def _simulated_jupiter_sell(self, mint: str, tokens: float, price: float,
+                                      priority_fee: Optional[float]) -> tuple[float, float]:
+        """Como simulated_sell, pero con lo que Jupiter daría de verdad por
+        los tokens (comisiones de la ruta incluidas) en vez de cobrar
+        sim_fee_pct sobre el precio: el precio que vigila el bot puede ser
+        el del pool on-chain, sin comisiones (Meteora). Si la cotización
+        falla, se cae a simulated_sell con el precio de mercado."""
+        try:
+            quoted = await self._jupiter().sell_price(mint, tokens, self.cfg.solana_rpc_url,
+                                                      priority=PRIORITY_TRADE)
+        except Exception as e:
+            logger.warning(f"[SIMULADO] No se pudo cotizar la venta en Jupiter ({e}); "
+                           f"se simula con el precio de mercado.")
+            return simulated_sell(self.cfg, tokens, price, priority_fee)
+        return simulated_sell(self.cfg, tokens, quoted, priority_fee, fee_pct=0.0)
+
     async def buy(self, mint: str, price: float, pool_override: Optional[str] = None) -> Position:
         # Valores ESTIMADOS a partir del precio de referencia -se usan
         # tal cual en modo SIMULADO, y como respaldo en modo REAL si no
@@ -340,10 +356,11 @@ class TradeExecutor:
         real_fill = False
 
         if not self.live and self.cfg.sim_costs:
-            # El precio de Jupiter ya es lo que se recibiría al vender
-            # (comisiones incluidas): no se cobran otra vez.
-            fee_pct = 0.0 if pool_override == JUPITER_POOL else None
-            proceeds, exit_price = simulated_sell(self.cfg, token_amount_sold, price, priority_fee, fee_pct)
+            if pool_override == JUPITER_POOL:
+                proceeds, exit_price = await self._simulated_jupiter_sell(
+                    position.mint, token_amount_sold, price, priority_fee)
+            else:
+                proceeds, exit_price = simulated_sell(self.cfg, token_amount_sold, price, priority_fee)
 
         if self.live:
             try:

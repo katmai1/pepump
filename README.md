@@ -189,6 +189,14 @@ on-chain que se activan solos cuando ese feed deja de entregar trades:
   mandar trades en silencio, así que el bot lo detecta por timeout
   (`stall_timeout_seconds`) y lo confirma on-chain antes de cambiar de
   fuente.
+- **Raydium CPMM / Meteora** (`RaydiumCpmmOnChainClient`,
+  `MeteoraDlmmOnChainClient`, `MeteoraDammV2OnChainClient`): mints que no
+  son de pump.fun pero cotizan contra SOL. En Meteora se miran DLMM y DAMM v2
+  y se usa el pool con más SOL: un DLMM pequeño da un precio que solo se
+  mueve a saltos de un bin (2% con `bin_step` 200). La Lightning API no
+  tiene un pool de Meteora, así que con `jupiter_api_key` (y la clave
+  privada, en real) las órdenes de estos tokens van por Jupiter; sin ella,
+  con `pool = "auto"`.
 
 No se usan DexScreener ni Jupiter para el precio de estos tokens a propósito:
 desalinean el precio que el bot "ve" del precio contra el que realmente se

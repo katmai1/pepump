@@ -8,6 +8,8 @@ PUMPFUN_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 RAYDIUM_CPMM_PROGRAM_ID = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C"
 # Programa de Meteora DLMM en Solana (constante pública, no cambia).
 METEORA_DLMM_PROGRAM_ID = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
+# Programa de Meteora DAMM v2 (CP-AMM) en Solana (constante pública, no cambia).
+METEORA_DAMM_V2_PROGRAM_ID = "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG"
 # Mint del SOL "wrapped" (WSOL) — para confirmar que el pool que
 # encontramos está denominado en SOL antes de usar su precio.
 WSOL_MINT = "So11111111111111111111111111111111111111112"

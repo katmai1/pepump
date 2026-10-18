@@ -89,7 +89,7 @@ class TrailingTakeProfitBot:
         # del feed en vivo, de dónde sale ahora (`self.onchain.source`) y
         # por qué pool hay que rutear la orden.
         self.onchain = OnchainFallback(self.mint, config.solana_rpc_url, resume_onchain_source,
-                                       jupiter=jupiter)
+                                       jupiter=jupiter, live=config.live)
         if resume_position is not None:
             self.onchain.jupiter_tokens = resume_position.token_amount
         # Si _get_reference_price (o algo que llame desde ahí) ya
@@ -788,8 +788,8 @@ class TrailingTakeProfitBot:
         errores mezclados para un solo problema."""
         logger.error(f"Abortando esta entrada: no hay de dónde sacar el precio de {self.mint} "
                      f"(no tiene bonding curve de pump.fun, ni pool oficial de migración en "
-                     f"PumpSwap, ni pool de Raydium CPMM ni de Meteora DLMM contra SOL con liquidez "
-                     f"real). Si está en otro DEX (Meteora DAMM, Raydium AMM v4/CLMM, LaunchLab sin "
+                     f"PumpSwap, ni pool de Raydium CPMM ni de Meteora DLMM/DAMM v2 contra SOL con "
+                     f"liquidez real). Si está en otro DEX (Meteora DAMM v1, Raydium AMM v4/CLMM, LaunchLab sin "
                      f"graduar...), este bot "
                      f"no puede calcular su precio de entrada"
                      + (" (tampoco se pudo por Jupiter, ver arriba)." if self.onchain.jupiter is not None else

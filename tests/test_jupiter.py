@@ -387,7 +387,7 @@ def test_executor_simulado_compra_con_la_cotizacion_de_jupiter():
     assert pos.sol_amount > 0.05
 
 
-def test_executor_simulado_no_cobra_dos_veces_las_comisiones_al_vender(tmp_path):
+def test_executor_simulado_vende_a_lo_que_cotiza_jupiter(tmp_path):
     cfg = make_config(sim_costs=True, sim_slippage_pct=0.0, sim_fee_pct=2.0, priority_fee=0.0,
                       trade_history_csv=str(tmp_path / "h.csv"))
     executor = TradeExecutor(client=None, live=False, config=cfg, jupiter=FakeJupiter(tokens=1000.0))
@@ -395,9 +395,25 @@ def test_executor_simulado_no_cobra_dos_veces_las_comisiones_al_vender(tmp_path)
 
     asyncio.run(executor.sell(pos, 0.0001, "trailing", pool_override=JUPITER_POOL))
 
-    # 1000 tokens x 0.0001 = 0.1 SOL, sin el 2% de sim_fee_pct.
+    # Lo que cotiza Jupiter por los 1000 tokens (0.00004 x 1000 = 0.04 SOL),
+    # no el precio de mercado (0.0001), y sin el 2% de sim_fee_pct encima.
     from pepump.executor import NETWORK_FEE_SOL, TOKEN_ACCOUNT_RENT_SOL
-    assert pos.proceeds_sol == pytest.approx(0.1 - NETWORK_FEE_SOL + TOKEN_ACCOUNT_RENT_SOL)
+    assert pos.proceeds_sol == pytest.approx(0.04 - NETWORK_FEE_SOL + TOKEN_ACCOUNT_RENT_SOL)
+    assert pos.close_reason == "trailing"
+
+
+def test_executor_simulado_si_jupiter_no_cotiza_la_venta_cobra_las_comisiones(tmp_path):
+    cfg = make_config(sim_costs=True, sim_slippage_pct=0.0, sim_fee_pct=2.0, priority_fee=0.0,
+                      trade_history_csv=str(tmp_path / "h.csv"))
+    jupiter = FakeJupiter(tokens=1000.0)
+    executor = TradeExecutor(client=None, live=False, config=cfg, jupiter=jupiter)
+    pos = asyncio.run(executor.buy(MINT, 0.00004, pool_override=JUPITER_POOL))
+    jupiter.fail_quote = True
+
+    asyncio.run(executor.sell(pos, 0.0001, "trailing", pool_override=JUPITER_POOL))
+
+    from pepump.executor import NETWORK_FEE_SOL, TOKEN_ACCOUNT_RENT_SOL
+    assert pos.proceeds_sol == pytest.approx(0.1 * 0.98 - NETWORK_FEE_SOL + TOKEN_ACCOUNT_RENT_SOL)
 
 
 # --------------------------------------------------------------------------- #

@@ -570,8 +570,8 @@ function showOpenError(message) {
 const MARKETS = {
   bondingcurve: "En la curva de pump.fun",
   pumpswap: "Migrado a PumpSwap",
-  other: "No está en pump.fun ni en PumpSwap: se intentará Raydium CPMM / Meteora DLMM",
-  jupiter: "No está en pump.fun ni en PumpSwap: si tampoco está en Raydium CPMM / Meteora DLMM, irá por Jupiter (precio = lo que darían al vender)",
+  other: "No está en pump.fun ni en PumpSwap: se intentará Raydium CPMM / Meteora (DLMM o DAMM v2)",
+  jupiter: "No está en pump.fun ni en PumpSwap: si tampoco está en Raydium CPMM / Meteora, irá por Jupiter (precio = lo que darían al vender)",
   unknown: "No se pudo comprobar dónde cotiza (¿RPC?)",
 };
 

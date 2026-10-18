@@ -132,7 +132,7 @@ wallet_address = ""
 
 [jupiter]
 # OPCIONAL. Para tokens que no cotizan contra SOL en pump.fun, PumpSwap,
-# Raydium CPMM ni Meteora DLMM (p. ej. los de StonkFun, contra STONK, ORE o
+# Raydium CPMM ni Meteora DLMM/DAMM v2 (p. ej. los de StonkFun, contra STONK, ORE o
 # TSLAx): el precio sale de la cotización de venta de Jupiter y las órdenes
 # van por Jupiter, que encuentra la ruta SOL -> quote -> token sola. Los
 # demás tokens siguen yendo por PumpPortal como siempre.
