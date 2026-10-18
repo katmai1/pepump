@@ -21,9 +21,12 @@ class Position:
     # Precio de MERCADO de referencia en el momento de comprar (el que
     # venía del feed/on-chain). Se separa de `entry_price` porque, con
     # datos reales de fill, `entry_price` es el precio EFECTIVO pagado
-    # e incluye todos los costes de la tx (fee de pump.fun, priority
-    # fee, y el rent de crear la ATA del token -~0.002 SOL, que sobre
-    # una compra de 0.05 SOL ya es un 4%). Ese precio efectivo es el
+    # e incluye los costes de la tx (fee de pump.fun, priority fee...).
+    # NO incluye el rent de crear la cuenta del token (~0.002 SOL, un 4%
+    # de una compra de 0.05 SOL): vuelve al venderlo todo, así que no es
+    # un coste. Sí está en `sol_amount` (lo que salió de la wallet), y el
+    # PnL realizado (proceeds - sol_amount) lo cuenta según haya vuelto o
+    # no. Ese precio efectivo es el
     # correcto para calcular el PnL real, pero NO para los umbrales de
     # la estrategia: comparar el precio de mercado actual contra un
     # precio inflado por comisiones desplaza en silencio la activación
@@ -130,18 +133,25 @@ NETWORK_FEE_SOL = 0.000005  # fee base de una tx de Solana (una firma)
 TOKEN_ACCOUNT_RENT_SOL = 0.00203928
 
 
+def entry_price_without_rent(spent: float, tokens: float, rent: float) -> float:
+    """Precio efectivo de entrada: SOL gastados MENOS el rent de la cuenta
+    del token (vuelve al vender), por token."""
+    return (spent - rent) / tokens
+
+
 def simulated_buy(cfg, price: float) -> tuple[float, float, float]:
     """Compra SIMULADA con los costes de una real (con cfg.sim_costs):
     se paga `sim_slippage_pct` % por encima del precio de mercado, más
     `sim_fee_pct` % de comisiones (pump.fun + PumpPortal) sobre buy_sol,
     el priority fee, el fee de red y el rent de la cuenta del token.
     Devuelve (SOL gastados, tokens recibidos, precio efectivo), los mismos
-    tres números que da una compra real con datos de fill."""
+    tres números que da una compra real con datos de fill. El precio
+    efectivo no incluye el rent (ver Position.market_entry_price)."""
     fill_price = price * (1 + cfg.sim_slippage_pct / 100.0)
     tokens = cfg.buy_sol / fill_price
     spent = (cfg.buy_sol * (1 + cfg.sim_fee_pct / 100.0) + cfg.priority_fee
              + NETWORK_FEE_SOL + TOKEN_ACCOUNT_RENT_SOL)
-    return spent, tokens, spent / tokens
+    return spent, tokens, entry_price_without_rent(spent, tokens, TOKEN_ACCOUNT_RENT_SOL)
 
 
 def simulated_sell(cfg, tokens: float, price: float,
@@ -150,14 +160,16 @@ def simulated_sell(cfg, tokens: float, price: float,
     cobra `sim_slippage_pct` % por debajo del precio de mercado, menos
     `sim_fee_pct` % de comisiones (o `fee_pct`), el priority fee y el fee
     de red, y vuelve el rent de la cuenta del token. Devuelve (SOL
-    recibidos, precio efectivo)."""
+    recibidos, precio efectivo); el precio efectivo no cuenta el rent
+    devuelto, igual que el de entrada no cuenta el pagado."""
     fee = cfg.priority_fee if priority_fee is None else priority_fee
     fee_pct = cfg.sim_fee_pct if fee_pct is None else fee_pct
     gross = tokens * price * (1 - cfg.sim_slippage_pct / 100.0)
     proceeds = gross * (1 - fee_pct / 100.0) - fee - NETWORK_FEE_SOL + TOKEN_ACCOUNT_RENT_SOL
     # Sin ingresos netos no hay precio de salida con sentido (igual que en
     # una venta real): se deja el de mercado.
-    exit_price = proceeds / tokens if proceeds > 0 and tokens > 0 else price
+    sin_rent = proceeds - TOKEN_ACCOUNT_RENT_SOL
+    exit_price = sin_rent / tokens if sin_rent > 0 and tokens > 0 else price
     return proceeds, exit_price
 
 
@@ -217,7 +229,7 @@ class TradeExecutor:
             return simulated_buy(self.cfg, price)
         tokens *= 1 - self.cfg.sim_slippage_pct / 100.0
         spent = self.cfg.buy_sol + self.cfg.priority_fee + NETWORK_FEE_SOL + TOKEN_ACCOUNT_RENT_SOL
-        return spent, tokens, spent / tokens
+        return spent, tokens, entry_price_without_rent(spent, tokens, TOKEN_ACCOUNT_RENT_SOL)
 
     async def _simulated_jupiter_sell(self, mint: str, tokens: float, price: float,
                                       priority_fee: Optional[float]) -> tuple[float, float]:
@@ -289,9 +301,12 @@ class TradeExecutor:
                     and actual_token_delta > 0 and actual_sol_delta < 0):
                 real_sol_spent = abs(actual_sol_delta)  # gastamos SOL -> sol_delta viene negativo
                 real_token_amount = actual_token_delta
+                rent = result.get("actual_rent_paid_sol") or 0.0
+                if not 0 <= rent < real_sol_spent:
+                    rent = 0.0
                 sol_amount = real_sol_spent
                 token_amount = real_token_amount
-                entry_price = real_sol_spent / real_token_amount
+                entry_price = entry_price_without_rent(real_sol_spent, real_token_amount, rent)
                 real_fill = True
                 sobrecoste_pct = ((entry_price / price - 1.0) * 100.0) if price > 0 else 0.0
                 sobrecoste_sol = real_sol_spent - self.cfg.buy_sol
@@ -300,12 +315,13 @@ class TradeExecutor:
                             f"tokens -> precio efectivo real: {entry_price:.10f} SOL/token "
                             f"({sobrecoste_pct:+.2f}% vs. el precio de mercado de referencia "
                             f"{price:.10f}).")
+                renta = (f" y {rent:.9f} SOL de rent de la cuenta del token (vuelve al venderlo todo; "
+                         f"no cuenta en el precio de entrada)" if rent else "")
                 logger.info(f"[REAL] Coste de entrar: {sobrecoste_sol:+.9f} SOL sobre los "
-                            f"{self.cfg.buy_sol:.9f} SOL de la orden (comisión de pump.fun, comisión "
-                            f"de PumpPortal, priority fee, fee de red y el rent de la cuenta de token "
-                            f"-este último, ~0.002 SOL, vuelve al cerrarse la cuenta al vender). Por "
-                            f"eso el % que muestra pump.fun -que es solo movimiento de precio- va a "
-                            f"ir {sobrecoste_pct:+.2f}% por encima del PnL neto de pepump.")
+                            f"{self.cfg.buy_sol:.9f} SOL de la orden (comisiones del pool y del "
+                            f"intermediario, priority fee y fee de red){renta}. Por eso el % que "
+                            f"muestra pump.fun -que es solo movimiento de precio- va a ir "
+                            f"{sobrecoste_pct:+.2f}% por encima del PnL neto de pepump.")
             else:
                 logger.warning(f"[REAL] No se pudieron confirmar los datos reales de la compra; "
                                 f"se usa el ESTIMADO (precio de referencia {price:.10f} SOL/token, "
@@ -429,8 +445,11 @@ class TradeExecutor:
                 real_token_amount_sold = abs(actual_token_delta)  # vendimos tokens -> viene negativo
                 proceeds = real_sol_received
                 token_amount_sold = real_token_amount_sold
-                if real_sol_received > 0 and real_token_amount_sold > 0:
-                    exit_price = real_sol_received / real_token_amount_sold
+                refund = result.get("actual_rent_refund_sol") or 0.0
+                if not 0 <= refund < real_sol_received:
+                    refund = 0.0
+                if real_sol_received - refund > 0 and real_token_amount_sold > 0:
+                    exit_price = (real_sol_received - refund) / real_token_amount_sold
                 else:
                     # Sin ingresos netos no hay "precio de salida" que
                     # tenga sentido: se deja el de mercado para el log/CSV

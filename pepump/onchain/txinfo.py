@@ -197,6 +197,28 @@ def _wallet_token_delta(meta, mint: str, wallet: str) -> Optional[float]:
     return (post_tokens or 0.0) - (pre_tokens or 0.0)
 
 
+def _token_account_rent(meta, mint: str, wallet: str) -> tuple[float, float]:
+    """(rent pagado, rent devuelto), en SOL, por la cuenta de `mint` de LA
+    WALLET en esta tx: si la tx la creó (no está en los token balances de
+    antes y sí en los de después), pagó sus lamports; si la cerró (al
+    revés), se los devolvió. Es parte de sol_delta, pero no es coste de
+    la operación: el rent de una cuenta vuelve al cerrarla.
+
+    Exacto (los lamports de esa cuenta en la propia tx), no la constante de
+    una cuenta SPL: las de Token-2022 con extensiones cuestan algo más. 0.0
+    de cada lado si no se puede saber (el nodo no manda `owner` o
+    `account_index`): entonces se trata como coste, como antes."""
+    def nuestras(balances) -> set:
+        return {b.account_index for b in (balances or [])
+                if str(b.mint) == mint and getattr(b, "owner", None) is not None
+                and str(b.owner) == wallet and getattr(b, "account_index", None) is not None}
+
+    pre, post = nuestras(meta.pre_token_balances), nuestras(meta.post_token_balances)
+    pagado = sum(meta.post_balances[i] for i in post - pre if i < len(meta.post_balances))
+    devuelto = sum(meta.pre_balances[i] for i in pre - post if i < len(meta.pre_balances))
+    return pagado / 1_000_000_000.0, devuelto / 1_000_000_000.0
+
+
 async def fetch_actual_fill(signature: str, rpc_url: str, mint: str,
                               max_attempts: int = 3, retry_delay_seconds: float = 0.75,
                               wallet: Optional[str] = None) -> Optional[dict]:
@@ -221,13 +243,16 @@ async def fetch_actual_fill(signature: str, rpc_url: str, mint: str,
     -eso ya lo garantizó _confirm_transaction_onchain-, esto es solo
     para reportar números reales, no para decidir si salió bien).
 
-    Devuelve {"sol_delta": float, "token_delta": float}:
+    Devuelve {"sol_delta": float, "token_delta": float, "rent_paid_sol":
+    float, "rent_refund_sol": float, "wallet": str}:
       - sol_delta: SOL netos ganados (positivo) o gastados (negativo)
         por la wallet en esta tx, en SOL (no lamports) e incluyendo
         TODOS los fees (red + priority fee + lo que haya cobrado el
         programa) -es el movimiento real de saldo, no un cálculo.
       - token_delta: tokens del `mint` ganados (positivo) o gastados
         (negativo) por la wallet, en unidades de token (no raw/atomic).
+      - rent_paid_sol / rent_refund_sol: la parte de sol_delta que es rent
+        de la cuenta del token (ver _token_account_rent).
 
     `max_attempts`/`retry_delay_seconds`: get_transaction puede no
     encontrar todavía la tx (resp.value/transaction en None) aunque
@@ -285,7 +310,9 @@ async def fetch_actual_fill(signature: str, rpc_url: str, mint: str,
             if token_delta is None:
                 return None
 
-            return {"sol_delta": sol_delta, "token_delta": token_delta, "wallet": payer}
+            rent_paid, rent_refund = _token_account_rent(meta, mint, payer)
+            return {"sol_delta": sol_delta, "token_delta": token_delta, "rent_paid_sol": rent_paid,
+                    "rent_refund_sol": rent_refund, "wallet": payer}
         except Exception as e:
             if attempt < max_attempts:
                 await asyncio.sleep(retry_delay_seconds)

@@ -171,7 +171,9 @@ en el log y en el panel web.
 En modo simulado se cobran por defecto los costes que tendría la operación
 en real (comisiones de pump.fun y PumpPortal, un 1% de slippage en contra,
 priority fee y rent de la cuenta del token), para que el PnL simulado no
-salga más optimista que el real. Se ajustan con `sim_fee_pct` /
+salga más optimista que el real. El rent (~0.002 SOL) se paga al comprar y
+vuelve al vender: sale en el saldo, pero no cuenta en el precio de entrada
+ni en el PnL neto mientras la posición está abierta. Se ajustan con `sim_fee_pct` /
 `sim_slippage_pct`, o se apagan con `sim_costs = false` (sección `[general]`).
 
 Cada orden cerrada se registra en el CSV de `general.trade_history_csv`

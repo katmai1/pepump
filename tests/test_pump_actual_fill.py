@@ -41,10 +41,11 @@ class FakeUiTokenAmount:
 
 
 class FakeTokenBalance:
-    def __init__(self, mint, owner, ui_amount):
+    def __init__(self, mint, owner, ui_amount, account_index=None):
         self.mint = mint
         self.owner = owner
         self.ui_token_amount = FakeUiTokenAmount(ui_amount)
+        self.account_index = account_index
 
 
 class FakeMeta:
@@ -471,7 +472,9 @@ def test_fetch_actual_fill_con_wallet_no_supone_que_paga_la_tx(monkeypatch):
 
     fill = asyncio.run(txinfo_module.fetch_actual_fill(FAKE_SIGNATURE, "http://fake-rpc", MINT, wallet=WALLET))
 
-    assert fill == {"sol_delta": pytest.approx(0.06), "token_delta": pytest.approx(-1000.0), "wallet": WALLET}
+    assert fill["sol_delta"] == pytest.approx(0.06)
+    assert fill["token_delta"] == pytest.approx(-1000.0)
+    assert fill["wallet"] == WALLET
 
 
 def test_fetch_actual_fill_con_wallet_que_no_esta_en_la_tx(monkeypatch):
@@ -480,3 +483,49 @@ def test_fetch_actual_fill_con_wallet_que_no_esta_en_la_tx(monkeypatch):
 
     assert asyncio.run(txinfo_module.fetch_actual_fill(FAKE_SIGNATURE, "http://fake-rpc", MINT,
                                                        wallet="NoEsta1111111111111111111111111111111111111")) is None
+
+
+# Rent de la cuenta del token: la cuenta 2 es la nuestra (2_074_080 lamports,
+# lo que cuesta una de Token-2022 con la extensión de impuesto).
+TOKEN_ACCOUNT_LAMPORTS = 2_074_080
+
+
+def _resp_con_cuenta(pre_tokens, post_tokens, sol_delta_lamports):
+    pre = [FakeTokenBalance(MINT, WALLET, pre_tokens, 2)] if pre_tokens is not None else []
+    post = [FakeTokenBalance(MINT, WALLET, post_tokens, 2)] if post_tokens is not None else []
+    meta = FakeMeta(
+        pre_balances=[1_000_000_000, 5_000_000_000, 0 if pre_tokens is None else TOKEN_ACCOUNT_LAMPORTS],
+        post_balances=[1_000_000_000 + sol_delta_lamports, 5_000_000_000,
+                       0 if post_tokens is None else TOKEN_ACCOUNT_LAMPORTS],
+        pre_token_balances=pre, post_token_balances=post,
+    )
+    return FakeGetTransactionResp(FakeConfirmedTx(meta, [WALLET, OTHER_ACCOUNT, "TokenAcc"]))
+
+
+def _fill(monkeypatch, resp):
+    monkeypatch.setattr(txinfo_module, "AsyncClient", lambda url: FakeAsyncClient(resp=resp))
+    return asyncio.run(txinfo_module.fetch_actual_fill(FAKE_SIGNATURE, "http://fake-rpc", MINT))
+
+
+def test_compra_que_crea_la_cuenta_del_token_reporta_el_rent_pagado(monkeypatch):
+    fill = _fill(monkeypatch, _resp_con_cuenta(None, 1000.0, -52_000_000))
+    assert fill["rent_paid_sol"] == pytest.approx(0.00207408)
+    assert fill["rent_refund_sol"] == 0.0
+
+
+def test_venta_que_cierra_la_cuenta_del_token_reporta_el_rent_devuelto(monkeypatch):
+    fill = _fill(monkeypatch, _resp_con_cuenta(1000.0, None, 60_000_000))
+    assert fill["rent_paid_sol"] == 0.0
+    assert fill["rent_refund_sol"] == pytest.approx(0.00207408)
+
+
+def test_venta_que_deja_la_cuenta_abierta_no_devuelve_rent(monkeypatch):
+    fill = _fill(monkeypatch, _resp_con_cuenta(1000.0, 0.0, 58_000_000))
+    assert fill["rent_refund_sol"] == 0.0
+
+
+def test_sin_account_index_no_se_descuenta_rent(monkeypatch):
+    """Sin poder identificar la cuenta, el rent se trata como coste (como antes)."""
+    resp = _make_resp(sol_delta_lamports=-50_500_000, pre_tokens=None, post_tokens=1_234.5)
+    fill = _fill(monkeypatch, resp)
+    assert fill["rent_paid_sol"] == 0.0 and fill["rent_refund_sol"] == 0.0

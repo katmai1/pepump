@@ -325,3 +325,29 @@ async def test_log_de_venta_muestra_mercado_y_neto(caplog):
 
     assert "mercado:" in caplog.text
     assert "PnL neto:" in caplog.text
+
+
+async def test_el_rent_pagado_no_cuenta_en_el_precio_de_entrada():
+    """El rent de la cuenta del token vuelve al venderlo todo: está en
+    sol_amount (salió de la wallet) pero no en el precio de entrada."""
+    client = FakeLightningClient(result={"signature": "abc", "actual_sol_delta": -0.0521,
+                                         "actual_token_delta": 1000.0, "actual_rent_paid_sol": 0.00204})
+    executor = TradeExecutor(client=client, live=True, config=DummyConfig())
+
+    pos = await executor.buy("MintABC", price=0.00005)
+
+    assert pos.sol_amount == pytest.approx(0.0521)
+    assert pos.entry_price == pytest.approx((0.0521 - 0.00204) / 1000.0)
+
+
+async def test_el_rent_devuelto_no_cuenta_en_el_precio_de_salida():
+    client = FakeLightningClient(result={"signature": "abc", "actual_sol_delta": 0.06204,
+                                         "actual_token_delta": -1000.0, "actual_rent_refund_sol": 0.00204})
+    executor = TradeExecutor(client=client, live=True, config=DummyConfig())
+    pos = Position(mint="MintABC", entry_price=0.00005, sol_amount=0.0521, token_amount=1000.0)
+
+    await executor.sell(pos, 0.00006, "trailing")
+
+    assert pos.exit_price == pytest.approx(0.00006)
+    # El PnL realizado es lo que pasó en la wallet, rent incluido.
+    assert pos.realized_pnl_sol == pytest.approx(0.06204 - 0.0521)

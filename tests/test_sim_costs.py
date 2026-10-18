@@ -20,8 +20,18 @@ def test_compra_simulada_paga_slippage_comisiones_y_costes_fijos():
     spent, tokens, entry = simulated_buy(cfg, 1.0)
     assert tokens == pytest.approx(0.05 / 1.01)
     assert spent == pytest.approx(0.05 * 1.02 + 0.00001 + NETWORK_FEE_SOL + TOKEN_ACCOUNT_RENT_SOL)
-    assert entry == pytest.approx(spent / tokens)
+    # El rent no es coste: vuelve al vender. Sí está en lo gastado.
+    assert entry == pytest.approx((spent - TOKEN_ACCOUNT_RENT_SOL) / tokens)
     assert entry > 1.0
+
+
+def test_el_rent_no_infla_el_precio_de_entrada():
+    """Con 0.05 SOL, el rent (~0.002 SOL) es un 4%: contarlo como coste
+    retrasaba la activación del trailing y adelantaba el stop-loss."""
+    cfg = _cfg(sim_fee_pct=0.0, sim_slippage_pct=0.0, priority_fee=0.0)
+    spent, tokens, entry = simulated_buy(cfg, 1.0)
+    assert spent == pytest.approx(0.05 + NETWORK_FEE_SOL + TOKEN_ACCOUNT_RENT_SOL)
+    assert entry == pytest.approx(1.0 + NETWORK_FEE_SOL / 0.05)
 
 
 def test_venta_simulada_cobra_y_devuelve_el_rent():
@@ -29,7 +39,7 @@ def test_venta_simulada_cobra_y_devuelve_el_rent():
     proceeds, exit_price = simulated_sell(cfg, 0.05, 1.0)
     esperado = 0.05 * 0.99 * 0.98 - 0.00001 - NETWORK_FEE_SOL + TOKEN_ACCOUNT_RENT_SOL
     assert proceeds == pytest.approx(esperado)
-    assert exit_price == pytest.approx(esperado / 0.05)
+    assert exit_price == pytest.approx((esperado - TOKEN_ACCOUNT_RENT_SOL) / 0.05)
 
 
 def test_venta_simulada_usa_el_priority_fee_del_reintento():

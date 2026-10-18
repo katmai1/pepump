@@ -74,9 +74,10 @@ class AppConfig:
     entry_dip_pct: float = 0.0
     # Contra qué precio de entrada se miden activation_pct e
     # initial_stop_pct (ver ESTRATEGIA_BASES):
-    #   "real"   -> el precio EFECTIVO pagado (con comisiones, priority
-    #               fee y rent de la cuenta de token), leído de la tx de
-    #               compra confirmada. Es lo que de verdad ganas o pierdes.
+    #   "real"   -> el precio EFECTIVO pagado (con comisiones y priority
+    #               fee, sin el rent de la cuenta de token, que vuelve al
+    #               vender), leído de la tx de compra confirmada. Es lo que
+    #               de verdad ganas o pierdes.
     #   "market" -> el precio de MERCADO al comprar (el que muestra
     #               pump.fun), sin costes. Era el comportamiento anterior.
     # Sin datos de fill (compra real sin poder leer la tx, o simulado con
