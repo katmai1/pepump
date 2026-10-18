@@ -2,8 +2,8 @@ import logging
 import sys
 from typing import Optional
 
-from pepump.log_context import MintContextFilter, MintTagFormatter
 from pepump.dashboard import PanelAwareHandler, StatusPanel, create_panel, panel_unavailable_reason
+from pepump.log_context import MintContextFilter, MintTagFormatter
 
 
 def setup_logging(level: int = logging.INFO, panel: bool = True,
@@ -36,7 +36,7 @@ def setup_logging(level: int = logging.INFO, panel: bool = True,
     # "replace" como red de seguridad para que ninguna salida rara pueda
     # hacer desaparecer una línea de log.
     try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
     except (AttributeError, ValueError, OSError):
         # stdout no es un TextIOWrapper (lo pisó pytest, un wrapper
         # propio, etc.). No es crítico: en Linux ya es UTF-8, y en
@@ -45,6 +45,7 @@ def setup_logging(level: int = logging.INFO, panel: bool = True,
 
     status_panel = create_panel(sys.stdout) if panel else None
     no_panel_reason = panel_unavailable_reason(sys.stdout) if panel and status_panel is None else None
+    handler: logging.Handler
     if status_panel is not None:
         handler = PanelAwareHandler(sys.stdout, status_panel)
     else:

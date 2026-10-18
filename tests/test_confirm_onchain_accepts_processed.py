@@ -3,7 +3,7 @@ Test de regresión para PumpPortalClient._confirm_transaction_onchain:
 a propósito se conforma con CUALQUIER confirmation_status no-nulo,
 incluido "processed" (el nivel más laxo, casi instantáneo). Es una
 decisión consciente para no retrasar la apertura de la posición -ver
-pump.py:_fetch_actual_fill, que es quien absorbe el desfase que esto
+onchain/txinfo.py:fetch_actual_fill, que es quien absorbe el desfase que esto
 puede causar contra getTransaction, con sus propios reintentos y sin
 bloquear la compra.
 """
@@ -12,8 +12,8 @@ import asyncio
 from solders.signature import Signature
 from solders.transaction_status import TransactionConfirmationStatus
 
-from pepump import pump as pump_module
-from pepump.pump import PumpPortalClient
+from pepump import pumpportal as pumpportal_module
+from pepump.pumpportal import PumpPortalClient
 
 FAKE_SIGNATURE = str(Signature.default())
 
@@ -47,7 +47,7 @@ class FakeAsyncClient:
 
 def test_processed_alcanza_para_confirmar_de_una(monkeypatch):
     fake_client = FakeAsyncClient(FakeStatusInfo(TransactionConfirmationStatus.Processed))
-    monkeypatch.setattr(pump_module, "AsyncClient", lambda url: fake_client)
+    monkeypatch.setattr(pumpportal_module, "AsyncClient", lambda url: fake_client)
 
     asyncio.run(PumpPortalClient._confirm_transaction_onchain(
         FAKE_SIGNATURE, "http://fake-rpc", timeout_seconds=5.0, poll_interval_seconds=0

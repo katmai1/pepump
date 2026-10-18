@@ -118,6 +118,7 @@ class PositionStore:
             "INSERT INTO positions (mint, live, created_at, status, settings_json, updated_at) "
             "VALUES (?, ?, ?, 'waiting_entry', ?, ?)",
             (mint, int(live), now, json.dumps(settings), now))
+        assert cur.lastrowid is not None  # siempre tras un INSERT
         return cur.lastrowid
 
     def update(self, pos_id: int, fields: dict) -> None:
@@ -130,7 +131,7 @@ class PositionStore:
 
     def get(self, pos_id: int) -> Optional[dict]:
         row = self._db.execute("SELECT * FROM positions WHERE id = ?", (pos_id,)).fetchone()
-        return _row(row)
+        return _row(row) if row is not None else None
 
     def with_status(self, *statuses: str) -> List[dict]:
         marks = ", ".join("?" for _ in statuses)
@@ -165,9 +166,7 @@ class PositionStore:
                          "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
 
 
-def _row(row) -> Optional[dict]:
-    if row is None:
-        return None
+def _row(row) -> dict:
     d = dict(row)
     d["live"] = bool(d["live"])
     d["armed"] = bool(d["armed"])

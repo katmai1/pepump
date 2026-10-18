@@ -11,8 +11,9 @@ import asyncio
 import pytest
 from solders.pubkey import Pubkey
 
-from pepump import pump as pump_module
-from pepump.pump import WSOL_MINT, MeteoraDlmmOnChainClient
+from pepump.onchain import meteora_dlmm as meteora_dlmm_module
+from pepump.onchain.meteora_dlmm import MeteoraDlmmOnChainClient
+from pepump.onchain.programs import WSOL_MINT
 
 MINT = "Hg5Ja55T5wESq4vyFoiVCMeHXtGyVA69X2UHq8hgpump"
 LAMPORTS = 10 ** 9
@@ -115,7 +116,7 @@ def _cache_limpio():
 
 
 def _fetch(monkeypatch, rpc):
-    monkeypatch.setattr(pump_module, "AsyncClient", lambda url: rpc)
+    monkeypatch.setattr(meteora_dlmm_module, "AsyncClient", lambda url: rpc)
     return asyncio.run(MeteoraDlmmOnChainClient("http://fake-rpc").fetch_price_or_confirm_absent(MINT))
 
 

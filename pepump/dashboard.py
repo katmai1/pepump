@@ -22,7 +22,7 @@ import logging
 import os
 import shutil
 import threading
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 
 def _enable_windows_vt(stream) -> bool:
@@ -34,7 +34,7 @@ def _enable_windows_vt(stream) -> bool:
     try:
         import ctypes
         from ctypes import wintypes
-        kernel32 = ctypes.windll.kernel32
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]  # solo existe en Windows
         handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
         mode = wintypes.DWORD()
         if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
@@ -254,7 +254,7 @@ class MultiPositionPanel:
     y la línea de estado de ese bot). Con varias, una cabecera y una
     línea por posición (ver position_row)."""
 
-    def __init__(self, panel: StatusPanel, snapshot: callable, live: bool):
+    def __init__(self, panel: StatusPanel, snapshot: Callable[[], List[dict]], live: bool):
         self.panel = panel
         self._snapshot = snapshot
         self._live = live

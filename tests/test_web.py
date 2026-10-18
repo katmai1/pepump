@@ -298,7 +298,8 @@ def test_websocket_manda_hello_estado_y_logs():
         # Un log nuevo llega en el momento (desde otro hilo, como to_thread).
         record = logging.LogRecord("pepump.x", logging.INFO, __file__, 1, "hola web", None, None)
         t = threading.Thread(target=logs.handle, args=(record,))
-        t.start(); t.join()
+        t.start()
+        t.join()
         tipos = set()
         for _ in range(5):
             msg = ws.receive_json()
@@ -433,7 +434,8 @@ def test_precios_para_el_grafico():
     puntos = client.get("/api/positions/1/prices").json()["points"]
     assert len(puntos) == 10 and puntos[0] == [100.0, 1.0]
     # Solo los nuevos (para ir actualizando el gráfico).
-    assert client.get("/api/positions/1/prices", params={"after": 107.0}).json()["points"] == [[108.0, 9.0], [109.0, 10.0]]
+    nuevos = client.get("/api/positions/1/prices", params={"after": 107.0}).json()["points"]
+    assert nuevos == [[108.0, 9.0], [109.0, 10.0]]
     assert client.get("/api/positions/9/prices").status_code == 404
 
 

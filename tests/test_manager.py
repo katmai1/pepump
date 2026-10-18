@@ -197,7 +197,7 @@ async def test_max_buy_sol_por_posicion():
     with pytest.raises(ValueError, match="max_buy_sol"):
         manager.open(A, buy_sol=10)
     assert manager.positions() == []
-    managed = manager.open(A, buy_sol=0.5)  # justo el máximo vale
+    manager.open(A, buy_sol=0.5)  # justo el máximo vale
     manager.close_all("fin")
     await asyncio.wait_for(manager.wait_all(), 5)
     await manager.aclose()
@@ -210,7 +210,7 @@ async def test_max_open_positions():
         manager.open(B)
     manager.close(pa.id, "fin")
     await asyncio.wait_for(pa.task, 5)
-    pb = manager.open(B)  # al cerrar la primera, hay hueco
+    manager.open(B)  # al cerrar la primera, hay hueco
     manager.close_all("fin")
     await asyncio.wait_for(manager.wait_all(), 5)
     await manager.aclose()

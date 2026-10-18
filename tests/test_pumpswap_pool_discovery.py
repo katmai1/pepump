@@ -9,17 +9,19 @@ comprobación de migración y en cada ciclo de polling. Ahora la dirección
 del pool oficial se CALCULA (es un PDA) y basta un getAccountInfo.
 """
 import asyncio
+from typing import Optional
 
 import pytest
 from solders.pubkey import Pubkey
 
-from pepump.pump import PUMPSWAP_PROGRAM_ID, WSOL_MINT, PumpSwapOnChainClient
+from pepump.onchain.programs import PUMPSWAP_PROGRAM_ID, WSOL_MINT
+from pepump.onchain.pumpswap import PumpSwapOnChainClient
 
 OTRO_QUOTE_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"  # USDC
 
 
 def build_pool_account_data(base_mint: str, quote_mint: str, lp_supply: int,
-                            con_coin_creator: bool = True, creator: str = None) -> bytes:
+                            con_coin_creator: bool = True, creator: Optional[str] = None) -> bytes:
     """Arma el account data crudo de un pool de PumpSwap con el mismo
     layout que PumpSwapPoolStateNew/Old de pumpswapamm. Por defecto el
     `creator` es el del pool oficial de migración de pump.fun."""
@@ -112,13 +114,13 @@ def test_sin_pool_confirma_ausencia_en_fetch():
         async def __aexit__(self, *a):
             return False
 
-    import pepump.pump as pump_module
-    original = pump_module.AsyncClient
-    pump_module.AsyncClient = lambda url: _Ctx()
+    import pepump.onchain.pumpswap as pumpswap_module
+    original = pumpswap_module.AsyncClient
+    pumpswap_module.AsyncClient = lambda url: _Ctx()
     try:
         price, absent = asyncio.run(PumpSwapOnChainClient("http://fake-rpc").fetch_price_or_confirm_absent(MINT))
     finally:
-        pump_module.AsyncClient = original
+        pumpswap_module.AsyncClient = original
     assert price is None and absent is True
 
 

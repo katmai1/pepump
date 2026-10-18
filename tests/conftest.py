@@ -9,6 +9,7 @@ Lightning API, RPC de Solana).
 """
 import asyncio
 import time
+from typing import Optional
 
 import pytest
 
@@ -60,7 +61,7 @@ class FakeTradeStreamClient:
     DATA_WS_URL = "wss://fake.pumpportal.test/api/data"
 
     def __init__(self, events_by_connection=None, fail_connect_times: int = 0,
-                 connect_exc: Exception = None):
+                 connect_exc: Optional[Exception] = None):
         self.events_by_connection = events_by_connection or [[]]
         self.fail_connect_times = fail_connect_times
         self.connect_exc = connect_exc or ConnectionRefusedError("conexión rechazada (fake)")
@@ -97,7 +98,7 @@ class SpyExecutor:
     """
 
     def __init__(self, sell_delay: float = 0.0, fail_sell_times: int = 0,
-                 fail_exc: Exception = None):
+                 fail_exc: Optional[Exception] = None):
         self.sell_delay = sell_delay
         self.fail_sell_times = fail_sell_times
         self.fail_exc = fail_exc or RuntimeError("Lightning API rechazó la orden (fake)")
@@ -109,12 +110,12 @@ class SpyExecutor:
         self.last_sell_pool_override = None
         self.last_sell_reason = None
 
-    async def buy(self, mint: str, price: float, pool_override: str = None) -> Position:
+    async def buy(self, mint: str, price: float, pool_override: Optional[str] = None) -> Position:
         self.buy_calls += 1
         self.last_buy_pool_override = pool_override
         return Position(mint=mint, entry_price=price, sol_amount=0.05, token_amount=0.05 / price)
 
-    async def sell(self, position: Position, price: float, reason: str, pool_override: str = None) -> None:
+    async def sell(self, position: Position, price: float, reason: str, pool_override: Optional[str] = None) -> None:
         self.sell_calls += 1
         self.last_sell_pool_override = pool_override
         self.last_sell_reason = reason

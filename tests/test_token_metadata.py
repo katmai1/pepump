@@ -1,6 +1,6 @@
 """Parseo del nombre/símbolo on-chain (TokenMetadataOnChainClient), con
 cuentas armadas a mano: Metaplex y extensión TokenMetadata de Token-2022."""
-from pepump.pump import TokenMetadataOnChainClient as C
+from pepump.onchain.metadata import TokenMetadataOnChainClient as C
 
 
 def _borsh(s: str, pad: int = 0) -> bytes:

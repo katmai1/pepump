@@ -1,7 +1,7 @@
 """
 Tests para el uso de los datos REALES de fill (actual_sol_delta /
 actual_token_delta, que execute_lightning_trade ahora agrega a su
-respuesta -ver pump.py:_fetch_actual_fill) en TradeExecutor.buy() y
+respuesta -ver onchain/txinfo.py:fetch_actual_fill) en TradeExecutor.buy() y
 .sell(): la Position y el PnL deben reflejar lo que REALMENTE pasó en
 la wallet, no la estimación a partir del precio de referencia.
 """
@@ -202,7 +202,7 @@ async def test_por_defecto_la_activacion_se_mide_contra_el_precio_real():
     5% por encima del mercado, +10% de mercado NO arma el trailing (solo
     es +4,8% real); hace falta +15,5% de mercado (+10% real)."""
     from pepump.bot import TrailingTakeProfitBot
-    from tests.conftest import make_config, FakeTradeStreamClient, SpyExecutor
+    from tests.conftest import FakeTradeStreamClient, SpyExecutor, make_config
 
     cfg = make_config(activation_pct=10.0, initial_stop_pct=25.0)
     assert cfg.strategy_price_basis == "real"
@@ -220,7 +220,7 @@ async def test_por_defecto_la_activacion_se_mide_contra_el_precio_real():
 
 async def test_por_defecto_el_stop_loss_inicial_se_mide_contra_el_precio_real():
     from pepump.bot import TrailingTakeProfitBot
-    from tests.conftest import make_config, FakeTradeStreamClient, SpyExecutor
+    from tests.conftest import FakeTradeStreamClient, SpyExecutor, make_config
 
     cfg = make_config(activation_pct=10.0, initial_stop_pct=25.0)
     spy = SpyExecutor()
@@ -243,7 +243,7 @@ async def test_opcion_market_umbrales_contra_el_precio_de_mercado():
     haría falta un +15,5% -la estrategia cambiaría sola por culpa de las
     comisiones."""
     from pepump.bot import TrailingTakeProfitBot
-    from tests.conftest import make_config, FakeTradeStreamClient, SpyExecutor
+    from tests.conftest import FakeTradeStreamClient, SpyExecutor, make_config
 
     cfg = make_config(activation_pct=10.0, initial_stop_pct=25.0, strategy_price_basis="market")
     bot = TrailingTakeProfitBot(client=FakeTradeStreamClient(), executor=SpyExecutor(), config=cfg)
@@ -258,7 +258,7 @@ async def test_opcion_market_umbrales_contra_el_precio_de_mercado():
 
 async def test_opcion_market_stop_loss_contra_el_precio_de_mercado():
     from pepump.bot import TrailingTakeProfitBot
-    from tests.conftest import make_config, FakeTradeStreamClient, SpyExecutor
+    from tests.conftest import FakeTradeStreamClient, SpyExecutor, make_config
 
     cfg = make_config(activation_pct=10.0, initial_stop_pct=25.0, strategy_price_basis="market")
     spy = SpyExecutor()

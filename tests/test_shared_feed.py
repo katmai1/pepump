@@ -85,8 +85,8 @@ def _feed(**kw):
 
 async def test_un_solo_websocket_para_varios_mints():
     feed, conns = _feed()
-    sa = await feed.connect_trade_stream(A)
-    sb = await feed.connect_trade_stream(B)
+    await feed.connect_trade_stream(A)
+    await feed.connect_trade_stream(B)
 
     assert len(conns.sockets) == 1
     assert conns.sockets[0].sent == [
@@ -143,7 +143,7 @@ async def test_close_da_de_baja_y_cierra_la_conexion_con_el_ultimo():
 async def test_reconecta_y_resuscribe_sin_que_el_bot_lo_note():
     feed, conns = _feed()
     sa = await feed.connect_trade_stream(A)
-    sb = await feed.connect_trade_stream(B)
+    await feed.connect_trade_stream(B)
     ita = feed.iter_trade_events(sa)
     conns.sockets[0].push({"message": "ok"})
     conns.sockets[0].push({"message": "ok"})

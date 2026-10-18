@@ -37,7 +37,7 @@ import contextvars
 import json
 import logging
 from collections import deque
-from typing import AsyncIterator, Deque, Dict, Optional, Set
+from typing import Any, AsyncIterator, Deque, Dict, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -76,9 +76,9 @@ class SharedTradeFeed:
         self.client = client
         if connect is None:
             import websockets
-            connect = websockets.connect
+            connect = websockets.connect  # type: ignore[attr-defined]
         self._connect = connect
-        self._ws = None
+        self._ws: Any = None
         self._reader_task: Optional[asyncio.Task] = None
         self._subs: Dict[str, Set[TradeSubscription]] = {}
         # Suscripciones esperando su ack, en el orden en que se mandó su
@@ -223,12 +223,12 @@ class SharedTradeFeed:
             if "unsubscribed" in texto:
                 return  # ack de un unsubscribe: no es de nadie
             if self._pending_acks:
-                sub = self._pending_acks.popleft()
+                pending = self._pending_acks.popleft()
                 # None: ack de una re-suscripción de alguien que ya tenía
                 # el suyo -> se descarta.
-                if sub is not None and not sub.closed:
-                    sub.acked = True
-                    sub.queue.put_nowait(event)
+                if pending is not None and not pending.closed:
+                    pending.acked = True
+                    pending.queue.put_nowait(event)
             return
         # Errores u otros mensajes sin mint: no hay a quién atribuirlos.
         logger.debug(f"[Feed compartido] mensaje sin mint descartado: {event!r}")

@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from pepump.history import append_closed_trade
-from pepump.pump import TradeOutcomeUnknown
+from pepump.pumpportal import TradeOutcomeUnknown
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +30,7 @@ class Position:
     # PnL usa entry_price. Si no se pasa, vale lo mismo que entry_price
     # (modo simulado, o compra real sin fill real -> comportamiento
     # idéntico al de antes).
-    market_entry_price: Optional[float] = None
+    market_entry_price: float = 0.0
     highest_price: float = field(init=False)
     armed: bool = False                # ¿ya se activó el trailing stop?
     armed_at: Optional[float] = None   # time.time() de cuándo se armó (para el gráfico)
@@ -39,7 +39,7 @@ class Position:
     # REALES pre/post de la transacción de compra confirmada (ver
     # TradeExecutor.buy) en vez de ser una estimación a partir del
     # precio de referencia. Solo puede ser True en modo REAL, y solo si
-    # se pudo leer la tx (ver pump.py:_fetch_actual_fill) -si esa
+    # se pudo leer la tx (ver onchain/txinfo.py:fetch_actual_fill) -si esa
     # lectura falla, se cae al estimado y esto queda en False aunque la
     # compra haya sido real.
     entry_is_real_fill: bool = False
@@ -60,7 +60,7 @@ class Position:
     exit_is_real_fill: bool = False
 
     def __post_init__(self):
-        if self.market_entry_price is None or self.market_entry_price <= 0:
+        if not self.market_entry_price or self.market_entry_price <= 0:
             self.market_entry_price = self.entry_price
         # El máximo se compara siempre contra precios de MERCADO, así que
         # arranca en el precio de mercado de la entrada, no en el efectivo.
@@ -155,7 +155,7 @@ class TradeExecutor:
             # devuelve, además de la respuesta cruda de la Lightning
             # API, los datos REALES de fill (leídos de los balances
             # pre/post de la propia transacción) en "actual_sol_delta" /
-            # "actual_token_delta" -ver pump.py:_fetch_actual_fill. Si
+            # "actual_token_delta" -ver onchain/txinfo.py:fetch_actual_fill. Si
             # están, reemplazan la estimación con los números reales de
             # lo que efectivamente pasó en la wallet (incluye fees).
             actual_sol_delta = result.get("actual_sol_delta") if isinstance(result, dict) else None
@@ -277,7 +277,7 @@ class TradeExecutor:
 
             # La venta CONFIRMÓ on-chain. Igual que en buy(), reemplazamos
             # la estimación con los datos REALES de fill si se pudieron
-            # leer -ver pump.py:_fetch_actual_fill.
+            # leer -ver onchain/txinfo.py:fetch_actual_fill.
             actual_sol_delta = result.get("actual_sol_delta") if isinstance(result, dict) else None
             actual_token_delta = result.get("actual_token_delta") if isinstance(result, dict) else None
             # La señal de que la venta se leyó bien es el delta de TOKENS
@@ -354,7 +354,7 @@ class TradeExecutor:
         # sus propios errores de disco.
         history_path = getattr(self.cfg, "trade_history_csv", "") or ""
         append_closed_trade(history_path, {
-            "closed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+            "closed_at": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
             "mint": position.mint,
             "mode": etiqueta,
             "entry_price": f"{position.entry_price:.10f}",

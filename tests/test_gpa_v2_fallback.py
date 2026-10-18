@@ -1,6 +1,6 @@
 """
 Tests del fallback a getProgramAccountsV2 y de los errores del RPC que
-antes quedaban tapados (ver pump.py: _rpc_value / _get_program_accounts).
+antes quedaban tapados (ver onchain/rpc.py: rpc_value / get_program_accounts).
 
 Caso real que motivó todo esto: Helius dejó de servir el
 getProgramAccounts clásico sobre el programa de PumpSwap (10M de cuentas)
@@ -18,9 +18,9 @@ import pytest
 from solana.rpc.types import MemcmpOpts
 from solders.pubkey import Pubkey
 
-from pepump import pump as pump_module
-from pepump.pump import (PUMPSWAP_PROGRAM_ID, RpcErrorResponse, _get_program_accounts,
-                          _rpc_value)
+from pepump.onchain import rpc as rpc_module
+from pepump.onchain.programs import PUMPSWAP_PROGRAM_ID
+from pepump.onchain.rpc import RpcErrorResponse, get_program_accounts, rpc_value
 
 PROGRAM = Pubkey.from_string(PUMPSWAP_PROGRAM_ID)
 FILTROS = [MemcmpOpts(offset=43, bytes="So11111111111111111111111111111111111111112")]
@@ -84,28 +84,28 @@ def fake_post(monkeypatch):
             hechas.append(json)
             return FakeHttpResponse(paginas[len(hechas) - 1])
 
-        monkeypatch.setattr(pump_module.requests, "post", _post)
+        monkeypatch.setattr(rpc_module.requests, "post", _post)
         return hechas
     return _instalar
 
 
-# --- _rpc_value: el error del RPC deja de quedar tapado ---------------- #
+# --- rpc_value: el error del RPC deja de quedar tapado ---------------- #
 
 def test_rpc_value_devuelve_el_valor_si_la_respuesta_es_normal():
-    assert _rpc_value(RespuestaOk([1, 2, 3]), "algo") == [1, 2, 3]
-    assert _rpc_value(RespuestaOk(None), "algo") is None
+    assert rpc_value(RespuestaOk([1, 2, 3]), "algo") == [1, 2, 3]
+    assert rpc_value(RespuestaOk(None), "algo") is None
 
 
 def test_rpc_value_traduce_el_error_del_nodo_en_vez_de_un_attributeerror():
     """Antes: AttributeError sin información. Ahora: el mensaje del nodo,
     que es el que explica de verdad qué pasó."""
     with pytest.raises(RpcErrorResponse) as exc:
-        _rpc_value(RespuestaDeError(MENSAJE_HELIUS), "los pools de PumpSwap de X")
+        rpc_value(RespuestaDeError(MENSAJE_HELIUS), "los pools de PumpSwap de X")
     assert "los pools de PumpSwap de X" in str(exc.value)
     assert "getProgramAccountsV2" in str(exc.value)
 
 
-# --- _get_program_accounts: camino normal y fallback a la V2 ----------- #
+# --- get_program_accounts: camino normal y fallback a la V2 ----------- #
 
 async def test_usa_la_clasica_cuando_el_rpc_la_acepta(fake_post):
     """Si getProgramAccounts funciona, no se toca la V2: los RPC que no la
@@ -113,7 +113,7 @@ async def test_usa_la_clasica_cuando_el_rpc_la_acepta(fake_post):
     hechas = fake_post([])
     client = FakeClient(RespuestaOk(["cuenta-a", "cuenta-b"]))
 
-    assert await _get_program_accounts(client, "http://rpc.test", PROGRAM, FILTROS, "x") == \
+    assert await get_program_accounts(client, "http://rpc.test", PROGRAM, FILTROS, "x") == \
         ["cuenta-a", "cuenta-b"]
     assert client.calls == 1
     assert hechas == []  # no se mandó ningún getProgramAccountsV2
@@ -125,11 +125,11 @@ async def test_cae_a_la_v2_cuando_el_rpc_pide_paginacion(fake_post):
     hechas = fake_post([pagina([("Pool1111", b"datos-del-pool")])])
     client = FakeClient(RespuestaDeError(MENSAJE_HELIUS))
 
-    cuentas = await _get_program_accounts(client, "http://rpc.test", PROGRAM, FILTROS, "x")
+    cuentas = await get_program_accounts(client, "http://rpc.test", PROGRAM, FILTROS, "x")
 
     assert len(cuentas) == 1
     # Misma forma que las cuentas de solana-py, para que el parseo de los
-    # clientes de pump.py sirva igual venga de donde venga.
+    # clientes de onchain/ sirva igual venga de donde venga.
     assert str(cuentas[0].pubkey) == "Pool1111"
     assert cuentas[0].account.data == b"datos-del-pool"
     # Y se mandó con el método y los filtros correctos.
@@ -150,7 +150,7 @@ async def test_la_v2_recorre_todas_las_paginas_aunque_vengan_vacias(fake_post):
     ])
     client = FakeClient(RespuestaDeError(MENSAJE_HELIUS))
 
-    cuentas = await _get_program_accounts(client, "http://rpc.test", PROGRAM, FILTROS, "x")
+    cuentas = await get_program_accounts(client, "http://rpc.test", PROGRAM, FILTROS, "x")
 
     assert [str(c.pubkey) for c in cuentas] == ["Pool2222"]
     assert len(hechas) == 3
@@ -164,12 +164,12 @@ async def test_un_barrido_truncado_lanza_en_vez_de_devolver_resultados_parciales
     lista vacía como `pool_confirmed_absent=True`, o sea una CONFIRMACIÓN
     de que el mint no tiene pool. Con la paginación a medias eso sería
     mentira, así que tiene que fallar explícitamente."""
-    monkeypatch.setattr(pump_module, "_GPA_V2_MAX_PAGES", 3)
+    monkeypatch.setattr(rpc_module, "_GPA_V2_MAX_PAGES", 3)
     fake_post([pagina([], pagination_key=f"sigue-{i}") for i in range(10)])
     client = FakeClient(RespuestaDeError(MENSAJE_HELIUS))
 
     with pytest.raises(RpcErrorResponse, match="no terminó de paginar"):
-        await _get_program_accounts(client, "http://rpc.test", PROGRAM, FILTROS, "x")
+        await get_program_accounts(client, "http://rpc.test", PROGRAM, FILTROS, "x")
 
 
 async def test_otros_errores_del_rpc_no_disparan_la_v2(fake_post):
@@ -180,7 +180,7 @@ async def test_otros_errores_del_rpc_no_disparan_la_v2(fake_post):
     client = FakeClient(RespuestaDeError("Invalid API key"))
 
     with pytest.raises(RpcErrorResponse, match="Invalid API key"):
-        await _get_program_accounts(client, "http://rpc.test", PROGRAM, FILTROS, "x")
+        await get_program_accounts(client, "http://rpc.test", PROGRAM, FILTROS, "x")
     assert hechas == []
 
 
@@ -189,4 +189,4 @@ async def test_la_v2_propaga_su_propio_error_del_rpc(fake_post):
     client = FakeClient(RespuestaDeError(MENSAJE_HELIUS))
 
     with pytest.raises(RpcErrorResponse, match="Pagination limit too large"):
-        await _get_program_accounts(client, "http://rpc.test", PROGRAM, FILTROS, "x")
+        await get_program_accounts(client, "http://rpc.test", PROGRAM, FILTROS, "x")

@@ -1,9 +1,9 @@
-from dataclasses import dataclass, fields
 import logging
 import os
 import tomllib
+from dataclasses import dataclass, fields
 
-from solders.pubkey import Pubkey  # type: ignore
+from solders.pubkey import Pubkey
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +83,7 @@ class AppConfig:
     # (subscribeTokenTrade) ANTES de recurrir al fallback on-chain de
     # PumpSwap. Solo aplica si ya llegó el ack de suscripción pero ningún
     # trade real -> típicamente un mint que ya migró a PumpSwap, caso en
-    # el que subscribeTokenTrade no entrega nada (ver pump.py). Mientras
+    # el que subscribeTokenTrade no entrega nada (ver pumpportal.py). Mientras
     # el mint sigue en bonding curve, el feed en vivo funciona bien y este
     # timeout no debería llegar a cumplirse casi nunca.
     live_feed_timeout_seconds: float = 5.0
@@ -97,7 +97,7 @@ class AppConfig:
     entry_wait_timeout_seconds: float = 60.0
     # RPC de Solana usado ÚNICAMENTE para leer, on-chain, las reservas
     # reales del pool de PumpSwap cuando el mint ya migró (ver
-    # PumpSwapOnChainClient en pump.py). Un endpoint público gratuito alcanza para
+    # PumpSwapOnChainClient en onchain/pumpswap.py). Un endpoint público gratuito alcanza para
     # esto (una sola lectura, no trading), pero es lento/rate-limited;
     # para uso serio conviene un RPC dedicado (Helius, QuickNode, etc.).
     solana_rpc_url: str = "https://api.mainnet-beta.solana.com"
@@ -126,7 +126,7 @@ class AppConfig:
     # darla por fallida. Necesario porque PumpPortal puede devolver un
     # 200 OK con firma de forma "optimista", antes de saber si la tx va
     # a confirmar o reventar (p. ej. por slippage excedido) — ver
-    # execute_lightning_trade en pump.py.
+    # execute_lightning_trade en pumpportal.py.
     tx_confirm_timeout_seconds: float = 30.0
     tx_confirm_poll_interval_seconds: float = 2.0
 

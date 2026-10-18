@@ -64,10 +64,11 @@ import logging
 import sys
 
 from pepump.config import load_config, validate_mint
-from pepump.pump import PumpPortalClient, TokenMetadataOnChainClient
 from pepump.dashboard import MultiPositionPanel
 from pepump.logging_config import setup_logging
 from pepump.manager import PositionManager
+from pepump.onchain.metadata import TokenMetadataOnChainClient
+from pepump.pumpportal import PumpPortalClient
 from pepump.shutdown import run_with_shutdown_signals_for
 
 logger = logging.getLogger(__name__)
@@ -80,7 +81,8 @@ def parse_args():
     p.add_argument("-m", "--mint", type=str, action="append", default=[],
                    help="Mint con el que abrir una posición. Se puede repetir: -m <MINT1> -m <MINT2>. "
                         "Sin -m, solo se retoman las posiciones que quedaron abiertas")
-    p.add_argument("-c", "--config", default="config.toml", help="Ruta al archivo .toml de configuración (default: config.toml)")
+    p.add_argument("-c", "--config", default="config.toml",
+                   help="Ruta al archivo .toml de configuración (default: config.toml)")
     p.add_argument("-v", "--verbose", action="store_true", help="Logging en nivel DEBUG en vez de INFO")
     p.add_argument("--web", nargs="?", type=int, const=8080, default=None, metavar="PUERTO",
                    help="Arranca el panel web en http://127.0.0.1:PUERTO (default 8080) y deja el bot "
@@ -123,7 +125,7 @@ if __name__ == "__main__":
     panel = setup_logging(level=logging.DEBUG if args.verbose else logging.INFO, panel=not args.no_panel,
                           tag_mint=True)
 
-    
+
     try:
         config = load_config(args.config)
         # Los mints vienen SIEMPRE de la línea de comandos, nunca del .toml.
@@ -200,7 +202,7 @@ if __name__ == "__main__":
             manager.panel_factory = multi.for_position
 
         web = None
-        if web_sock is not None:
+        if web_sock is not None and log_buffer is not None:
             from pepump.web.server import WebPanel, allowed_hosts_for, create_app
             app = create_app(manager, log_buffer, live=config.live,
                              allowed_hosts=allowed_hosts_for(args.web_host),
@@ -224,7 +226,8 @@ if __name__ == "__main__":
         async def run_all():
             retomadas = await manager.recover()
             for mint in mints:
-                if manager.get(mint) is not None and manager.get(mint).active:
+                existente = manager.get(mint)
+                if existente is not None and existente.active:
                     logger.info(f"{mint} ya estaba abierta y se retomó: no se abre otra.")
                     continue
                 try:

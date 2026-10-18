@@ -12,8 +12,9 @@ import asyncio
 import pytest
 from solders.pubkey import Pubkey
 
-from pepump import pump as pump_module
-from pepump.pump import WSOL_MINT, RaydiumCpmmOnChainClient
+from pepump.onchain import raydium_cpmm as raydium_cpmm_module
+from pepump.onchain.programs import WSOL_MINT
+from pepump.onchain.raydium_cpmm import RaydiumCpmmOnChainClient
 
 MINT = "Dz9mQ9NzkBcCsuGPFJ3r1bS4wgqKMHBPiVuniW8Mbonk"
 LAMPORTS = 10 ** 9
@@ -117,7 +118,7 @@ def _cache_limpio():
 
 
 def _fetch(monkeypatch, rpc):
-    monkeypatch.setattr(pump_module, "AsyncClient", lambda url: rpc)
+    monkeypatch.setattr(raydium_cpmm_module, "AsyncClient", lambda url: rpc)
     return asyncio.run(RaydiumCpmmOnChainClient("http://fake-rpc").fetch_price_or_confirm_absent(MINT))
 
 

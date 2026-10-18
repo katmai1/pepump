@@ -5,7 +5,7 @@ subscribeTokenTrade da el ack pero no entrega ningún trade real para un
 mint que sigue en bonding curve (ver bot.py:_try_onchain_fallback /
 _handle_feed_stall).
 
-No pega a la red real: monkeypatchea pump_module.AsyncClient con un
+No pega a la red real: monkeypatchea pump_curve_module.AsyncClient con un
 fake que devuelve bytes armados a mano con el mismo layout que la
 cuenta real (ver PUMP_CURVE_STATE_FIELD_OFFSETS documentado en la
 propia clase).
@@ -13,8 +13,8 @@ propia clase).
 import asyncio
 import struct
 
-from pepump import pump as pump_module
-from pepump.pump import PumpCurveOnChainClient
+from pepump.onchain import pump_curve as pump_curve_module
+from pepump.onchain.pump_curve import PumpCurveOnChainClient
 
 FAKE_MINT = "So11111111111111111111111111111111111111112"  # cualquier mint válido, no se valida contra la red
 
@@ -75,7 +75,7 @@ def test_precio_normal_curva_activa(monkeypatch):
         complete=False,
     )
     fake_client = FakeAsyncClient(FakeAccountInfoResp(FakeAccountInfoValue(data)))
-    monkeypatch.setattr(pump_module, "AsyncClient", lambda url: fake_client)
+    monkeypatch.setattr(pump_curve_module, "AsyncClient", lambda url: fake_client)
 
     client = PumpCurveOnChainClient("http://fake-rpc")
     price, complete, exists = asyncio.run(client.fetch_price_or_status(FAKE_MINT))
@@ -96,7 +96,7 @@ def test_layout_tolera_bytes_extra_al_final(monkeypatch):
         extra_bytes=200,
     )
     fake_client = FakeAsyncClient(FakeAccountInfoResp(FakeAccountInfoValue(data)))
-    monkeypatch.setattr(pump_module, "AsyncClient", lambda url: fake_client)
+    monkeypatch.setattr(pump_curve_module, "AsyncClient", lambda url: fake_client)
 
     client = PumpCurveOnChainClient("http://fake-rpc")
     price, complete, exists = asyncio.run(client.fetch_price_or_status(FAKE_MINT))
@@ -112,7 +112,7 @@ def test_curva_completada_devuelve_complete_true(monkeypatch):
         complete=True,
     )
     fake_client = FakeAsyncClient(FakeAccountInfoResp(FakeAccountInfoValue(data)))
-    monkeypatch.setattr(pump_module, "AsyncClient", lambda url: fake_client)
+    monkeypatch.setattr(pump_curve_module, "AsyncClient", lambda url: fake_client)
 
     client = PumpCurveOnChainClient("http://fake-rpc")
     price, complete, exists = asyncio.run(client.fetch_price_or_status(FAKE_MINT))
@@ -123,7 +123,7 @@ def test_curva_completada_devuelve_complete_true(monkeypatch):
 
 def test_cuenta_inexistente(monkeypatch):
     fake_client = FakeAsyncClient(FakeAccountInfoResp(None))
-    monkeypatch.setattr(pump_module, "AsyncClient", lambda url: fake_client)
+    monkeypatch.setattr(pump_curve_module, "AsyncClient", lambda url: fake_client)
 
     client = PumpCurveOnChainClient("http://fake-rpc")
     price, complete, exists = asyncio.run(client.fetch_price_or_status(FAKE_MINT))
@@ -136,7 +136,7 @@ def test_cuenta_inexistente(monkeypatch):
 def test_virtual_token_reserves_cero_no_calcula_precio(monkeypatch):
     data = _make_account_data(virtual_token_reserves=0, virtual_sol_reserves=30 * 10**9, complete=False)
     fake_client = FakeAsyncClient(FakeAccountInfoResp(FakeAccountInfoValue(data)))
-    monkeypatch.setattr(pump_module, "AsyncClient", lambda url: fake_client)
+    monkeypatch.setattr(pump_curve_module, "AsyncClient", lambda url: fake_client)
 
     client = PumpCurveOnChainClient("http://fake-rpc")
     price, complete, exists = asyncio.run(client.fetch_price_or_status(FAKE_MINT))
@@ -147,7 +147,7 @@ def test_virtual_token_reserves_cero_no_calcula_precio(monkeypatch):
 
 def test_cuenta_mas_chica_de_lo_esperado_no_rompe(monkeypatch):
     fake_client = FakeAsyncClient(FakeAccountInfoResp(FakeAccountInfoValue(b"\x00" * 10)))
-    monkeypatch.setattr(pump_module, "AsyncClient", lambda url: fake_client)
+    monkeypatch.setattr(pump_curve_module, "AsyncClient", lambda url: fake_client)
 
     client = PumpCurveOnChainClient("http://fake-rpc")
     price, complete, exists = asyncio.run(client.fetch_price_or_status(FAKE_MINT))
@@ -168,7 +168,7 @@ def test_excepcion_de_red_no_propaga(monkeypatch):
         async def __aexit__(self, *exc_info):
             return False
 
-    monkeypatch.setattr(pump_module, "AsyncClient", BoomClient)
+    monkeypatch.setattr(pump_curve_module, "AsyncClient", BoomClient)
 
     client = PumpCurveOnChainClient("http://fake-rpc")
     price, complete, exists = asyncio.run(client.fetch_price_or_status(FAKE_MINT))

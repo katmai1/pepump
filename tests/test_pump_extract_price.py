@@ -1,6 +1,6 @@
 import pytest
 
-from pepump.pump import PumpPortalClient
+from pepump.pumpportal import PumpPortalClient
 
 
 def test_extract_price_level1_bonding_curve_reserves():

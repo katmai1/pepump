@@ -282,7 +282,7 @@ def create_app(manager: PositionManager, logs: LogBuffer, *, live: bool,
             try:
                 result = await manager.preview(mint)
             except ValueError as e:
-                raise HTTPException(status_code=400, detail=str(e))
+                raise HTTPException(status_code=400, detail=str(e)) from e
             preview_cache[mint] = (time.monotonic(), result)
             if len(preview_cache) > 200:
                 preview_cache.clear()
@@ -321,7 +321,7 @@ def create_app(manager: PositionManager, logs: LogBuffer, *, live: bool,
                                           overrides.get("priority_fee", defaults["priority_fee"]))
             managed = manager.open(mint, **overrides)
         except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+            raise HTTPException(status_code=400, detail=str(e)) from e
         modo = "REAL" if managed.config.live else "simulada"
         logger.info(f"Posición #{managed.id} ({modo}) abierta desde la web ({client_ip(request)}).")
         return {"id": managed.id, **managed.bot.snapshot()}
@@ -368,7 +368,7 @@ def create_app(manager: PositionManager, logs: LogBuffer, *, live: bool,
                 timeout = min(max(0.0, next_state - time.monotonic()), _SHUTDOWN_CHECK_SECONDS)
                 try:
                     entry = await asyncio.wait_for(queue.get(), timeout=timeout)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     if time.monotonic() < next_state:
                         continue  # solo tocaba mirar si se está apagando
                     # La sesión puede caducar (o cerrarse) con el WebSocket abierto.

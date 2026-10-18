@@ -182,6 +182,8 @@ bot "ve" del precio contra el que realmente se ejecuta la orden.
 ```bash
 pip install -r requirements-dev.txt
 pytest
+ruff check .     # lint (config en pyproject.toml)
+mypy             # tipos
 ```
 
 No se toca la red en ningún test: el websocket, la Lightning API y el RPC

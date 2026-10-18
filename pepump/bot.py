@@ -3,12 +3,15 @@ import contextlib
 import logging
 import time
 from collections import deque
-from typing import AsyncIterator, Optional
+from typing import Any, AsyncIterator, Callable, Optional
 
 from pepump.executor import Position
 from pepump.log_context import current_mint, set_mint_label
-from pepump.pump import (PumpSwapOnChainClient, PumpCurveOnChainClient, RaydiumCpmmOnChainClient,
-                         MeteoraDlmmOnChainClient)
+from pepump.onchain.meteora_dlmm import MeteoraDlmmOnChainClient
+from pepump.onchain.pump_curve import PumpCurveOnChainClient
+from pepump.onchain.pumpswap import PumpSwapOnChainClient
+from pepump.onchain.raydium_cpmm import RaydiumCpmmOnChainClient
+from pepump.strategy import Action, TrailingStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -77,10 +80,10 @@ class TrailingTakeProfitBot:
         # Historial de precios (ts, precio) para el gráfico; ver _record_price.
         self.price_history: deque = deque(maxlen=_PRICE_HISTORY_MAX)
         # Lo pone el gestor: guarda cada punto en la base de datos.
-        self._price_cb = None
+        self._price_cb: Optional[Callable[[float, float], None]] = None
         self._latest_price: Optional[float] = None
         self._closed_event = asyncio.Event()
-        self._ws = None
+        self._ws: Any = None
         self._trade_events: Optional[AsyncIterator[dict]] = None
         # BUGFIX (generador cerrado por timeout): ver _next_trade_event.
         # Tarea pendiente de `self._trade_events.__anext__()` que puede
@@ -182,6 +185,10 @@ class TrailingTakeProfitBot:
         self.token_name: Optional[str] = None
         self.token_symbol: Optional[str] = None
         self._update_panel_fixed()
+
+    @property
+    def strategy(self) -> TrailingStrategy:
+        return TrailingStrategy.from_config(self.cfg)
 
     def close(self, reason: str = "cierre manual") -> None:
         """Pide el cierre ordenado: si hay una posición abierta se vende
@@ -676,6 +683,8 @@ class TrailingTakeProfitBot:
             return pending.result()
 
         if pending is None or pending.cancelled():
+            if self._trade_events is None:
+                raise RuntimeError("_next_trade_event sin conexión al feed")
             next_task = asyncio.ensure_future(self._trade_events.__anext__())
         else:
             next_task = pending
@@ -710,7 +719,7 @@ class TrailingTakeProfitBot:
         # Ganó el timeout: dejamos next_task VIVA (sin cancelar) para
         # retomarla en la próxima llamada en vez de cerrar el generador.
         self._pending_next_event_task = next_task
-        raise asyncio.TimeoutError()
+        raise TimeoutError()
 
     async def _get_initial_price(self) -> Optional[float]:
         """Punto de entrada para conseguir el precio de compra real.
@@ -770,7 +779,7 @@ class TrailingTakeProfitBot:
         start = time.monotonic()
         last_reminder = start
         recibio_ack = False
-        ack_received_at: Optional[float] = None
+        ack_received_at = 0.0  # solo cuenta con recibio_ack
         sin_precio = 0
 
         existence_check_task: Optional[asyncio.Task] = asyncio.ensure_future(
@@ -835,7 +844,7 @@ class TrailingTakeProfitBot:
                 except _ShutdownRequested:
                     logger.info("Cancelado por el usuario mientras se esperaba el precio de entrada.")
                     return None
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     continue  # se recalcula el timeout restante y dispara el fallback arriba
                 except StopAsyncIteration:
                     logger.warning("[Feed en vivo] la conexión se cerró antes de recibir un trade con precio.")
@@ -1100,7 +1109,7 @@ class TrailingTakeProfitBot:
                     )
                     logger.info("Cancelado por el usuario mientras se esperaba la baja de entrada.")
                     return None
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     continue  # se cumplió el intervalo de polling sin pedido de shutdown; seguimos
 
         # Feed en vivo: reusamos la misma conexión/suscripción ya abierta.
@@ -1134,8 +1143,9 @@ class TrailingTakeProfitBot:
                     # entra por aquí: es subclase de Exception. Solo se
                     # distingue para el texto del log.
                     is_clean_close = isinstance(e, StopAsyncIteration)
-                    logger.warning(f"[Feed en vivo] {'la conexión se cerró' if is_clean_close else f'conexión interrumpida ({e})'} "
-                                   f"mientras se esperaba la baja de entrada; reconectando...")
+                    motivo = "la conexión se cerró" if is_clean_close else f"conexión interrumpida ({e})"
+                    logger.warning(f"[Feed en vivo] {motivo} mientras se esperaba la baja de entrada; "
+                                   f"reconectando...")
                     try:
                         if self._ws is not None:
                             try:
@@ -1271,7 +1281,7 @@ class TrailingTakeProfitBot:
                         return
                     try:
                         event = await self._next_trade_event(timeout=self.cfg.stall_timeout_seconds)
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         if await self._handle_feed_stall():
                             return  # migró: _handle_feed_stall ya corrió el polling on-chain hasta el cierre
                         continue  # solo poco volumen: seguimos esperando el feed en vivo
@@ -1370,7 +1380,7 @@ class TrailingTakeProfitBot:
             return True
 
         curve = PumpCurveOnChainClient(self.cfg.solana_rpc_url)
-        curve_price, complete, exists = await curve.fetch_price_or_status(self.mint)
+        curve_price, complete, _exists = await curve.fetch_price_or_status(self.mint)
         if curve_price is not None and not complete:
             self._curve_stalls += 1
             if self._curve_stalls >= _MAX_CURVE_STALLS_BEFORE_POLLING:
@@ -1470,9 +1480,7 @@ class TrailingTakeProfitBot:
         if pos is None:
             return snap
 
-        # Mismos umbrales que evalúa _on_price_update, contra el precio de
-        # entrada que corresponde a strategy_price_basis.
-        entry = pos.strategy_entry_price(cfg.strategy_price_basis)
+        strategy = self.strategy
         live_price = price is not None and price > 0 and not pos.closed
         snap["position"] = {
             "entry_price": pos.entry_price,
@@ -1484,12 +1492,11 @@ class TrailingTakeProfitBot:
             "armed": pos.armed,
             "armed_at": pos.armed_at,
             "highest_price": pos.highest_price,
-            "activation_price": entry * (1 + cfg.activation_pct / 100.0),
-            "initial_stop_price": entry * (1 - cfg.initial_stop_pct / 100.0),
-            "trailing_stop_price": (pos.highest_price * (1 - cfg.trailing_pct / 100.0)
-                                    if pos.armed else None),
-            "market_pnl_pct": pos.market_pnl_pct(price) if live_price else None,
-            "net_pnl_pct": pos.pnl_pct(price) if live_price else None,
+            "activation_price": strategy.activation_price(pos),
+            "initial_stop_price": strategy.initial_stop_price(pos),
+            "trailing_stop_price": strategy.trailing_stop_price(pos),
+            "market_pnl_pct": pos.market_pnl_pct(price) if live_price and price is not None else None,
+            "net_pnl_pct": pos.pnl_pct(price) if live_price and price is not None else None,
             "closed": pos.closed,
             "closed_at": pos.closed_at,
             "exit_price": pos.exit_price,
@@ -1522,12 +1529,12 @@ class TrailingTakeProfitBot:
         else:
             coste = f" | coste real {pos.entry_price:.10f}" if pos.entry_is_real_fill else ""
             lines.append(f" Entrada {pos.market_entry_price:.10f} SOL/token{coste}")
-            entry = pos.strategy_entry_price(cfg.strategy_price_basis)
+            strategy = self.strategy
             base = "precio real" if cfg.strategy_price_basis == "real" else "precio de mercado"
-            lines.append(f" Activación +{cfg.activation_pct}% (>= {entry * (1 + cfg.activation_pct / 100.0):.10f}) "
+            lines.append(f" Activación +{cfg.activation_pct}% (>= {strategy.activation_price(pos):.10f}) "
                          f"| trailing {cfg.trailing_pct}% "
                          f"| stop-loss inicial -{cfg.initial_stop_pct}% "
-                         f"(<= {entry * (1 - cfg.initial_stop_pct / 100.0):.10f}) | sobre {base}")
+                         f"(<= {strategy.initial_stop_price(pos):.10f}) | sobre {base}")
         self.panel.set_fixed(lines)
 
     def _show_status(self, line: str) -> None:
@@ -1567,7 +1574,7 @@ class TrailingTakeProfitBot:
             neto = (f" | neto {pos.pnl_pct(self.latest_price):+.2f}%"
                     if pos.entry_is_real_fill else "")
             if pos.armed:
-                stop_price = pos.highest_price * (1 - self.cfg.trailing_pct / 100.0)
+                stop_price = self.strategy.trailing_stop_price(pos)
                 self._show_status(f"⏱️  [armado] precio {self.latest_price:.10f} | máximo {pos.highest_price:.10f} "
                                   f"| nivel de venta {stop_price:.10f} | mercado: {pnl:+.2f}%{neto}")
             else:
@@ -1607,6 +1614,8 @@ class TrailingTakeProfitBot:
         # Meteora DLMM: la Lightning API no tiene un pool "meteora", así que
         # se fuerza "auto" (aunque cfg.pool diga otra cosa) y PumpPortal
         # decide por dónde rutear.
+        if self._onchain_source is None:
+            return None
         return {"pumpswap": "pump-amm", "raydium-cpmm": "raydium-cpmm",
                 "meteora-dlmm": "auto"}.get(self._onchain_source)
 
@@ -1618,55 +1627,28 @@ class TrailingTakeProfitBot:
                     f"| stop-loss inicial (antes de armar): -{self.cfg.initial_stop_pct}%")
 
     async def _on_price_update(self, price: float) -> None:
+        """Aplica la decisión de la estrategia (ver strategy.py) a la
+        posición: armar, registrar un máximo nuevo o vender."""
         pos = self.position
         if pos is None or pos.closed:
             return
-        basis = self.cfg.strategy_price_basis
-        # % contra el mismo precio de entrada que usan los umbrales de
-        # aquí abajo: neto con "real", de mercado con "market".
-        pnl = pos.strategy_pnl_pct(price, basis)
-        entry = pos.strategy_entry_price(basis)
+        strategy = self.strategy
+        decision = strategy.evaluate(pos, price)
 
-        # --- Caso 1: todavía no se armó el trailing-stop ------------------ #
-        #
-        # Por defecto (strategy_price_basis = "real") los umbrales se
-        # comparan contra `entry_price`: con datos reales de fill es el
-        # precio EFECTIVO pagado e incluye comisiones + priority fee + el
-        # rent de la ATA (sobre una compra de 0.05 SOL eso puede ser un
-        # 4-5%). Así la activación pide ganancia REAL y el stop-loss corta
-        # por pérdida REAL, y el listón efectivo sobre el precio de mercado
-        # queda más alto (activación) y más cerca (stop-loss).
-        #
-        # Con "market" se comparan contra `market_entry_price` (el precio
-        # de MERCADO al comprar), como antes: los % coinciden con los de
-        # pump.fun y las comisiones no mueven los umbrales.
-        if not pos.armed:
-            if price >= entry * (1 + self.cfg.activation_pct / 100.0):
-                pos.armed = True
-                pos.armed_at = time.time()
-                pos.highest_price = price
-                self._persist()
-                logger.info(f"✅ Trailing-stop ARMADO. Precio actual {price:.10f} "
-                            f"(PnL {pnl:+.2f}%). Máximo inicial registrado.")
-            elif price <= entry * (1 - self.cfg.initial_stop_pct / 100.0):
-                await self._try_sell(pos, price, "stop-loss inicial (nunca se activó el trailing)")
-            return
-
-        # --- Caso 2: trailing-stop armado, sigue el máximo ----------------- #
-        if price > pos.highest_price:
+        if decision.action is Action.ARM:
+            pos.armed = True
+            pos.armed_at = time.time()
             pos.highest_price = price
             self._persist()
-            stop_price = pos.highest_price * (1 - self.cfg.trailing_pct / 100.0)
-            logger.info(f"📈 Nuevo máximo: {price:.10f} (PnL {pnl:+.2f}%) "
-                        f"| nuevo nivel de venta (trailing): {stop_price:.10f}")
-            return
-
-        stop_price = pos.highest_price * (1 - self.cfg.trailing_pct / 100.0)
-        if price <= stop_price:
-            await self._try_sell(
-                pos, price,
-                f"retroceso de {self.cfg.trailing_pct}% desde el máximo ({pos.highest_price:.10f})"
-            )
+            logger.info(f"✅ Trailing-stop ARMADO. Precio actual {price:.10f} "
+                        f"(PnL {strategy.pnl_pct(pos, price):+.2f}%). Máximo inicial registrado.")
+        elif decision.action is Action.NEW_HIGH:
+            pos.highest_price = price
+            self._persist()
+            logger.info(f"📈 Nuevo máximo: {price:.10f} (PnL {strategy.pnl_pct(pos, price):+.2f}%) "
+                        f"| nuevo nivel de venta (trailing): {strategy.trailing_stop_price(pos):.10f}")
+        elif decision.is_sell:
+            await self._try_sell(pos, price, decision.reason)
 
     async def _try_sell(self, pos: Position, price: float, reason: str) -> None:
         """Envuelve executor.sell(): si la venta REAL falla (Lightning API

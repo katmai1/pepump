@@ -135,7 +135,7 @@ async def test_sell_appends_row_to_trade_history_csv(tmp_path):
     with open(history_path, newline="", encoding="utf-8") as f:
         rows = list(csv.reader(f))
     assert rows[0] == CSV_FIELDS
-    row = dict(zip(CSV_FIELDS, rows[1]))
+    row = dict(zip(CSV_FIELDS, rows[1], strict=True))
     assert row["mint"] == "MintABC"
     assert row["mode"] == "SIMULADO"
     assert row["reason"] == "trailing-stop"
@@ -186,7 +186,7 @@ class FastConfirmConfig(DummyConfig):
 
 
 async def test_sell_live_unknown_outcome_but_tokens_gone_marks_closed():
-    from pepump.pump import TradeOutcomeUnknown
+    from pepump.pumpportal import TradeOutcomeUnknown
     client = FakeClientWithBalance([10.0, 0.0], exc=TradeOutcomeUnknown("read timeout"))
     executor = TradeExecutor(client=client, live=True, config=FastConfirmConfig())
     pos = Position(mint="M", entry_price=1.0, sol_amount=0.05, token_amount=0.05)
@@ -198,7 +198,7 @@ async def test_sell_live_unknown_outcome_but_tokens_gone_marks_closed():
 
 @pytest.mark.parametrize("balance", [10.0, None])
 async def test_sell_live_unknown_outcome_with_tokens_or_unknown_balance_stays_open(balance):
-    from pepump.pump import TradeOutcomeUnknown
+    from pepump.pumpportal import TradeOutcomeUnknown
     client = FakeClientWithBalance([balance], exc=TradeOutcomeUnknown("read timeout"))
     executor = TradeExecutor(client=client, live=True, config=FastConfirmConfig())
     pos = Position(mint="M", entry_price=1.0, sol_amount=0.05, token_amount=0.05)

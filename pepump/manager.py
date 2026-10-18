@@ -19,6 +19,7 @@ cuando se corría uno solo; el gestor solo:
 """
 import asyncio
 import dataclasses
+import functools
 import logging
 import time
 from dataclasses import dataclass
@@ -29,7 +30,8 @@ from pepump.config import AppConfig, validate_config, validate_mint
 from pepump.executor import Position, TradeExecutor
 from pepump.feed import SharedTradeFeed
 from pepump.log_context import enable_tags
-from pepump.pump import PumpCurveOnChainClient, PumpSwapOnChainClient
+from pepump.onchain.pump_curve import PumpCurveOnChainClient
+from pepump.onchain.pumpswap import PumpSwapOnChainClient
 from pepump.store import PositionStore
 
 logger = logging.getLogger(__name__)
@@ -162,7 +164,7 @@ class PositionManager:
         if self.panel_factory is not None:
             bot.panel = self.panel_factory(managed)
             bot._update_panel_fixed()
-        task.add_done_callback(lambda t, m=managed: self._on_done(m, t))
+        task.add_done_callback(functools.partial(self._on_done, managed))
         self._positions[pos_id] = managed
         if len(self._positions) > 1:
             enable_tags()
@@ -224,6 +226,8 @@ class PositionManager:
 
     # --- persistencia -------------------------------------------------------- #
     def _save(self, managed: ManagedPosition) -> None:
+        if self.store is None:
+            return
         bot = managed.bot
         pos = bot.position
         if pos is not None and pos.closed:
@@ -236,7 +240,7 @@ class PositionManager:
             status = "waiting_entry"
         else:
             status = "cancelled"
-        fields = {
+        fields: Dict[str, object] = {
             "status": status,
             "token_name": bot.token_name,
             "token_symbol": bot.token_symbol,
@@ -372,6 +376,7 @@ class PositionManager:
 
     def _recover_half_buy(self, row: dict, balance: Optional[float]) -> None:
         """El proceso murió con una compra enviada y sin confirmar."""
+        assert self.store is not None  # solo se llama desde recover()
         pos_id, mint = row["id"], row["mint"]
         if not row["live"]:
             motivo = "el bot se detuvo durante la compra (simulada)"
@@ -435,7 +440,7 @@ class PositionManager:
         getMultipleAccounts). Lanza ValueError si el mint no es válido."""
         mint = validate_mint(mint)
         rpc = self.base_config.solana_rpc_url
-        out = {"mint": mint, "name": None, "symbol": None, "market": None, "price": None,
+        out: Dict[str, object] = {"mint": mint, "name": None, "symbol": None, "market": None, "price": None,
                "active_position": None}
         ocupada = self._active_for_mint(mint)
         if ocupada is not None:
