@@ -13,6 +13,17 @@ class AppConfig:
     # --- [general] --------------------------------------------------- #
     mint: str = ""
     live: bool = False
+    # Modo SIMULADO: cobrar los costes que tendría una operación real
+    # (ver executor.simulated_buy / simulated_sell) para que el PnL simulado
+    # se parezca al real. False = compra y venta exactas al precio de
+    # mercado, sin ningún coste.
+    sim_costs: bool = True
+    # Comisiones por operación, en % del SOL: pump.fun (~1% en la bonding
+    # curve, ~0.3% en PumpSwap) + PumpPortal (1% con la Lightning API).
+    sim_fee_pct: float = 2.0
+    # Slippage en contra al simular: se compra este % más caro y se vende
+    # este % más barato que el precio de mercado.
+    sim_slippage_pct: float = 1.0
     # Cada cuánto tiempo (segundos) se muestra en pantalla el %% de profit actual.
     status_interval_seconds: float = 5.0
     # Ruta al .csv donde se va agregando (append) una fila por cada orden
@@ -67,8 +78,8 @@ class AppConfig:
     #               compra confirmada. Es lo que de verdad ganas o pierdes.
     #   "market" -> el precio de MERCADO al comprar (el que muestra
     #               pump.fun), sin costes. Era el comportamiento anterior.
-    # Sin datos reales de fill (modo simulado, o si no se pudo leer la tx)
-    # los dos precios son el mismo y da igual.
+    # Sin datos de fill (compra real sin poder leer la tx, o simulado con
+    # general.sim_costs = false) los dos precios son el mismo y da igual.
     strategy_price_basis: str = "real"
 
     # --- [pumpportal] ----------------------------------------------------- #
@@ -199,6 +210,8 @@ def validate_config(config: AppConfig) -> None:
             rango = "[0, 100)" if minimo_incluido else "(0, 100)"
             errores.append(f"{nombre} tiene que estar en el rango {rango} (está en {valor})")
 
+    porcentaje_abierto("general.sim_fee_pct", config.sim_fee_pct, minimo_incluido=True)
+    porcentaje_abierto("general.sim_slippage_pct", config.sim_slippage_pct, minimo_incluido=True)
     positivo("trade.buy_sol", config.buy_sol)
     positivo("trade.max_buy_sol", config.max_buy_sol)
     if config.buy_sol and config.max_buy_sol and config.buy_sol > config.max_buy_sol:

@@ -94,6 +94,15 @@ class Position:
         de mercado con "market"."""
         return self.market_pnl_pct(price) if basis == "market" else self.pnl_pct(price)
 
+    def has_entry_costs(self) -> bool:
+        """True si entry_price incluye los costes de entrar: datos reales de
+        la tx, o costes simulados (general.sim_costs). Ahí el PnL neto y el
+        de mercado son números distintos y vale la pena mostrar los dos."""
+        return self.entry_is_real_fill or self.entry_price != self.market_entry_price
+
+    def cost_label(self) -> str:
+        return "coste real" if self.entry_is_real_fill else "coste simulado"
+
     def entry_cost_pct(self) -> float:
         """Cuánto por encima del precio de mercado te salió entrar, en %.
         0 si no hay datos reales de fill (ahí ambos precios son el
@@ -110,6 +119,44 @@ class Position:
 # 0.00001 -> 0.00004 -> 0.00016 -> 0.00064 -> 0.001 SOL.
 SELL_SLIPPAGE_STEP = 10.0
 SELL_PRIORITY_FEE_FACTOR = 4.0
+
+
+# Costes fijos de una operación real que también se cobran al simular
+# (ver simulated_buy / simulated_sell).
+NETWORK_FEE_SOL = 0.000005  # fee base de una tx de Solana (una firma)
+# Rent de la cuenta del token: se paga al comprar y vuelve al vender (la
+# venta del 100% cierra la cuenta).
+TOKEN_ACCOUNT_RENT_SOL = 0.00203928
+
+
+def simulated_buy(cfg, price: float) -> tuple[float, float, float]:
+    """Compra SIMULADA con los costes de una real (con cfg.sim_costs):
+    se paga `sim_slippage_pct` % por encima del precio de mercado, más
+    `sim_fee_pct` % de comisiones (pump.fun + PumpPortal) sobre buy_sol,
+    el priority fee, el fee de red y el rent de la cuenta del token.
+    Devuelve (SOL gastados, tokens recibidos, precio efectivo), los mismos
+    tres números que da una compra real con datos de fill."""
+    fill_price = price * (1 + cfg.sim_slippage_pct / 100.0)
+    tokens = cfg.buy_sol / fill_price
+    spent = (cfg.buy_sol * (1 + cfg.sim_fee_pct / 100.0) + cfg.priority_fee
+             + NETWORK_FEE_SOL + TOKEN_ACCOUNT_RENT_SOL)
+    return spent, tokens, spent / tokens
+
+
+def simulated_sell(cfg, tokens: float, price: float,
+                   priority_fee: Optional[float] = None) -> tuple[float, float]:
+    """Venta SIMULADA con los costes de una real (con cfg.sim_costs): se
+    cobra `sim_slippage_pct` % por debajo del precio de mercado, menos
+    `sim_fee_pct` % de comisiones, el priority fee y el fee de red, y
+    vuelve el rent de la cuenta del token. Devuelve (SOL recibidos,
+    precio efectivo)."""
+    fee = cfg.priority_fee if priority_fee is None else priority_fee
+    gross = tokens * price * (1 - cfg.sim_slippage_pct / 100.0)
+    proceeds = gross * (1 - cfg.sim_fee_pct / 100.0) - fee - NETWORK_FEE_SOL + TOKEN_ACCOUNT_RENT_SOL
+    # Sin ingresos netos no hay precio de salida con sentido (igual que en
+    # una venta real): se deja el de mercado.
+    exit_price = proceeds / tokens if proceeds > 0 and tokens > 0 else price
+    return proceeds, exit_price
 
 
 def sell_retry_params(cfg, failures: int) -> tuple[float, float]:
@@ -150,6 +197,9 @@ class TradeExecutor:
         entry_price = price
         token_amount = sol_amount / price if price > 0 else 0.0
         real_fill = False
+
+        if not self.live and self.cfg.sim_costs:
+            sol_amount, token_amount, entry_price = simulated_buy(self.cfg, price)
 
         if self.live:
             try:
@@ -213,12 +263,17 @@ class TradeExecutor:
                                 f"~{token_amount:,.2f} tokens) para la posición.")
 
         etiqueta = "REAL" if self.live else "SIMULADO"
-        sufijo = " [datos reales]" if real_fill else (" [estimado]" if self.live else "")
+        sufijo = self._fill_suffix(real_fill)
         logger.info(f"[{etiqueta}] COMPRA de {sol_amount:.9f} SOL en {mint} a precio "
                     f"{entry_price:.10f} SOL/token (~{token_amount:,.2f} tokens){sufijo}")
         return Position(mint=mint, entry_price=entry_price, sol_amount=sol_amount,
                          token_amount=token_amount, market_entry_price=price,
                          entry_is_real_fill=real_fill)
+
+    def _fill_suffix(self, real_fill: bool) -> str:
+        if self.live:
+            return " [datos reales]" if real_fill else " [estimado]"
+        return " [con costes simulados]" if self.cfg.sim_costs else ""
 
     async def _tokens_gone_from_wallet(self, mint: str) -> bool:
         """True si la wallet ya no tiene tokens de `mint`. Va mirando
@@ -250,6 +305,9 @@ class TradeExecutor:
         token_amount_sold = position.token_amount
         proceeds = token_amount_sold * price
         real_fill = False
+
+        if not self.live and self.cfg.sim_costs:
+            proceeds, exit_price = simulated_sell(self.cfg, token_amount_sold, price, priority_fee)
 
         if self.live:
             try:
@@ -348,7 +406,7 @@ class TradeExecutor:
         pnl_sol = proceeds - position.sol_amount
         pnl_pct = (pnl_sol / position.sol_amount * 100.0) if position.sol_amount > 0 else 0.0
         etiqueta = "REAL" if self.live else "SIMULADO"
-        sufijo = " [datos reales]" if real_fill else (" [estimado]" if self.live else "")
+        sufijo = self._fill_suffix(real_fill)
         # Se loguean los DOS números porque miden cosas distintas y no
         # coinciden en cuanto hay costes reales de por medio: el de
         # mercado es cuánto se movió el precio (el que muestra pump.fun),

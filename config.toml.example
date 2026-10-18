@@ -6,6 +6,22 @@
 # true  = opera en real vía la Lightning API de PumpPortal (requiere API key).
 live = false
 
+# Modo SIMULADO: cobra los costes que tendría la operación en real, para que
+# el PnL simulado se parezca al de verdad (sin esto sale bastante más
+# optimista). true = se aplican; false = compra y venta exactas al precio
+# de mercado, sin costes.
+#   - sim_fee_pct: comisiones por operación, en % del SOL. pump.fun cobra
+#     ~1% en la bonding curve (~0.3% en PumpSwap) y PumpPortal un 1% con la
+#     Lightning API. Si sueles operar tokens ya migrados, prueba con 1.3.
+#   - sim_slippage_pct: se compra este % más caro y se vende este % más
+#     barato que el precio de mercado (la orden nunca entra al precio exacto).
+# Además se cobran, como en real, el priority fee y el fee de red de cada
+# operación, y el rent de la cuenta del token (~0.002 SOL), que se paga al
+# comprar y vuelve al vender.
+sim_costs = true
+sim_fee_pct = 2.0
+sim_slippage_pct = 1.0
+
 # El bot se suscribe (subscribe_trade) al feed en vivo de PumpPortal para
 # este mint ANTES de comprar, y espera el tiempo que haga falta a que
 # llegue el primer trade real para usar ESE precio como entrada. Es la
@@ -93,7 +109,7 @@ entry_dip_pct = 0.0
 #            ~14% para armar el trailing, y el stop-loss salta antes.
 # "market" = el precio de mercado al comprar (el % que muestra pump.fun),
 #            sin contar costes. Es como funcionaba antes.
-# En modo simulado los dos son iguales (no hay comisiones reales).
+# En modo simulado con sim_costs = false los dos son iguales (sin costes).
 strategy_price_basis = "real"
 
 [pumpportal]

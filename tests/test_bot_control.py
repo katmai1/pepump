@@ -120,7 +120,7 @@ async def test_snapshot_antes_de_arrancar():
 
 
 async def test_sell_guarda_los_datos_del_cierre_en_la_posicion(tmp_path):
-    cfg = make_config(live=False, trade_history_csv="")
+    cfg = make_config(live=False, trade_history_csv="", sim_costs=False)
     executor = TradeExecutor(client=None, live=False, config=cfg)
     pos = Position(mint=cfg.mint, entry_price=1.0, sol_amount=0.05, token_amount=0.05)
 

@@ -215,7 +215,7 @@ def position_row(snap: dict) -> str:
             partes.append(f"activa ≥ {pos['activation_price']:.10f}")
         if pos["market_pnl_pct"] is not None:
             pnl = f"mercado {pos['market_pnl_pct']:+.2f}%"
-            if pos["entry_is_real_fill"] and pos["net_pnl_pct"] is not None:
+            if pos.get("has_entry_costs") and pos["net_pnl_pct"] is not None:
                 pnl += f" neto {pos['net_pnl_pct']:+.2f}%"
             partes.append(pnl)
     else:

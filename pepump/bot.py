@@ -1207,6 +1207,7 @@ class TrailingTakeProfitBot:
             "entry_price": pos.entry_price,
             "market_entry_price": pos.market_entry_price,
             "entry_is_real_fill": pos.entry_is_real_fill,
+            "has_entry_costs": pos.has_entry_costs(),
             "sol_amount": pos.sol_amount,
             "token_amount": pos.token_amount,
             "opened_at": pos.opened_at,
@@ -1248,7 +1249,7 @@ class TrailingTakeProfitBot:
             lines.append(f" Activación +{cfg.activation_pct}% | trailing {cfg.trailing_pct}% "
                          f"| stop-loss inicial -{cfg.initial_stop_pct}%")
         else:
-            coste = f" | coste real {pos.entry_price:.10f}" if pos.entry_is_real_fill else ""
+            coste = f" | {pos.cost_label()} {pos.entry_price:.10f}" if pos.has_entry_costs() else ""
             lines.append(f" Entrada {pos.market_entry_price:.10f} SOL/token{coste}")
             strategy = self.strategy
             base = "precio real" if cfg.strategy_price_basis == "real" else "precio de mercado"
@@ -1293,7 +1294,7 @@ class TrailingTakeProfitBot:
             # La brecha entre los dos es fija: pos.entry_cost_pct().
             pnl = pos.market_pnl_pct(self.latest_price)
             neto = (f" | neto {pos.pnl_pct(self.latest_price):+.2f}%"
-                    if pos.entry_is_real_fill else "")
+                    if pos.has_entry_costs() else "")
             if self.sell_failures:
                 neto += f" | ⚠ {self.sell_failures} ventas fallidas, reintentando"
 
@@ -1307,7 +1308,7 @@ class TrailingTakeProfitBot:
                 # comisiones) se muestra aparte para que no parezca un
                 # error ver el neto en negativo con el precio clavado en
                 # la entrada.
-                coste = (f" | coste real {pos.entry_price:.10f}" if pos.entry_is_real_fill else "")
+                coste = (f" | {pos.cost_label()} {pos.entry_price:.10f}" if pos.has_entry_costs() else "")
                 self._show_status(f"⏱️  [esperando activación +{self.cfg.activation_pct}%] "
                                   f"precio {self.latest_price:.10f} | entrada {pos.market_entry_price:.10f}"
                                   f"{coste} | mercado: {pnl:+.2f}%{neto}")

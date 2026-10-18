@@ -268,7 +268,7 @@ function renderTable(now) {
       pnlNet = pos.realized_pnl_pct;
     } else if (pos) {
       pnlMarket = pos.market_pnl_pct;
-      pnlNet = pos.entry_is_real_fill ? pos.net_pnl_pct : null;
+      pnlNet = pos.has_entry_costs ? pos.net_pnl_pct : null;
     }
 
     const since = pos ? pos.opened_at : snap.started_at;
@@ -771,7 +771,8 @@ function renderDetail() {
   if (pos) {
     items.push(
       kv("Entrada (mercado)", fmtPrice(pos.market_entry_price)),
-      kv("Coste real por token", pos.entry_is_real_fill ? fmtPrice(pos.entry_price) : "— (estimado)"),
+      kv(pos.entry_is_real_fill || !pos.has_entry_costs ? "Coste real por token" : "Coste por token (simulado)",
+         pos.has_entry_costs ? fmtPrice(pos.entry_price) : "— (estimado)"),
       kv("SOL invertidos", fmtSol(pos.sol_amount)),
       kv("Tokens", pos.token_amount.toLocaleString("es-ES", { maximumFractionDigits: 2 })),
       kv("Abierta a las", fmtTime(pos.opened_at)),
@@ -783,8 +784,8 @@ function renderDetail() {
     if (!pos.closed) {
       items.push(
         kv("PnL mercado", fmtPct(pos.market_pnl_pct), { tone: toneClass(pos.market_pnl_pct) }),
-        kv("PnL neto", pos.entry_is_real_fill ? fmtPct(pos.net_pnl_pct) : "— (sin datos reales)",
-           { tone: pos.entry_is_real_fill ? toneClass(pos.net_pnl_pct) : "" }),
+        kv("PnL neto", pos.has_entry_costs ? fmtPct(pos.net_pnl_pct) : "— (sin datos de costes)",
+           { tone: pos.has_entry_costs ? toneClass(pos.net_pnl_pct) : "" }),
         kv("PnL si se vende ahora", `${fmtSolSigned(openPnlSol(snap))} SOL`, { tone: toneClass(openPnlSol(snap)) }),
       );
     } else {

@@ -33,6 +33,9 @@ class DummyConfig:
     tx_confirm_timeout_seconds = 30.0
     tx_confirm_poll_interval_seconds = 2.0
     trade_history_csv = ""  # desactivado por default en estos tests
+    # Simulación a precio exacto: estos tests miran las cuentas, no los
+    # costes simulados (ver test_sim_costs.py).
+    sim_costs = False
 
 
 class FakeLightningClient:
