@@ -90,7 +90,7 @@ class TrailingTakeProfitBot:
         # por qué pool hay que rutear la orden.
         self.onchain = OnchainFallback(self.mint, config.solana_rpc_url, resume_onchain_source,
                                        jupiter=jupiter, live=config.live,
-                                       prefer_jupiter=config.jupiter_for_all)
+                                       prefer_jupiter=config.jupiter_for_all, buy_sol=config.buy_sol)
         if resume_position is not None:
             self.onchain.jupiter_tokens = resume_position.token_amount
         # Si _get_reference_price (o algo que llame desde ahí) ya

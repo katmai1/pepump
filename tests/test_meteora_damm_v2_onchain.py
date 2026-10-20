@@ -209,3 +209,60 @@ class _Jupiter:
 def test_las_ordenes_de_meteora_van_por_jupiter_si_se_puede(source, jupiter, live, expected):
     onchain = OnchainFallback(MINT, "http://fake-rpc", source, jupiter=jupiter, live=live)
     assert onchain.pool_override() == expected
+
+
+# --------------------------------------------------------------------------- #
+# Pool de Meteora desacoplado del mercado: se contrasta con Jupiter
+# --------------------------------------------------------------------------- #
+
+class _QuotingJupiter(_Jupiter):
+    def __init__(self, sell_price, can_sign=True, fail=False):
+        super().__init__(can_sign)
+        self.price = sell_price
+        self.fail = fail
+
+    async def buy_tokens(self, mint, sol, rpc_url, priority=None):
+        if self.fail:
+            raise RuntimeError("sin ruta")
+        return sol / self.price
+
+    async def sell_price(self, mint, tokens, rpc_url, priority=None):
+        return self.price
+
+
+def _resolve_with_jupiter(monkeypatch, damm_price, jupiter, live=True, buy_sol=0.05):
+    monkeypatch.setattr(fallback_module, "MeteoraDlmmOnChainClient", FakeMeteora(None, None, True))
+    monkeypatch.setattr(fallback_module, "MeteoraDammV2OnChainClient", FakeMeteora(damm_price, 3.9))
+    onchain = OnchainFallback(MINT, "http://fake-rpc", jupiter=jupiter, live=live, buy_sol=buy_sol)
+    price, _absent = asyncio.run(onchain._try_meteora())
+    return onchain, price
+
+
+def test_caso_real_pool_damm_v2_clavado_lejos_de_jupiter_usa_jupiter(monkeypatch):
+    # DKYcjo...pump: el pool DAMM v2 contra SOL marcaba 5.23e-6 y se
+    # compraba y vendía por Jupiter a ~3.2e-6.
+    onchain, price = _resolve_with_jupiter(monkeypatch, 5.23e-6, _QuotingJupiter(3.2e-6))
+
+    assert onchain.source == "jupiter"
+    assert price == 3.2e-6
+    assert onchain.jupiter_tokens == pytest.approx(0.05 / 3.2e-6)
+    assert onchain.pool_override() == JUPITER_POOL
+
+
+def test_si_jupiter_coincide_se_queda_con_meteora(monkeypatch):
+    onchain, price = _resolve_with_jupiter(monkeypatch, 5.23e-6, _QuotingJupiter(5.0e-6))
+
+    assert onchain.source == "meteora-damm-v2"
+    assert price == 5.23e-6
+
+
+@pytest.mark.parametrize("jupiter, live, buy_sol", [
+    (_QuotingJupiter(3.2e-6, fail=True), True, 0.05),     # Jupiter no cotiza
+    (_QuotingJupiter(3.2e-6, can_sign=False), True, 0.05),  # la orden no iría por Jupiter
+    (_QuotingJupiter(3.2e-6), True, None),                # sin importe con el que cotizar
+])
+def test_sin_contraste_posible_se_queda_con_meteora(monkeypatch, jupiter, live, buy_sol):
+    onchain, price = _resolve_with_jupiter(monkeypatch, 5.23e-6, jupiter, live, buy_sol)
+
+    assert onchain.source == "meteora-damm-v2"
+    assert price == 5.23e-6
