@@ -212,7 +212,7 @@ def test_las_ordenes_de_meteora_van_por_jupiter_si_se_puede(source, jupiter, liv
 
 
 # --------------------------------------------------------------------------- #
-# Pool de Meteora desacoplado del mercado: se contrasta con Jupiter
+# Si la orden va por Jupiter, el precio de un token de Meteora sale de Jupiter
 # --------------------------------------------------------------------------- #
 
 class _QuotingJupiter(_Jupiter):
@@ -249,11 +249,21 @@ def test_caso_real_pool_damm_v2_clavado_lejos_de_jupiter_usa_jupiter(monkeypatch
     assert onchain.pool_override() == JUPITER_POOL
 
 
-def test_si_jupiter_coincide_se_queda_con_meteora(monkeypatch):
+def test_aunque_jupiter_coincida_el_precio_es_el_de_jupiter(monkeypatch):
+    # El del pool no incluye comisiones, impacto ni los saltos de bin: el
+    # de Jupiter es lo que se cobra al vender.
     onchain, price = _resolve_with_jupiter(monkeypatch, 5.23e-6, _QuotingJupiter(5.0e-6))
 
-    assert onchain.source == "meteora-damm-v2"
-    assert price == 5.23e-6
+    assert onchain.source == "jupiter"
+    assert price == 5.0e-6
+
+
+def test_simulado_sin_clave_tambien_cotiza_en_jupiter(monkeypatch):
+    onchain, price = _resolve_with_jupiter(monkeypatch, 5.23e-6, _QuotingJupiter(5.0e-6, can_sign=False),
+                                           live=False)
+
+    assert onchain.source == "jupiter"
+    assert price == 5.0e-6
 
 
 @pytest.mark.parametrize("jupiter, live, buy_sol", [
@@ -266,3 +276,18 @@ def test_sin_contraste_posible_se_queda_con_meteora(monkeypatch, jupiter, live, 
 
     assert onchain.source == "meteora-damm-v2"
     assert price == 5.23e-6
+
+
+@pytest.mark.parametrize("source, jupiter, live, expected", [
+    ("meteora-dlmm", _Jupiter(can_sign=True), True, "jupiter"),
+    ("meteora-damm-v2", _Jupiter(can_sign=False), False, "jupiter"),
+    ("meteora-dlmm", _Jupiter(can_sign=False), True, "meteora-dlmm"),  # real sin clave
+    ("meteora-dlmm", None, False, "meteora-dlmm"),
+    ("pumpswap", _Jupiter(can_sign=True), True, "pumpswap"),
+])
+def test_al_retomar_una_de_meteora_el_precio_pasa_a_jupiter(source, jupiter, live, expected):
+    onchain = OnchainFallback(MINT, "http://fake-rpc", source, jupiter=jupiter, live=live)
+    onchain.jupiter_tokens = 15284.0
+    onchain.resume_meteora_via_jupiter()
+
+    assert onchain.source == expected

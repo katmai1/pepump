@@ -36,12 +36,6 @@ logger = logging.getLogger(__name__)
 
 
 class OnchainFallback:
-    # Cuánto puede separarse (%) el precio de un pool de Meteora contra SOL de
-    # la cotización de venta de Jupiter antes de dar el pool por desacoplado
-    # del mercado (ver _meteora_vs_jupiter). La cotización lleva comisiones e
-    # impacto, así que unos pocos % de diferencia son normales.
-    METEORA_MAX_JUPITER_DEVIATION_PCT = 10.0
-
     def __init__(self, mint: str, rpc_url: str, source: Optional[str] = None, jupiter=None,
                  live: bool = False, prefer_jupiter: bool = False, buy_sol: Optional[float] = None):
         self.mint = mint
@@ -61,8 +55,8 @@ class OnchainFallback:
         # siempre lo que de verdad se va a vender.
         self.jupiter_tokens: Optional[float] = None
         self.jupiter_priority = PRIORITY_PRICE
-        # SOL de la compra, para contrastar un pool de Meteora con Jupiter
-        # (ver _meteora_vs_jupiter). None = sin contraste.
+        # SOL de la compra, para cotizar en Jupiter un token de Meteora (ver
+        # _meteora_via_jupiter). None = se sigue con el precio del pool.
         self.buy_sol = buy_sol
 
     async def fetch_price(self) -> Optional[float]:
@@ -186,38 +180,46 @@ class OnchainFallback:
             return None, confirmed_absent
         source, price = best
         nombre = "Meteora DLMM" if source == "meteora-dlmm" else "Meteora DAMM v2"
-        jupiter_price = await self._meteora_vs_jupiter(nombre, price)
+        jupiter_price = await self._meteora_via_jupiter(nombre, price)
         if jupiter_price is not None:
             return jupiter_price, False
         logger.info(f"Precio de referencia (fallback on-chain {nombre}): {price:.10f} SOL/token")
         self.source = source
         return price, False
 
-    async def _meteora_vs_jupiter(self, nombre: str, price: float) -> Optional[float]:
-        """Contrasta el precio del pool de Meteora contra SOL con la
-        cotización de venta de Jupiter, cuando la orden va a ir por Jupiter.
-        Cualquiera puede crear un pool de Meteora, y uno pequeño puede quedar
-        desacoplado del mercado si la liquidez de verdad cotiza contra otro
-        token (caso real DKYcjo...pump: pool DAMM v2 contra SOL de ~4 SOL,
-        sin operaciones, clavado en 5.23e-6 durante toda la posición, mientras
-        Jupiter compraba y vendía por SOL -> USDC -> TTWO a ~3.2e-6). Si se
-        separan más de METEORA_MAX_JUPITER_DEVIATION_PCT, el precio pasa a ser
-        el de Jupiter (deja `self.source` en "jupiter" y devuelve ese precio).
-        None si coinciden o no se puede contrastar: se sigue con Meteora."""
-        if self.jupiter is None or not self.buy_sol or not (self.jupiter.can_sign or not self.live):
+    async def _meteora_via_jupiter(self, nombre: str, price: float) -> Optional[float]:
+        """Si las órdenes van a ir por Jupiter (ver pool_override), el precio
+        de un token de Meteora sale de la cotización de venta de Jupiter
+        para los tokens de la posición, no del pool contra SOL: es lo que se
+        cobra de verdad al vender. El precio del pool no lo es:
+
+          - DLMM mueve el precio a saltos de un bin (2% con bin_step 200): un
+            trailing del 1% salta con cualquier bajada de un bin.
+          - No incluye la comisión del pool (2% de base en esos pools, más una
+            variable que sube con la volatilidad) ni el impacto de la venta,
+            que cruza varios bins si hay poca liquidez cerca del activo (caso
+            real Wr8xaw...STNK: el bin marcaba 3.54e-6 y se vendió a 3.20e-6).
+          - Puede no ser donde está la liquidez: Jupiter vende por la mejor
+            ruta, a veces contra otro token (Wr8xaw...STNK vendió vía ysPp2B a
+            4.50e-6 con el DLMM/SOL en 5.47e-6), y un pool pequeño puede estar
+            parado (DKYcjo...pump: DAMM v2 clavado en 5.23e-6 toda la posición
+            mientras Jupiter operaba a ~3.2e-6).
+
+        Deja `self.source` en "jupiter" y devuelve ese precio, o None si no se
+        puede cotizar (se sigue con el precio del pool)."""
+        if not self.buy_sol or not self._jupiter_can_trade():
             return None
         try:
             tokens = await self.jupiter.buy_tokens(self.mint, self.buy_sol, self.rpc_url)
             jupiter_price = await self.jupiter.sell_price(self.mint, tokens, self.rpc_url)
         except Exception as e:
-            logger.debug(f"[Jupiter] No se pudo contrastar el precio de {nombre} con Jupiter: {e}")
+            logger.warning(f"[Jupiter] No se pudo cotizar {self.mint} en Jupiter ({e}); el precio sale "
+                           f"del pool de {nombre}.")
             return None
         desvio = (price / jupiter_price - 1.0) * 100.0 if jupiter_price > 0 else 0.0
-        if abs(desvio) <= self.METEORA_MAX_JUPITER_DEVIATION_PCT:
-            return None
-        logger.warning(f"El pool de {nombre} contra SOL marca {price:.10f} SOL/token, un {desvio:+.1f}% "
-                       f"respecto a lo que da Jupiter ({jupiter_price:.10f}): no refleja el mercado real. "
-                       f"El precio sale de la cotización de venta de Jupiter.")
+        logger.info(f"Precio de referencia (cotización de venta en Jupiter, {tokens:,.2f} tokens): "
+                    f"{jupiter_price:.10f} SOL/token (el pool de {nombre} contra SOL marca {price:.10f}, "
+                    f"{desvio:+.1f}%)")
         self.jupiter_tokens = tokens
         self.source = "jupiter"
         return jupiter_price
@@ -337,6 +339,21 @@ class OnchainFallback:
                     f"{price:.10f} SOL/token")
         return price
 
+    def _jupiter_can_trade(self) -> bool:
+        """True si las órdenes pueden ir por Jupiter: hay cliente y, en REAL,
+        clave con la que firmar."""
+        return self.jupiter is not None and (self.jupiter.can_sign or not self.live)
+
+    def resume_meteora_via_jupiter(self) -> None:
+        """Posición retomada que vigilaba un pool de Meteora: si las órdenes
+        van por Jupiter, el precio pasa a ser su cotización de venta, como en
+        una entrada nueva (ver _meteora_via_jupiter). Hace falta
+        `jupiter_tokens`, los tokens de la posición."""
+        if (self.source in ("meteora-dlmm", "meteora-damm-v2") and self.jupiter_tokens
+                and self._jupiter_can_trade()):
+            logger.info(f"El precio sale de la cotización de venta en Jupiter, no del pool de {self.source}.")
+            self.source = "jupiter"
+
     def pool_override(self) -> Optional[str]:
         """Si ya confirmamos -sea al entrar (resolve_reference) o a
         mitad de posición (bot._handle_feed_stall)- que este mint migró de
@@ -369,7 +386,7 @@ class OnchainFallback:
         # tampoco hace falta el override de "pump-amm" tras una migración.
         if self.source == "jupiter":
             return JUPITER_POOL
-        jupiter_ok = self.jupiter is not None and (self.jupiter.can_sign or not self.live)
+        jupiter_ok = self._jupiter_can_trade()
         es_meteora = self.source in ("meteora-dlmm", "meteora-damm-v2")
         if jupiter_ok and (self.prefer_jupiter or es_meteora):
             return JUPITER_POOL

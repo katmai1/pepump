@@ -93,6 +93,7 @@ class TrailingTakeProfitBot:
                                        prefer_jupiter=config.jupiter_for_all, buy_sol=config.buy_sol)
         if resume_position is not None:
             self.onchain.jupiter_tokens = resume_position.token_amount
+            self.onchain.resume_meteora_via_jupiter()
         # Si _get_reference_price (o algo que llame desde ahí) ya
         # logueó un motivo específico para devolver None -mint que no es
         # de pump.fun, timeout total, fallback on-chain sin precio,
