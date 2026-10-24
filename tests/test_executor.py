@@ -50,6 +50,9 @@ class FakeLightningClient:
             raise self.exc
         return self.result
 
+    async def get_wallet_token_balance(self, mint, rpc_url):
+        return None  # wallet desconocida
+
 
 async def test_buy_simulated_does_not_touch_network_and_returns_position():
     client = FakeLightningClient()
@@ -243,3 +246,27 @@ async def test_buy_live_resultado_desconocido_sin_poder_mirar_la_wallet_sigue_de
 
     with pytest.raises(TradeOutcomeUnknown):
         await executor.buy("M", price=0.00004)
+
+
+async def test_venta_rechazada_sin_tokens_en_la_wallet_cierra_la_posicion():
+    """Si ya no quedan tokens (venta anterior que entró tarde, o vendida a
+    mano), PumpPortal rechaza cada "100%": antes el bot reintentaba sin fin
+    con la posición abierta."""
+    client = FakeClientWithBalance([0.0], exc=RuntimeError("PumpPortal rechazó la orden de sell"))
+    executor = TradeExecutor(client=client, live=True, config=FastConfirmConfig())
+    pos = Position(mint="M", entry_price=1.0, sol_amount=0.05, token_amount=0.05)
+
+    await executor.sell(pos, price=1.2, reason="test")
+
+    assert pos.closed is True and pos.exit_is_real_fill is False
+
+
+@pytest.mark.parametrize("balance", [10.0, None])
+async def test_venta_rechazada_con_tokens_o_sin_poder_mirar_sigue_abierta(balance):
+    client = FakeClientWithBalance([balance], exc=RuntimeError("slippage excedido"))
+    executor = TradeExecutor(client=client, live=True, config=FastConfirmConfig())
+    pos = Position(mint="M", entry_price=1.0, sol_amount=0.05, token_amount=0.05)
+
+    with pytest.raises(RuntimeError):
+        await executor.sell(pos, price=1.2, reason="test")
+    assert pos.closed is False

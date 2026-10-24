@@ -431,6 +431,24 @@ class TradeExecutor:
         balance = await self._poll_wallet_balance(mint, lambda b: b <= 0)
         return balance is not None and balance <= 0
 
+    @staticmethod
+    def _log_sell_failure(position: Position) -> None:
+        # BUGFIX: antes esta excepción se logueaba y se seguía de largo
+        # igual: la posición se marcaba `closed = True` y se imprimía el
+        # PnL/proceeds como si la venta hubiese salido bien, cuando en
+        # realidad la Lightning API falló (o la tx confirmó pero FALLÓ
+        # on-chain, p. ej. por slippage excedido) y el token real seguía en
+        # la wallet, sin vender. Con SOL real eso es peligroso: el bot "cree"
+        # que cerró la posición y deja de vigilarla. Ahora se propaga la
+        # excepción y NO se marca la posición como cerrada, para que quede
+        # claro que la venta real falló y haya que reintentarla (bot.py
+        # reintenta solo con el próximo precio que llegue — ver _try_sell).
+        # Se llama dentro del `except`: logger.exception lleva el traceback.
+        logger.exception(
+            f"[REAL] Error al vender {position.mint} (la orden no se confirmó on-chain). "
+            "La posición SIGUE ABIERTA: no se marcó como vendida."
+        )
+
     async def sell(self, position: Position, price: float, reason: str,
                     pool_override: Optional[str] = None, slippage: Optional[float] = None,
                     priority_fee: Optional[float] = None) -> None:
@@ -482,26 +500,26 @@ class TradeExecutor:
                     "con el PnL ESTIMADO (no hay firma de la que leer los datos reales)."
                 )
                 result = {}
-            except Exception:
-                # BUGFIX: antes esta excepción se logueaba y se seguía de
-                # largo igual: la posición se marcaba `closed = True` y se
-                # imprimía el PnL/proceeds como si la venta hubiese salido
-                # bien, cuando en realidad la Lightning API falló (o la tx
-                # confirmó pero FALLÓ on-chain, p. ej. por slippage
-                # excedido) y el token real seguía en la wallet, sin
-                # vender. Con SOL real eso es peligroso: el bot "cree" que
-                # cerró la posición y deja de vigilarla. Ahora propagamos
-                # la excepción y NO marcamos la posición como cerrada,
-                # para que quede claro que la venta real falló y haya que
-                # reintentarla (bot.py reintenta solo con el próximo
-                # precio que llegue — ver _try_sell).
-                logger.exception(
-                    f"[REAL] Error al vender {position.mint} (la orden no se confirmó on-chain). "
-                    "La posición SIGUE ABIERTA: no se marcó como vendida."
+            except Exception as e:
+                # Un rechazo puede ser justo porque ya NO quedan tokens: la
+                # venta anterior entró tarde (tras dar su resultado por
+                # desconocido) o se vendió a mano fuera del bot. Sin mirar la
+                # wallet, PumpPortal rechazaba cada "100%" y el bot
+                # reintentaba sin fin con la posición "abierta". Una lectura
+                # basta: si quedan tokens, el fallo es de verdad.
+                balance = await self.client.get_wallet_token_balance(position.mint, self.cfg.solana_rpc_url)
+                if balance is None or balance > 0:
+                    self._log_sell_failure(position)
+                    raise
+                logger.warning(
+                    f"[REAL] La venta de {position.mint} falló ({e}), pero la wallet ya no tiene "
+                    "tokens de ese mint: ya se vendieron (fuera del bot o en una venta anterior que "
+                    "entró tarde). Se cierra la posición con el PnL ESTIMADO."
                 )
-                raise
+                result = {}
 
-            # La venta CONFIRMÓ on-chain. Igual que en buy(), reemplazamos
+            # La venta CONFIRMÓ on-chain (o ya no quedan tokens que vender).
+            # Igual que en buy(), reemplazamos
             # la estimación con los datos REALES de fill si se pudieron
             # leer -ver onchain/txinfo.py:fetch_actual_fill.
             actual_sol_delta = result.get("actual_sol_delta") if isinstance(result, dict) else None
