@@ -36,9 +36,13 @@ OPEN_FLAGS = (
 MARKETS = {
     "bondingcurve": "en la curva de pump.fun",
     "pumpswap": "migrado a PumpSwap",
+    "jupiter": "por Jupiter (no cotiza contra SOL en ningún pool que el bot lea)",
     "other": "no está en pump.fun ni en PumpSwap (se intentará Raydium CPMM / Meteora DLMM)",
     "unknown": "no se pudo comprobar dónde cotiza",
 }
+# Igual que en la web (ROUND_TRIP_WARN_PCT de app.js): a partir de cuánto se
+# pierde de entrada (comprar y vender al momento) se avisa antes de comprar.
+ROUND_TRIP_WARN_PCT = 5.0
 
 
 def parse_args():
@@ -116,6 +120,24 @@ def describe(snap: dict) -> str:
     return "  ".join(partes)
 
 
+def round_trip_lines(p: dict) -> list:
+    """Coste de entrar y salir de la vista previa (solo si cotiza por
+    Jupiter), con el mismo aviso que da la web antes de comprar. Antes
+    ctl.py no lo enseñaba: se podía comprar un token que pierde un 12% nada
+    más entrar (caso real BTZK...WwGp) sin enterarse."""
+    rt = p.get("round_trip_pct")
+    if rt is None:
+        return []
+    lineas = [f"Comprar y vender ya ({p.get('buy_sol')} SOL): {fmt_pct(rt)}"]
+    if rt <= -ROUND_TRIP_WARN_PCT:
+        impuesto = (f", más el impuesto de transferencia del token ({p['transfer_fee_pct']}%)"
+                    if p.get("transfer_fee_pct") else "")
+        lineas.append(f"⚠ Si vendieras nada más comprar recuperarías un {abs(rt):.1f}% menos de lo que "
+                      f"pagas (comisiones de los pools e impacto{impuesto}). El PnL neto arrancará en "
+                      f"{fmt_pct(rt)}.")
+    return lineas
+
+
 def confirm(question: str, yes: bool) -> bool:
     if yes:
         return True
@@ -145,7 +167,9 @@ def main():
         # Igual que en la web: simulada salvo que se pida --real a propósito.
         live = bool(args.live)
         settings["live"] = live
-        r = s.get(f"{url}/api/preview", params={"mint": args.mint}, timeout=30)
+        cfg = {**defaults["settings"], **settings}
+        # Con el importe de esta compra: el coste de entrar depende de él.
+        r = s.get(f"{url}/api/preview", params={"mint": args.mint, "buy_sol": cfg["buy_sol"]}, timeout=30)
         if r.status_code != 200:
             fail(r.json().get("detail", str(r.status_code)))
         p = r.json()
@@ -156,7 +180,8 @@ def main():
             print(f"Precio: {fmt_price(p['price'])} SOL/token")
         if p.get("active_position"):
             fail(f"ya hay una posición activa de este token (#{p['active_position']})")
-        cfg = {**defaults["settings"], **settings}
+        for linea in round_trip_lines(p):
+            print(linea)
         print(f"Modo:   {'REAL (SOL de verdad)' if live else 'simulado'}")
         print(f"Compra: {cfg['buy_sol']} SOL · activa +{cfg['activation_pct']}% · trailing "
               f"{cfg['trailing_pct']}% · stop -{cfg['initial_stop_pct']}%"
