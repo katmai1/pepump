@@ -321,6 +321,26 @@ class TradeExecutor:
                     tx_confirm_poll_interval_seconds=self.cfg.tx_confirm_poll_interval_seconds,
                 )
                 logger.info(f"[REAL] Compra CONFIRMADA on-chain. Respuesta: {result}")
+            except TradeOutcomeUnknown as e:
+                # La orden pudo haber entrado (timeout de la API, tx sin
+                # confirmar a tiempo). Antes se daba por fallida sin más: la
+                # posición quedaba "cancelada" y, si la tx entraba, los tokens
+                # se quedaban en la wallet sin trailing ni stop. Se mira la
+                # wallet, como en sell().
+                balance = await self._poll_wallet_balance(mint, lambda b: b > 0)
+                if balance is None:
+                    logger.error(f"[REAL] La compra de {mint} no se confirmó ({e}) y no se pudo comprobar "
+                                 f"la wallet: revisa a mano si se compró.")
+                    raise
+                if balance <= 0:
+                    logger.error(f"[REAL] La compra de {mint} no se confirmó ({e}) y no llegaron tokens a "
+                                 f"la wallet: no se abre ninguna posición.")
+                    raise RuntimeError(f"la compra no llegó a la wallet ({e})") from e
+                logger.warning(f"[REAL] La compra de {mint} no se confirmó ({e}), pero la wallet ya tiene "
+                               f"{balance:,.2f} tokens: la compra SÍ se ejecutó. Se abre la posición con "
+                               f"la entrada ESTIMADA (no hay firma de la que leer los datos reales).")
+                token_amount = balance
+                result = {}
             except Exception:
                 # execute_lightning_trade ahora confirma en cadena antes
                 # de devolver: si esto lanza, es porque la orden fue
@@ -391,23 +411,25 @@ class TradeExecutor:
             return " [datos reales]" if real_fill else " [estimado]"
         return " [con costes simulados]" if self.cfg.sim_costs else ""
 
-    async def _tokens_gone_from_wallet(self, mint: str) -> bool:
-        """True si la wallet ya no tiene tokens de `mint`. Va mirando
-        durante tx_confirm_timeout_seconds porque una tx enviada justo
-        antes del timeout puede tardar unos segundos más en entrar. False
-        si quedan tokens al final o si no se puede consultar el saldo
-        (wallet todavía desconocida, RPC caído...): ante la duda, la
-        posición se sigue considerando abierta."""
+    async def _poll_wallet_balance(self, mint: str, until) -> Optional[float]:
+        """Saldo de `mint` en la wallet en cuanto cumple `until(saldo)`, o el
+        último leído al pasar tx_confirm_timeout_seconds: una tx enviada
+        justo antes del timeout puede tardar unos segundos más en entrar.
+        None si no se puede consultar (wallet todavía desconocida, RPC
+        caído...)."""
         deadline = time.monotonic() + self.cfg.tx_confirm_timeout_seconds
         while True:
             balance = await self.client.get_wallet_token_balance(mint, self.cfg.solana_rpc_url)
-            if balance is None:
-                return False
-            if balance <= 0:
-                return True
-            if time.monotonic() >= deadline:
-                return False
+            if balance is None or until(balance) or time.monotonic() >= deadline:
+                return balance
             await asyncio.sleep(self.cfg.tx_confirm_poll_interval_seconds)
+
+    async def _tokens_gone_from_wallet(self, mint: str) -> bool:
+        """True si la wallet ya no tiene tokens de `mint`. False si quedan
+        tokens al final o si no se puede consultar el saldo: ante la duda,
+        la posición se sigue considerando abierta."""
+        balance = await self._poll_wallet_balance(mint, lambda b: b <= 0)
+        return balance is not None and balance <= 0
 
     async def sell(self, position: Position, price: float, reason: str,
                     pool_override: Optional[str] = None, slippage: Optional[float] = None,

@@ -210,3 +210,36 @@ async def test_sell_live_unknown_outcome_with_tokens_or_unknown_balance_stays_op
         await executor.sell(pos, price=1.2, reason="test")
 
     assert pos.closed is False
+
+
+async def test_buy_live_resultado_desconocido_pero_tokens_en_la_wallet_abre_posicion():
+    """Antes la compra se daba por fallida sin mirar la wallet: si la tx
+    entraba, los tokens se quedaban sin trailing ni stop."""
+    from pepump.pumpportal import TradeOutcomeUnknown
+    client = FakeClientWithBalance([0.0, 1234.0], exc=TradeOutcomeUnknown("read timeout"))
+    executor = TradeExecutor(client=client, live=True, config=FastConfirmConfig())
+
+    pos = await executor.buy("M", price=0.00004)
+
+    assert pos.token_amount == 1234.0  # lo que hay de verdad (es lo que se venderá)
+    assert pos.sol_amount == FastConfirmConfig.buy_sol
+    assert pos.entry_is_real_fill is False
+
+
+async def test_buy_live_resultado_desconocido_sin_tokens_es_compra_fallida():
+    from pepump.pumpportal import TradeOutcomeUnknown
+    client = FakeClientWithBalance([0.0], exc=TradeOutcomeUnknown("read timeout"))
+    executor = TradeExecutor(client=client, live=True, config=FastConfirmConfig())
+
+    with pytest.raises(RuntimeError) as info:
+        await executor.buy("M", price=0.00004)
+    assert not isinstance(info.value, TradeOutcomeUnknown)
+
+
+async def test_buy_live_resultado_desconocido_sin_poder_mirar_la_wallet_sigue_desconocido():
+    from pepump.pumpportal import TradeOutcomeUnknown
+    client = FakeClientWithBalance([None], exc=TradeOutcomeUnknown("read timeout"))
+    executor = TradeExecutor(client=client, live=True, config=FastConfirmConfig())
+
+    with pytest.raises(TradeOutcomeUnknown):
+        await executor.buy("M", price=0.00004)

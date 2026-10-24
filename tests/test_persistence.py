@@ -8,6 +8,7 @@ import pytest
 
 from pepump.feed import SharedTradeFeed
 from pepump.manager import PositionManager
+from pepump.pumpportal import TradeOutcomeUnknown
 from pepump.store import PositionStore
 
 from .conftest import SpyExecutor, make_config
@@ -225,6 +226,27 @@ async def test_compra_a_medias(store, live, balance, esperado):
     assert await manager.recover() == []
     assert store.get(pos_id)["status"] == esperado
     assert executors == []  # nunca se arranca un bot para esto
+
+
+@pytest.mark.parametrize("exc, esperado", [
+    (TradeOutcomeUnknown("read timeout"), "review"),    # no se sabe si entró
+    (RuntimeError("slippage excedido"), "cancelled"),   # seguro que no entró
+])
+async def test_compra_sin_resultado_conocido_queda_para_revisar(store, exc, esperado):
+    """Antes una compra que no se sabía si había entrado acababa como
+    'cancelled': nadie miraba la wallet ni al reiniciar, y si la tx entraba
+    los tokens se quedaban sin vigilar."""
+    class CompraQueFalla(SpyExecutor):
+        async def buy(self, mint, price, pool_override=None):
+            raise exc
+
+    manager, conns, _ = make_manager(store, live=True)
+    manager.executor_factory = lambda cfg: CompraQueFalla()
+    managed = manager.open(A)
+    await _precio(manager, conns, A, 1.0)
+    await asyncio.wait_for(managed.task, 5)
+    assert store.get(managed.id)["status"] == esperado
+    await manager.aclose()
 
 
 async def test_ids_persistentes_e_historial(store):

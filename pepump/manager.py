@@ -258,6 +258,10 @@ class PositionManager:
             status = "closed"
         elif pos is not None:
             status = "open"
+        elif bot.buy_outcome_unknown:
+            # Los tokens pueden estar en la wallet sin nadie que los vigile:
+            # ni se retoma ni se puede borrar del historial sin mirarlo.
+            status = "review"
         elif bot.phase == "buying":
             status = "buying"
         elif bot.running:

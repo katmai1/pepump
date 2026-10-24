@@ -9,6 +9,7 @@ from pepump.executor import Position, sell_retry_params
 from pepump.jupiter import JUPITER_POOL, PRIORITY_BACKGROUND
 from pepump.log_context import current_mint, set_mint_label
 from pepump.onchain.fallback import OnchainFallback
+from pepump.pumpportal import TradeOutcomeUnknown
 from pepump.strategy import Action, TrailingStrategy
 from pepump.trade_stream import ShutdownRequested, TradeStream
 
@@ -167,6 +168,9 @@ class TrailingTakeProfitBot:
         # intento e intento se espera un poco (_sell_retry_at, monotonic).
         self.sell_failures = 0
         self._sell_retry_at = 0.0
+        # True si la compra terminó sin saberse si entró (ver _enter): la
+        # posición se guarda para revisar a mano, no como cancelada.
+        self.buy_outcome_unknown = False
         # Panel fijo al pie de la terminal (ver dashboard.py). None cuando
         # la salida no es una terminal (archivo, pipe, tests): entonces el
         # estado se loguea como una línea más, igual que siempre.
@@ -454,6 +458,14 @@ class TrailingTakeProfitBot:
         self._persist()
         try:
             await self._on_first_price(initial_price)
+        except TradeOutcomeUnknown as e:
+            # No se sabe si se compró y no se pudo mirar la wallet: no es una
+            # compra fallida sin más (ver PositionManager._save, "review").
+            logger.error(f"⚠️  No se sabe si la compra entró: {e}. Revisa la wallet a mano: "
+                         f"https://pump.fun/{self.mint}")
+            self.buy_outcome_unknown = True
+            self.end_reason = f"no se sabe si la compra entró, revisa la wallet: {e}"
+            return False
         except Exception as e:
             logger.error(f"La compra no se confirmó on-chain, no se abrió ninguna posición: {e}")
             self.end_reason = f"la compra falló: {e}"
