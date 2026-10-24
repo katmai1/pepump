@@ -1265,6 +1265,9 @@ class TrailingTakeProfitBot:
             "phase": phase,
             "running": self.running,
             "close_requested": self._shutdown_requested.is_set(),
+            # Se está parando SIN vender (stop()): todavía se puede pedir que
+            # venda (ver close()), así que la web sigue ofreciendo "Cerrar".
+            "stopping_without_selling": self._shutdown_requested.is_set() and self._close_mode == "keep",
             "recovered": self.recovered,
             "detached": self.detached,
             "close_reason": self._close_reason,

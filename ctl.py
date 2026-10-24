@@ -211,7 +211,8 @@ def main():
         return
 
     if args.cmd == "close-all":
-        activas = [x for x in snaps if x["running"] and not x["close_requested"]]
+        activas = [x for x in snaps if x["running"]
+                   and (not x["close_requested"] or x.get("stopping_without_selling"))]
         if not activas:
             print("No hay posiciones activas.")
             return

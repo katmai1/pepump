@@ -58,8 +58,14 @@ class ManagedPosition:
 
     @property
     def closable(self) -> bool:
-        """Se le puede pedir el cierre: el bot corre y nadie lo pidió ya."""
-        return not self.task.done() and not self.bot.snapshot()["close_requested"]
+        """Se le puede pedir el cierre: el bot corre y nadie lo pidió ya, o
+        se está parando sin vender (stop()) y aún se puede pedir que venda.
+        Antes esto último no contaba: bot.close() sabía pasar de "parar" a
+        "vender", pero la web respondía 409 y nunca se llegaba ahí."""
+        if self.task.done():
+            return False
+        snap = self.bot.snapshot()
+        return not snap["close_requested"] or snap["stopping_without_selling"]
 
     @property
     def active(self) -> bool:

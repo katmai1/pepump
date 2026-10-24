@@ -315,8 +315,9 @@ function renderTable(now) {
 
 // ---------------------------------------------------------------- órdenes
 
-// Se le puede pedir el cierre: el bot corre y nadie lo pidió todavía.
-const closable = (snap) => snap.running && !snap.close_requested;
+// Se le puede pedir el cierre: el bot corre y nadie lo pidió todavía, o se
+// está parando sin vender y todavía se le puede pedir que venda.
+const closable = (snap) => snap.running && (!snap.close_requested || snap.stopping_without_selling);
 
 function actionButton(snap, extraClass = "") {
   if (closable(snap)) {

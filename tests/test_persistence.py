@@ -159,6 +159,22 @@ async def test_cerrar_despues_de_parar_vende():
     assert not managed.bot.detached
 
 
+async def test_parando_sin_vender_la_web_todavia_puede_cerrar():
+    """bot.close() sabía pasar de "parar" a "vender", pero closable daba
+    False en cuanto había un cierre pedido: la web respondía 409 y nunca se
+    llegaba ahí."""
+    manager, conns, executors = make_manager(None)
+    managed = manager.open(A)
+    await _precio(manager, conns, A, 1.0)
+    await _hasta(lambda: managed.bot.position is not None)
+    managed.bot.stop("Ctrl+C")
+    assert managed.closable and managed.bot.snapshot()["stopping_without_selling"]
+    manager.close(managed.id, "cerrada desde la web")
+    assert not managed.closable  # ya va a vender: un segundo cierre no hace nada
+    await asyncio.wait_for(managed.task, 5)
+    assert executors[0].sell_calls == 1
+
+
 async def test_al_arrancar_lo_que_esperaba_entrada_se_cancela(store):
     pos_id = store.create(A, live=False, settings={})
     manager, _, _ = make_manager(store)
