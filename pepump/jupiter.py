@@ -54,6 +54,10 @@ PRIORITY_BACKGROUND = 2
 _LAMPORTS_PER_SOL = 1_000_000_000
 # Offset del campo `decimals` en la cuenta de un mint (igual en Token-2022).
 _MINT_DECIMALS_OFFSET = 44
+# Token-2022: tras los 165 bytes de la cuenta base y el byte del tipo de
+# cuenta empiezan las extensiones (TLV: tipo u16, longitud u16, valor).
+_TOKEN_2022_TLV_OFFSET = 166
+_EXT_TRANSFER_FEE_CONFIG = 1
 # Códigos de /execute con los que la tx seguro que NO entró: Jupiter dejó
 # de intentarlo (blockhash vencido) o ni siquiera la aceptó.
 _EXECUTE_NOT_LANDED = {-1, -2, -3, -1000, -1002, -1003, -1004, -1005, -2000, -2002, -2003, -2004}
@@ -136,7 +140,7 @@ class JupiterClient:
         self.api_key = api_key
         self.keypair = keypair
         self._limiter = _PriorityLimiter(request_interval_seconds)
-        self._decimals: dict = {}
+        self._mints: dict = {}  # mint -> (decimales, impuesto de transferencia)
 
     @property
     def can_sign(self) -> bool:
@@ -186,23 +190,42 @@ class JupiterClient:
 
     # ---- Precio ----------------------------------------------------------- #
 
-    async def token_decimals(self, mint: str, rpc_url: str) -> int:
-        if mint not in self._decimals:
+    async def mint_info(self, mint: str, rpc_url: str) -> tuple:
+        """(decimales, impuesto de transferencia) del mint; el impuesto es
+        None o (bps, tope en unidades crudas), ver _transfer_fee."""
+        if mint not in self._mints:
             async with AsyncClient(rpc_url) as client:
                 resp = await client.get_account_info(Pubkey.from_string(mint))
             account = rpc_value(resp, f"la cuenta del mint {mint}")
             if account is None or len(bytes(account.data)) <= _MINT_DECIMALS_OFFSET:
                 raise JupiterError(f"No se pudo leer la cuenta del mint {mint}.")
-            self._decimals[mint] = bytes(account.data)[_MINT_DECIMALS_OFFSET]
-        return self._decimals[mint]
+            data = bytes(account.data)
+            self._mints[mint] = (data[_MINT_DECIMALS_OFFSET], _transfer_fee(data))
+        return self._mints[mint]
+
+    async def token_decimals(self, mint: str, rpc_url: str) -> int:
+        return (await self.mint_info(mint, rpc_url))[0]
+
+    async def transfer_fee_pct(self, mint: str, rpc_url: str) -> float:
+        """Impuesto de transferencia de Token-2022 del mint, en % (0 si no
+        tiene)."""
+        fee = (await self.mint_info(mint, rpc_url))[1]
+        return fee[0] / 100.0 if fee else 0.0
 
     async def buy_tokens(self, mint: str, sol: float, rpc_url: str,
                          priority: int = PRIORITY_PRICE) -> float:
-        """Tokens que darían ahora mismo por `sol` SOL (ya con la ruta, las
-        comisiones de los pools y la de Jupiter)."""
-        decimals = await self.token_decimals(mint, rpc_url)
+        """Tokens que llegarían a la wallet ahora mismo por `sol` SOL (ya con
+        la ruta, las comisiones de los pools y la de Jupiter). El outAmount
+        de Jupiter es lo que sale del pool, SIN el impuesto de transferencia
+        del token (caso real BTZK...WwGp, 3%: la cotización daba 70.9k y
+        llegaron 68.8k): se descuenta aquí."""
+        decimals, fee = await self.mint_info(mint, rpc_url)
         data = await self.quote(WSOL_MINT, mint, round(sol * _LAMPORTS_PER_SOL), priority)
-        return _as_int(data["outAmount"]) / 10 ** decimals
+        raw = _as_int(data["outAmount"])
+        if fee:
+            bps, maximum = fee
+            raw -= min(-(-raw * bps // 10_000), maximum)
+        return raw / 10 ** decimals
 
     async def sell_price(self, mint: str, token_amount: float, rpc_url: str,
                          priority: int = PRIORITY_PRICE) -> float:
@@ -401,6 +424,30 @@ def _b58decode(text: str) -> bytes:
         number = number * 58 + index
     body = number.to_bytes((number.bit_length() + 7) // 8, "big") if number else b""
     return b"\0" * (len(text) - len(text.lstrip("1"))) + body
+
+
+def _transfer_fee(mint_data: bytes) -> Optional[tuple]:
+    """(bps, tope en unidades crudas) de la extensión TransferFeeConfig de
+    un mint de Token-2022, o None si no la tiene (o es un mint de SPL
+    Token). De las dos tarifas que guarda (la anterior y la nueva, que entra
+    en vigor en una época dada) se toma la mayor: sin mirar la época actual,
+    así nunca se queda corto durante un cambio."""
+    offset = _TOKEN_2022_TLV_OFFSET
+    while offset + 4 <= len(mint_data):
+        ext_type = int.from_bytes(mint_data[offset:offset + 2], "little")
+        length = int.from_bytes(mint_data[offset + 2:offset + 4], "little")
+        value = mint_data[offset + 4:offset + 4 + length]
+        if ext_type == _EXT_TRANSFER_FEE_CONFIG and len(value) >= 108:
+            # autoridades (2 x 32), withheld (8), y dos tarifas de 18 bytes:
+            # época (u64), tope (u64), bps (u16).
+            fees = [(int.from_bytes(value[start + 16:start + 18], "little"),
+                     int.from_bytes(value[start + 8:start + 16], "little")) for start in (72, 90)]
+            bps, maximum = max(fees)
+            return (bps, maximum) if bps > 0 else None
+        if ext_type == 0 and length == 0:
+            break
+        offset += 4 + length
+    return None
 
 
 def _as_int(value) -> int:

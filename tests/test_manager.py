@@ -254,6 +254,45 @@ async def test_preview(monkeypatch):
         await manager.preview("no-es-un-mint")
 
 
+async def test_preview_avisa_del_coste_de_entrar_y_salir(monkeypatch):
+    """Caso real BTZK...WwGp por Jupiter: vender nada más comprar devolvía
+    un ~12% menos (impuesto de transferencia del 3% en cada sentido,
+    comisiones e impacto)."""
+    import pepump.manager as manager_module
+
+    class Curva:
+        def __init__(self, rpc): pass
+        async def fetch_price_or_status(self, mint):
+            return None, False, False
+
+    class Swap:
+        def __init__(self, rpc): pass
+        async def fetch_price_or_confirm_absent(self, mint):
+            return None, True
+
+    class Jupiter:
+        async def buy_tokens(self, mint, sol, rpc_url, priority=None):
+            self.sol = sol
+            return 68788.8
+        async def sell_price(self, mint, tokens, rpc_url, priority=None):
+            return 0.88 * self.sol / tokens
+        async def transfer_fee_pct(self, mint, rpc_url):
+            return 3.0
+
+    monkeypatch.setattr(manager_module, "PumpCurveOnChainClient", Curva)
+    monkeypatch.setattr(manager_module, "PumpSwapOnChainClient", Swap)
+    manager, _, _ = make_manager(buy_sol=0.05)
+    manager.jupiter = Jupiter()
+
+    p = await manager.preview(A)
+    assert p["market"] == "jupiter" and p["buy_sol"] == 0.05
+    assert p["round_trip_pct"] == pytest.approx(-12.0)
+    assert p["transfer_fee_pct"] == 3.0
+    # Con el importe del formulario, no el de la config.
+    p = await manager.preview(A, buy_sol=0.2)
+    assert manager.jupiter.sol == 0.2 and p["buy_sol"] == 0.2
+
+
 
 async def test_modo_por_posicion():
     """Real o simulada se elige al abrir; el executor de cada posición

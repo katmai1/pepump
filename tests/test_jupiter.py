@@ -157,13 +157,47 @@ def test_limitador_libera_el_turno_si_se_cancela():
 # Precio
 # --------------------------------------------------------------------------- #
 
-def _client(keypair=None) -> JupiterClient:
+def _client(keypair=None, transfer_fee=None) -> JupiterClient:
     client = JupiterClient("jup-key", keypair, request_interval_seconds=0.0)
 
-    async def decimals(mint, rpc_url):
-        return 6
-    client.token_decimals = decimals
+    async def mint_info(mint, rpc_url):
+        return 6, transfer_fee
+    client.mint_info = mint_info
     return client
+
+
+def _token_2022_mint(older_bps: int, newer_bps: int, maximum: int = 2**64 - 1) -> bytes:
+    """Cuenta de un mint de Token-2022 con la extensión TransferFeeConfig
+    detrás de otra extensión cualquiera (MetadataPointer, 64 bytes)."""
+    base = bytearray(165)
+    base[44] = 6
+    fee = bytes(72)
+    for epoch, bps in ((1, older_bps), (2, newer_bps)):
+        fee += epoch.to_bytes(8, "little") + maximum.to_bytes(8, "little") + bps.to_bytes(2, "little")
+    tlv = (18).to_bytes(2, "little") + (64).to_bytes(2, "little") + bytes(64)
+    tlv += (1).to_bytes(2, "little") + len(fee).to_bytes(2, "little") + fee
+    return bytes(base) + b"\x01" + tlv
+
+
+def test_impuesto_de_transferencia_del_mint():
+    assert jupiter_module._transfer_fee(_token_2022_mint(300, 300, maximum=10**15)) == (300, 10**15)
+    # En pleno cambio de tarifa, la mayor de las dos.
+    assert jupiter_module._transfer_fee(_token_2022_mint(500, 100))[0] == 500
+    assert jupiter_module._transfer_fee(_token_2022_mint(0, 0)) is None
+    assert jupiter_module._transfer_fee(bytes(82)) is None  # SPL Token
+
+
+def test_buy_tokens_descuenta_el_impuesto_de_transferencia(monkeypatch):
+    """Caso real BTZK...WwGp: el outAmount de Jupiter es lo que sale del
+    pool; con el 3% de impuesto llega un 3% menos a la wallet."""
+    monkeypatch.setattr(requests, "get", lambda *a, **k: FakeResponse(body={"outAmount": "70916301078"}))
+
+    tokens = asyncio.run(_client(transfer_fee=(300, 2**64 - 1)).buy_tokens(MINT, 0.05, "http://rpc"))
+    assert tokens == pytest.approx(70916.301078 * 0.97, abs=1e-6)
+
+    # El tope del impuesto también cuenta.
+    tokens = asyncio.run(_client(transfer_fee=(300, 1_000_000)).buy_tokens(MINT, 0.05, "http://rpc"))
+    assert tokens == pytest.approx(70916.301078 - 1.0)
 
 
 def test_sell_price_es_el_sol_recibido_por_token(monkeypatch):
@@ -348,6 +382,9 @@ class FakeJupiter:
             raise JupiterError("sin ruta (fake)")
         self.sell_quotes.append((token_amount, priority))
         return self.price
+
+    async def transfer_fee_pct(self, mint, rpc_url):
+        return 0.0
 
     async def execute_trade(self, **kwargs):
         self.trades.append(kwargs)

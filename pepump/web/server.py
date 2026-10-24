@@ -13,7 +13,7 @@ intermedia.
   GET  /api/positions/{id}/prices     precios para el gráfico (?after=<ts>)
   GET  /api/wallet                    dirección y saldo de SOL de la wallet
   GET  /api/defaults                  ajustes por defecto y límites (formulario)
-  GET  /api/preview?mint=...          qué es un mint antes de comprar
+  GET  /api/preview?mint=...&buy_sol= qué es un mint antes de comprar
   POST /api/positions                 abrir (comprar) una posición
   POST /api/positions/{id}/close      cerrar (vender) una posición
   POST /api/positions/close-all       cerrar todas
@@ -275,17 +275,19 @@ def create_app(manager: PositionManager, logs: LogBuffer, *, live: bool,
     # Con la cabecera del panel aunque sea un GET: cada vista previa gasta
     # consultas del RPC, y así una web ajena no puede ponerse a lanzarlas.
     @app.get("/api/preview", dependencies=orden)
-    async def get_preview(mint: str):
+    async def get_preview(mint: str, buy_sol: Optional[float] = None):
         mint = mint.strip()
-        cached = preview_cache.get(mint)
+        # El coste de entrar depende del importe (impacto): va en la clave.
+        key = (mint, buy_sol)
+        cached = preview_cache.get(key)
         if cached is not None and time.monotonic() - cached[0] < PREVIEW_CACHE_SECONDS:
             result = cached[1]
         else:
             try:
-                result = await manager.preview(mint)
+                result = await manager.preview(mint, buy_sol)
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e)) from e
-            preview_cache[mint] = (time.monotonic(), result)
+            preview_cache[key] = (time.monotonic(), result)
             if len(preview_cache) > 200:
                 preview_cache.clear()
         # La posición activa sí se mira siempre al momento.

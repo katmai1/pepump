@@ -487,14 +487,24 @@ class PositionManager:
             "accepting_new": not self._closing_all,
         }
 
-    async def preview(self, mint: str) -> dict:
+    async def preview(self, mint: str, buy_sol: Optional[float] = None) -> dict:
         """Qué es este mint, ANTES de comprar: nombre/símbolo, dónde cotiza
         y a qué precio. Solo consultas baratas (getAccountInfo /
-        getMultipleAccounts). Lanza ValueError si el mint no es válido."""
+        getMultipleAccounts). Lanza ValueError si el mint no es válido.
+
+        Si cotiza por Jupiter, también cuánto se pierde de entrada
+        (`round_trip_pct`): lo que devolvería vender ya mismo los tokens
+        que darían por `buy_sol` (el de la config si no se pasa), contra
+        esos `buy_sol`. Es donde arranca el PnL neto: comisiones de los
+        pools, impacto y el impuesto de transferencia del token
+        (`transfer_fee_pct`), pagados al comprar y otra vez al vender (caso
+        real BTZK...WwGp: −12% nada más comprar)."""
         mint = validate_mint(mint)
         rpc = self.base_config.solana_rpc_url
+        buy_sol = buy_sol if buy_sol and buy_sol > 0 else self.base_config.buy_sol
         out: Dict[str, object] = {"mint": mint, "name": None, "symbol": None, "market": None, "price": None,
-               "active_position": None}
+               "active_position": None, "buy_sol": buy_sol, "round_trip_pct": None,
+               "transfer_fee_pct": None}
         ocupada = self._active_for_mint(mint)
         if ocupada is not None:
             out["active_position"] = ocupada.id
@@ -521,10 +531,11 @@ class PositionManager:
                 # mira primero lo demás).
                 if self.jupiter is not None:
                     try:
-                        tokens = await self.jupiter.buy_tokens(mint, self.base_config.buy_sol, rpc,
-                                                               priority=PRIORITY_BACKGROUND)
-                        return "jupiter", await self.jupiter.sell_price(mint, tokens, rpc,
-                                                                        priority=PRIORITY_BACKGROUND)
+                        tokens = await self.jupiter.buy_tokens(mint, buy_sol, rpc, priority=PRIORITY_BACKGROUND)
+                        price = await self.jupiter.sell_price(mint, tokens, rpc, priority=PRIORITY_BACKGROUND)
+                        out["round_trip_pct"] = (price * tokens / buy_sol - 1.0) * 100.0
+                        out["transfer_fee_pct"] = await self.jupiter.transfer_fee_pct(mint, rpc)
+                        return "jupiter", price
                     except Exception as e:
                         logger.debug(f"[Vista previa] Jupiter no cotiza {mint}: {e}")
                 return "other", None

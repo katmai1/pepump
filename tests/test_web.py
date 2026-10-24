@@ -82,10 +82,11 @@ class FakeManager:
         if buy_sol + priority_fee > self.wallet_sol:
             raise ValueError("Saldo insuficiente: la wallet tiene 0.0100 SOL")
 
-    async def preview(self, mint):
+    async def preview(self, mint, buy_sol=None):
         if mint == "malo":
             raise ValueError("'malo' no es una dirección de mint válida")
         self.previews = getattr(self, "previews", 0) + 1
+        self.preview_buy_sol = buy_sol
         return {"mint": mint, "name": "Pepe", "symbol": "PEPE", "market": "bondingcurve",
                 "price": 1e-7, "active_position": None}
 
@@ -425,6 +426,9 @@ def test_preview_con_cache_y_errores():
     assert r.status_code == 200 and r.json()["symbol"] == "PEPE"
     client.get("/api/preview", params={"mint": A}, headers=PAGE)
     assert client.manager.previews == 1  # la segunda sale de la caché
+    # Con otro importe, otra cotización (el coste de entrar depende de él).
+    client.get("/api/preview", params={"mint": A, "buy_sol": 0.2}, headers=PAGE)
+    assert client.manager.previews == 2 and client.manager.preview_buy_sol == 0.2
     assert client.get("/api/preview", params={"mint": "malo"}, headers=PAGE).status_code == 400
     # Sin la cabecera del panel no se gasta RPC.
     assert client.get("/api/preview", params={"mint": A}).status_code == 403

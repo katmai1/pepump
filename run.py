@@ -101,18 +101,9 @@ def parse_args():
 
     return p.parse_args()
 
-def show_header(live, opening_now: bool):
-    # Sin print(): todo sale por el mismo logger que el resto del bot, así
-    # el banner queda en el archivo/redirección junto a las operaciones.
-    # Las comillas del modo van en una variable aparte a propósito: un
-    # f-string con comillas dobles anidadas solo compila en Python 3.12+
-    # (PEP 701), y este proyecto arranca en 3.11 (tomllib).
+def warn_live_mode(live, opening_now: bool):
     # general.live es el modo POR DEFECTO de las posiciones nuevas: desde la
     # web y ctl.py se elige en cada una. Las retomadas siguen en el suyo.
-    modo = "REAL ⚠️" if live else "SIMULADO"
-    logger.info("=" * 50)
-    logger.info(f"\t PePump | Modo por defecto: {modo}")
-    logger.info("=" * 50)
     if live and opening_now:
         logger.warning("⚠️  MODO REAL (general.live = true en el .toml): las posiciones de -m se abren con "
                        "SOL real.")
@@ -164,8 +155,7 @@ if __name__ == "__main__":
         log_buffer = LogBuffer()
         logging.getLogger().addHandler(log_buffer)
 
-    show_header(config.live, opening_now=bool(mints))
-    # Después del banner, para que no quede enterrado arriba.
+    warn_live_mode(config.live, opening_now=bool(mints))
     if web_sock is not None and not is_loopback(args.web_host):
         if config.web_password:
             logger.warning(f"Panel web abierto a la red ({args.web_host}) con contraseña. Va por HTTP "

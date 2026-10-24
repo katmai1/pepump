@@ -325,6 +325,11 @@ main {
 .dialog-body .facts dd { margin: 0; color: var(--ink); font-variant-numeric: tabular-nums; }
 .dialog-body .facts dd.up { color: var(--up); }
 .dialog-body .facts dd.down { color: var(--down); }
+.dialog-body .warn-cost {
+  border: 1px solid var(--warning);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
 .dialog-body .warn-real {
   border: 1px solid var(--critical);
   color: var(--critical);
@@ -386,6 +391,7 @@ main {
 }
 .preview .p-name { font-weight: 600; color: var(--ink); }
 .preview .p-meta { color: var(--ink-2); }
+.preview .p-warn { color: var(--warning); font-weight: 600; }
 .preview.warn { border-color: var(--warning); }
 .preview.bad { border-color: var(--down); color: var(--down); }
 #open-dialog .form-error { margin-top: 12px; }

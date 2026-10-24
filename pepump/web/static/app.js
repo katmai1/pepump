@@ -492,7 +492,7 @@ function renderFormWallet() {
     note.textContent = "No se pudo consultar el saldo de la wallet (¿RPC?).";
     return;
   }
-  const buy = Number(field("buy_sol").value.replace(",", ".")) || 0;
+  const buy = formBuySol();
   const fee = Number(field("priority_fee").value.replace(",", ".")) || 0;
   const needed = buy + fee + BUY_OVERHEAD_SOL;
   if (w.sol < needed) {
@@ -575,6 +575,38 @@ const MARKETS = {
   unknown: "No se pudo comprobar dónde cotiza (¿RPC?)",
 };
 
+// A partir de cuánto se pierde de entrada (comprar y vender al momento)
+// se avisa antes de comprar.
+const ROUND_TRIP_WARN_PCT = 5;
+
+const formBuySol = () => Number(field("buy_sol").value.replace(",", ".")) || 0;
+const bigRoundTrip = (p) => p && p.round_trip_pct !== null && p.round_trip_pct !== undefined
+  && p.round_trip_pct <= -ROUND_TRIP_WARN_PCT;
+
+// Qué supone el coste de entrar y salir para la posición: dónde arranca el
+// PnL neto y, si la estrategia se mide sobre lo pagado, cuánto tiene que
+// moverse el precio para llegar al stop o a la activación del trailing.
+function roundTripWarning(p, s) {
+  if (!bigRoundTrip(p)) return null;
+  const rt = p.round_trip_pct;
+  const tax = p.transfer_fee_pct
+    ? `, más el impuesto de transferencia del token (${p.transfer_fee_pct} %), que se paga al comprar y otra vez al vender`
+    : "";
+  let text = `Si vendieras nada más comprar recuperarías un ${Math.abs(rt).toFixed(1)} % menos de lo que pagas `
+    + `(comisiones de los pools e impacto${tax}). El PnL neto arrancará en ${fmtPct(rt)}.`;
+  if (s.strategy_price_basis === "real") {
+    const left = 1 + rt / 100;
+    const toStop = ((1 - s.initial_stop_pct / 100) / left - 1) * 100;
+    const toActivate = ((1 + s.activation_pct / 100) / left - 1) * 100;
+    text += toStop >= 0
+      ? ` El stop-loss inicial (−${s.initial_stop_pct} % sobre lo pagado) saltaría nada más entrar.`
+      : ` El stop-loss inicial (−${s.initial_stop_pct} % sobre lo pagado) saltaría con una bajada del precio de solo `
+        + `un ${Math.abs(toStop).toFixed(1)} %, y para activar el trailing (+${s.activation_pct} %) tendría que subir un `
+        + `${toActivate.toFixed(1)} %.`;
+  }
+  return el("p", { class: "warn-cost" }, `⚠ ${text}`);
+}
+
 function renderPreview(p, error) {
   const box = document.getElementById("f-preview");
   box.hidden = false;
@@ -592,17 +624,23 @@ function renderPreview(p, error) {
   const parts = [el("span", { class: "p-name" }, name),
                  el("span", { class: "p-meta" }, MARKETS[p.market] || p.market)];
   if (p.price) parts.push(el("span", { class: "p-meta" }, `Precio ahora: ${fmtPrice(p.price)} SOL/token`));
+  if (p.round_trip_pct !== null && p.round_trip_pct !== undefined) {
+    parts.push(el("span", { class: bigRoundTrip(p) ? "p-warn" : "p-meta" },
+                  `Comprar y vender ya (${p.buy_sol} SOL): ${fmtPct(p.round_trip_pct)}`
+                  + (p.transfer_fee_pct ? ` · impuesto de transferencia ${p.transfer_fee_pct} %` : "")));
+  }
   if (p.active_position) {
     box.classList.add("bad");
     parts.push(el("span", {}, `Ya hay una posición activa de este token (#${p.active_position}).`));
-  } else if (p.market === "other" || p.market === "unknown") {
+  } else if (p.market === "other" || p.market === "unknown" || bigRoundTrip(p)) {
     box.classList.add("warn");
   }
   box.replaceChildren(...parts);
 }
 
 let previewTimer = null;
-function onMintInput() {
+// Al cambiar el mint o el importe (el coste de entrar depende de él).
+function onPreviewInput() {
   clearTimeout(previewTimer);
   previewData = null;
   const mint = field("mint").value.trim();
@@ -616,7 +654,7 @@ function onMintInput() {
   previewTimer = setTimeout(async () => {
     const seq = ++previewSeq;
     try {
-      const p = await api(`/api/preview?mint=${encodeURIComponent(mint)}`);
+      const p = await fetchPreview(mint, formBuySol());
       if (seq !== previewSeq) return;
       previewData = p;
       renderPreview(p);
@@ -626,6 +664,11 @@ function onMintInput() {
       renderPreview(null, err.message);
     }
   }, 400);
+}
+
+function fetchPreview(mint, buySol) {
+  const amount = buySol > 0 ? `&buy_sol=${buySol}` : "";
+  return api(`/api/preview?mint=${encodeURIComponent(mint)}${amount}`);
 }
 
 function readSettings() {
@@ -683,6 +726,13 @@ async function doSubmitNewPosition() {
   }
 
   const s = { ...defaults.settings, ...settings };
+  // El coste de entrar se calculó con otro importe: se recalcula con este.
+  if (previewData && previewData.round_trip_pct !== null && previewData.buy_sol !== buySol) {
+    try {
+      previewData = await fetchPreview(mint, buySol);
+      renderPreview(previewData);
+    } catch { /* se sigue con la vista previa que había */ }
+  }
   const p = previewData;
   const tokenName = p && (p.symbol ? `$${p.symbol}` : p.name);
   const isReal = settings.live;
@@ -692,11 +742,14 @@ async function doSubmitNewPosition() {
       ["Mint", shortMint(mint)],
       ["Dónde", p ? (MARKETS[p.market] || p.market) : "sin comprobar"],
       ...(p && p.price ? [["Precio ahora", `${fmtPrice(p.price)} SOL/token`]] : []),
+      ...(p && p.round_trip_pct !== null && p.round_trip_pct !== undefined
+        ? [["Comprar y vender ya", `${fmtPct(p.round_trip_pct)} (${p.buy_sol} SOL)`, bigRoundTrip(p) ? "down" : ""]] : []),
       ["Modo", isReal ? "REAL (SOL de verdad)" : "simulado (no se compra nada)", isReal ? "down" : ""],
       ["Compra", `${buySol} SOL`],
       ["Entrada", s.entry_dip_pct > 0 ? `cuando baje un ${s.entry_dip_pct} %` : "al primer precio"],
       ["Estrategia", `activa +${s.activation_pct} % · trailing ${s.trailing_pct} % · stop −${s.initial_stop_pct} %`],
     ]),
+    roundTripWarning(p, s),
     realWarning(isReal, `se compra de verdad, con ${buySol} SOL reales de tu wallet.`),
   ].filter(Boolean), isReal ? "Comprar con SOL real" : "Comprar (simulado)", isReal);
   if (!ok) return;
@@ -1182,7 +1235,8 @@ document.getElementById("open-form").addEventListener("submit", submitNewPositio
 // El aviso de error es del último intento: se quita en cuanto tocas algo.
 document.getElementById("open-form").addEventListener("input", () => showOpenError(""));
 document.getElementById("open-cancel").addEventListener("click", () => document.getElementById("open-dialog").close());
-document.getElementById("f-mint").addEventListener("input", onMintInput);
+document.getElementById("f-mint").addEventListener("input", onPreviewInput);
+document.getElementById("f-buy_sol").addEventListener("input", onPreviewInput);
 document.getElementById("f-reset").addEventListener("click", fillDefaults);
 document.getElementById("f-mode").addEventListener("change", updateModeUI);
 for (const name of ["buy_sol", "priority_fee"]) {
