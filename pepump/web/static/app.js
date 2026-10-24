@@ -555,6 +555,7 @@ async function openNewPosition() {
   document.getElementById("f-buy-hint").textContent = `Máximo ${defaults.max_buy_sol} SOL por posición (max_buy_sol)`;
   document.getElementById("open-error").hidden = true;
   document.getElementById("f-preview").hidden = true;
+  previewSeq++;
   previewData = null;
   form.querySelector("details").open = false;
   document.getElementById("open-dialog").showModal();
@@ -642,6 +643,10 @@ let previewTimer = null;
 // Al cambiar el mint o el importe (el coste de entrar depende de él).
 function onPreviewInput() {
   clearTimeout(previewTimer);
+  // Invalida la consulta que siga en vuelo: antes solo se invalidaba al
+  // lanzar la siguiente (400 ms después), y si la vieja volvía en medio
+  // dejaba en previewData el token anterior, el que enseñaba la confirmación.
+  previewSeq++;
   previewData = null;
   const mint = field("mint").value.trim();
   field("mint").removeAttribute("aria-invalid");
