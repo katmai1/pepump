@@ -135,6 +135,10 @@ class Position:
 # Con los valores por defecto: slippage 15 -> 25 -> 35 -> 45 -> 50 y fee
 # 0.00001 -> 0.00004 -> 0.00016 -> 0.00064 -> 0.001 SOL.
 SELL_SLIPPAGE_STEP = 10.0
+# Con cuántos tokens de más (en tanto por uno) vendidos que los de la
+# posición se considera que la venta se llevó tokens ajenos a ella (ver
+# sell). Por debajo es redondeo.
+_EXTRA_TOKENS_TOLERANCE = 0.01
 SELL_PRIORITY_FEE_FACTOR = 4.0
 
 
@@ -554,6 +558,20 @@ class TradeExecutor:
                             f"vendiste {real_token_amount_sold:,.6f} tokens y recibiste "
                             f"{real_sol_received:.9f} SOL -> precio efectivo real: {exit_price:.10f} "
                             f"SOL/token.")
+                # La venta es del 100% de la wallet: si había tokens de más
+                # (un resto anterior, una compra a mano), sus SOL contaban
+                # como ganancia de la posición. Solo cuenta la parte de ella.
+                # Sin ingresos positivos no hay nada que repartir: las
+                # comisiones son de la tx, no de cada token.
+                if (position.token_amount > 0 and real_sol_received > 0
+                        and real_token_amount_sold > position.token_amount * (1 + _EXTRA_TOKENS_TOLERANCE)):
+                    parte = position.token_amount / real_token_amount_sold
+                    proceeds = real_sol_received * parte
+                    token_amount_sold = position.token_amount
+                    logger.warning(f"[REAL] Se vendieron {real_token_amount_sold:,.6f} tokens de {position.mint} "
+                                   f"y la posición tenía {position.token_amount:,.6f}: el resto ya estaba en la "
+                                   f"wallet. El PnL cuenta solo la parte de la posición "
+                                   f"({proceeds:.9f} de {real_sol_received:.9f} SOL).")
             else:
                 logger.warning("[REAL] No se pudieron confirmar los datos reales de la venta; "
                                "se usa el ESTIMADO (precio de referencia y token_amount de la "

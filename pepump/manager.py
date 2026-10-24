@@ -384,6 +384,10 @@ class PositionManager:
                 logger.warning(f"Posición #{pos_id} ({mint}): en la wallet hay {balance:,.2f} tokens y la "
                                f"posición tenía {row['token_amount']:,.2f}. Al vender se vende TODO lo "
                                f"que haya de ese token.")
+            elif balance is not None and row["token_amount"] and balance > row["token_amount"] * 1.01:
+                logger.warning(f"Posición #{pos_id} ({mint}): en la wallet hay {balance:,.2f} tokens y la "
+                               f"posición tenía {row['token_amount']:,.2f}. Al vender se venden TODOS; el "
+                               f"PnL de la posición cuenta solo los suyos.")
 
             settings = {k: v for k, v in row["settings"].items() if k in OVERRIDABLE_FIELDS}
             settings["live"] = live

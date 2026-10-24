@@ -382,3 +382,33 @@ async def test_la_compra_guarda_los_tokens_intermedios_de_la_ruta():
     assert pos.route_mints == ["USDC", "TTWO"]
     # Sin el rent de las tres cuentas, el coste de entrada es el del swap.
     assert pos.entry_price == pytest.approx((0.0345709 - 0.00456184) / 13719.755)
+
+
+async def test_venta_con_tokens_de_mas_en_la_wallet_cuenta_solo_los_de_la_posicion():
+    """La venta es del 100% de la wallet: si había tokens de antes (un resto,
+    una compra a mano), sus SOL contaban como ganancia de la posición."""
+    client = FakeLightningClient(result={
+        "signature": "xyz",
+        "actual_sol_delta": 0.15,          # por 3000 tokens: 1000 de la posición + 2000 que ya estaban
+        "actual_token_delta": -3000.0,
+    })
+    executor = TradeExecutor(client=client, live=True, config=DummyConfig())
+    pos = Position(mint="MintABC", entry_price=0.00005, sol_amount=0.05, token_amount=1000.0,
+                   entry_is_real_fill=True)
+
+    await executor.sell(pos, price=0.00005, reason="trailing-stop")
+
+    assert pos.proceeds_sol == pytest.approx(0.05)
+    assert pos.realized_pnl_sol == pytest.approx(0.0)
+    assert pos.exit_price == pytest.approx(0.00005)  # el precio por token no cambia
+
+
+async def test_venta_con_diferencia_de_redondeo_no_se_reparte():
+    client = FakeLightningClient(result={"signature": "xyz", "actual_sol_delta": 0.0603,
+                                         "actual_token_delta": -1000.4})
+    executor = TradeExecutor(client=client, live=True, config=DummyConfig())
+    pos = Position(mint="MintABC", entry_price=0.00005, sol_amount=0.05, token_amount=1000.0)
+
+    await executor.sell(pos, price=0.00006, reason="trailing-stop")
+
+    assert pos.proceeds_sol == pytest.approx(0.0603)

@@ -259,6 +259,18 @@ async def test_active_mints_son_los_de_posiciones_activas(store):
     await manager.aclose()
 
 
+async def test_retomar_con_mas_tokens_en_la_wallet_avisa(store, caplog):
+    pos_id = _abierta(store, A, live=True)
+    client = WalletClient(balances={A: 999_999.0}, wallet_address="W")
+    manager, _, _ = make_manager(store, client=client)
+    await manager.recover()
+    assert "el PnL de la posición cuenta solo los suyos" in caplog.text
+    manager.stop_all("fin")
+    await asyncio.wait_for(manager.wait_all(), 5)
+    await manager.aclose()
+    assert store.get(pos_id)["status"] == "open"
+
+
 async def test_ids_persistentes_e_historial(store):
     manager, conns, _ = make_manager(store)
     primera = manager.open(A)
