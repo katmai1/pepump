@@ -14,6 +14,7 @@ from collections import deque
 from typing import List, Optional, Set, Tuple
 
 from pepump.log_context import MintContextFilter
+from pepump.redact import SecretRedactingFilter
 
 
 class LogBuffer(logging.Handler):
@@ -24,6 +25,8 @@ class LogBuffer(logging.Handler):
     def __init__(self, maxlen: int = 2000, level: int = logging.INFO):
         super().__init__(level=level)
         self.addFilter(MintContextFilter())
+        # Lo que se guarda aquí lo ve cualquiera que entre al panel.
+        self.addFilter(SecretRedactingFilter())
         self._entries: deque = deque(maxlen=maxlen)
         self._seq = 0
         # emit() también lo llaman los hilos de asyncio.to_thread.
@@ -34,7 +37,8 @@ class LogBuffer(logging.Handler):
         try:
             message = record.getMessage()
             if record.exc_info:
-                message += "\n" + logging.Formatter().formatException(record.exc_info)
+                # exc_text: el traceback ya tapado por SecretRedactingFilter.
+                message += "\n" + (record.exc_text or logging.Formatter().formatException(record.exc_info))
             with self._lock:
                 self._seq += 1
                 entry = {

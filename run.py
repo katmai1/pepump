@@ -70,6 +70,7 @@ from pepump.logging_config import setup_logging
 from pepump.manager import PositionManager
 from pepump.onchain.metadata import TokenMetadataOnChainClient
 from pepump.pumpportal import PumpPortalClient
+from pepump.redact import register_config_secrets
 from pepump.shutdown import run_with_shutdown_signals_for
 from pepump.token_accounts import build_token_account_closer, sweep_empty_token_accounts
 
@@ -121,6 +122,8 @@ if __name__ == "__main__":
 
     try:
         config = load_config(args.config)
+        # Antes de que nada pueda loguear una URL con la clave dentro.
+        register_config_secrets(config)
         # Los mints vienen SIEMPRE de la línea de comandos, nunca del .toml.
         # Se normalizan y validan aquí para fallar rápido y con un mensaje
         # que apunte a la causa real -ver validate_mint en config.py.

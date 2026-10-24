@@ -4,6 +4,7 @@ from typing import Optional
 
 from pepump.dashboard import PanelAwareHandler, StatusPanel, create_panel, panel_unavailable_reason
 from pepump.log_context import MintContextFilter, MintTagFormatter
+from pepump.redact import SecretRedactingFilter
 
 
 def setup_logging(level: int = logging.INFO, panel: bool = True,
@@ -60,6 +61,7 @@ def setup_logging(level: int = logging.INFO, panel: bool = True,
     # `record.mint` en cada log (ver log_context.py). Solo se muestra con
     # tag_mint (varias posiciones): con una sola sería ruido.
     handler.addFilter(MintContextFilter())
+    handler.addFilter(SecretRedactingFilter())
     root.addHandler(handler)
 
     if no_panel_reason:

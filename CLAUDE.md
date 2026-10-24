@@ -77,6 +77,10 @@ posiciones desde ahí.
 - **Jupiter (plan gratuito): una petición cada ~2 s para toda la cuenta.**
   Todo pasa por `_PriorityLimiter`; las órdenes adelantan a las consultas de
   precio. Cada consulta nueva hace más lento el refresco de las posiciones.
+- **Las claves viajan en URLs** (Lightning API `?api-key=`, muchos RPC) y los
+  errores de requests/httpx las incluyen. `redact.py` las tapa en los
+  handlers de log y en `end_reason`; un texto de excepción que se guarde o
+  se mande a la web por otro camino tiene que pasar por `redact()`.
 - Lo que no se sabe si entró (timeout, 5xx) es `TradeOutcomeUnknown`, no
   `RuntimeError`: el executor mira la wallet antes de darlo por fallido.
 

@@ -10,6 +10,7 @@ from pepump.jupiter import JUPITER_POOL, PRIORITY_BACKGROUND
 from pepump.log_context import current_mint, set_mint_label
 from pepump.onchain.fallback import OnchainFallback
 from pepump.pumpportal import TradeOutcomeUnknown
+from pepump.redact import redact
 from pepump.strategy import Action, TrailingStrategy
 from pepump.trade_stream import ShutdownRequested, TradeStream
 
@@ -142,7 +143,7 @@ class TrailingTakeProfitBot:
         # hay que revisar a mano.
         self.phase = "starting"
         self.running = False
-        self.end_reason: Optional[str] = None
+        self._end_reason: Optional[str] = None
         self.started_at: Optional[float] = None
         self.finished_at: Optional[float] = None
         # Precio objetivo de la baja de entrada (entry_dip_pct > 0), para
@@ -240,6 +241,16 @@ class TrailingTakeProfitBot:
         self._close_reason = reason
         self._close_mode = "keep"
         self._shutdown_requested.set()
+
+    @property
+    def end_reason(self) -> Optional[str]:
+        return self._end_reason
+
+    @end_reason.setter
+    def end_reason(self, reason: Optional[str]) -> None:
+        # Suele llevar el texto de una excepción, que puede traer una URL
+        # con la API key dentro (ver redact.py); va a la web y a pepump.db.
+        self._end_reason = redact(reason) if reason else reason
 
     @property
     def latest_price(self) -> Optional[float]:
