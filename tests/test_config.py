@@ -10,9 +10,10 @@ from pepump.config import AppConfig, load_config, validate_config, validate_mint
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 CONFIG_SECTIONS = ("general", "trade", "strategy", "pumpportal", "jupiter", "onchain", "web")
-# `mint` es el único campo de AppConfig que NO va en el .toml: siempre
-# llega por la línea de comandos (-m/--mint, required en run.py).
-FIELDS_NOT_IN_TOML = {"mint"}
+# Campos de AppConfig que NO van en el .toml: `mint` llega por la línea de
+# comandos o la web, y `expected_round_trip_pct` de la vista previa de cada
+# compra.
+FIELDS_NOT_IN_TOML = {"mint", "expected_round_trip_pct"}
 
 
 @pytest.fixture(autouse=True)
@@ -61,6 +62,19 @@ api_key = "abc123"
     assert cfg.trailing_pct == 8.0
     assert cfg.initial_stop_pct == 30.0
     assert cfg.api_key == "abc123"
+
+
+def test_load_config_no_acepta_el_coste_de_la_vista_previa(tmp_path):
+    """expected_round_trip_pct es de cada compra (lo pone la vista previa):
+    fijado en el .toml compararía todas las compras con el mismo número."""
+    path = write_toml(tmp_path, """
+[trade]
+expected_round_trip_pct = -1.0
+
+[pumpportal]
+api_key = "abc123"
+""")
+    assert load_config(path).expected_round_trip_pct is None
 
 
 def test_load_config_missing_file_raises_file_not_found():

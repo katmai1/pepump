@@ -384,6 +384,18 @@ def test_abrir_una_posicion():
     assert overrides == {"buy_sol": 0.1, "trailing_pct": 12.0, "pool": "auto"}
 
 
+def test_abrir_con_el_coste_de_la_vista_previa():
+    client, _ = make_client()
+    r = client.post("/api/positions", headers=PAGE,
+                    json={"mint": A, "settings": {}, "expected_round_trip_pct": -0.2})
+    assert r.status_code == 200
+    assert client.manager.opened[1] == {"expected_round_trip_pct": -0.2}
+    for malo in ("-0.2", True):
+        r = client.post("/api/positions", headers=PAGE,
+                        json={"mint": A, "settings": {}, "expected_round_trip_pct": malo})
+        assert r.status_code == 400
+
+
 def test_abrir_eligiendo_real_o_simulada():
     client, _ = make_client()
     r = client.post("/api/positions", headers=PAGE, json={"mint": A, "settings": {"live": True}})

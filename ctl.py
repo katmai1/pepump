@@ -138,6 +138,15 @@ def round_trip_lines(p: dict) -> list:
     return lineas
 
 
+def open_body(p: dict, settings: dict) -> dict:
+    """Petición de abrir, con el coste de entrar y salir de la vista previa
+    `p`: si la orden real por Jupiter sale bastante peor, no se compra."""
+    body = {"mint": p["mint"], "settings": settings}
+    if p.get("round_trip_pct") is not None:
+        body["expected_round_trip_pct"] = p["round_trip_pct"]
+    return body
+
+
 def confirm(question: str, yes: bool) -> bool:
     if yes:
         return True
@@ -188,7 +197,7 @@ def main():
               + (f" · entra con una baja de {cfg['entry_dip_pct']}%" if cfg["entry_dip_pct"] else ""))
         if not confirm(f"¿Comprar{' con SOL REAL' if live else ' (simulado)'}?", args.yes):
             return
-        r = s.post(f"{url}/api/positions", json={"mint": p["mint"], "settings": settings}, timeout=10)
+        r = s.post(f"{url}/api/positions", json=open_body(p, settings), timeout=10)
         if r.status_code != 200:
             fail(r.json().get("detail", str(r.status_code)))
         print(f"Posición #{r.json()['id']} abierta. Comprará en cuanto haya precio.")

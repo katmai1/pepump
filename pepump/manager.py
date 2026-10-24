@@ -127,9 +127,14 @@ class PositionManager:
         self._followers: set = set()
 
     # --- control ------------------------------------------------------------ #
-    def open(self, mint: str, **overrides) -> ManagedPosition:
+    def open(self, mint: str, expected_round_trip_pct: Optional[float] = None, **overrides) -> ManagedPosition:
         """Arranca una posición nueva para `mint` y devuelve enseguida (la
         compra ocurre en segundo plano, cuando el bot consiga precio).
+
+        `expected_round_trip_pct` es el coste de entrar y salir que enseñó la
+        vista previa: si la orden real por Jupiter sale bastante peor, no se
+        compra (ver AppConfig.expected_round_trip_pct). No se guarda: solo
+        sirve para la compra.
 
         Lanza ValueError si el mint no es válido, si ya hay una posición
         activa de ese mint, si se llegó a max_open_positions, si un ajuste
@@ -152,7 +157,8 @@ class PositionManager:
             raise ValueError(f"No se puede ajustar por posición: {sorted(desconocidos)}. "
                              f"Permitidos: {list(OVERRIDABLE_FIELDS)}")
 
-        cfg = dataclasses.replace(self.base_config, mint=mint, **overrides)
+        cfg = dataclasses.replace(self.base_config, mint=mint, expected_round_trip_pct=expected_round_trip_pct,
+                                  **overrides)
         validate_config(cfg)
 
         if self.store is not None:

@@ -324,6 +324,11 @@ def create_app(manager: PositionManager, logs: LogBuffer, *, live: bool,
             else:
                 value = float(value)
             overrides[key] = value
+        # El coste de entrar y salir que enseñó la vista previa (ver
+        # PositionManager.open).
+        expected = body.get("expected_round_trip_pct")
+        if expected is not None and (isinstance(expected, bool) or not isinstance(expected, (int, float))):
+            raise HTTPException(status_code=400, detail="expected_round_trip_pct tiene que ser un número")
         defaults = manager.defaults()["settings"]
         live = overrides.get("live", defaults["live"])
         try:
@@ -331,7 +336,8 @@ def create_app(manager: PositionManager, logs: LogBuffer, *, live: bool,
                 # Saldo fresco antes de una compra REAL (ver check_funds).
                 await manager.check_funds(overrides.get("buy_sol", defaults["buy_sol"]),
                                           overrides.get("priority_fee", defaults["priority_fee"]))
-            managed = manager.open(mint, **overrides)
+            extra = {} if expected is None else {"expected_round_trip_pct": float(expected)}
+            managed = manager.open(mint, **extra, **overrides)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
         modo = "REAL" if managed.config.live else "simulada"

@@ -4,6 +4,7 @@ import os
 import stat
 import tomllib
 from dataclasses import dataclass, field, fields
+from typing import Optional
 
 from solders.pubkey import Pubkey
 
@@ -52,6 +53,11 @@ class AppConfig:
     slippage: float = 15.0
     priority_fee: float = 0.00001
     pool: str = "auto"  # ver POOLS_VALIDOS
+    # No va en el .toml: lo pone PositionManager.open con lo que enseñó la
+    # vista previa (`round_trip_pct`, solo si cotiza por Jupiter). Una compra
+    # REAL por Jupiter no se firma si la orden de verdad sale bastante peor
+    # (ver JupiterClient.execute_trade). None = sin comprobación.
+    expected_round_trip_pct: Optional[float] = None
     # Topes para los REINTENTOS de una venta fallida (ver
     # executor.sell_retry_params): cada fallo sube el slippage y el priority
     # fee, porque cuando salta un stop el precio suele estar cayendo rápido
@@ -347,7 +353,8 @@ def load_config(path: str) -> AppConfig:
     with open(path, "rb") as f:
         raw = tomllib.load(f)
 
-    valid_keys = {f.name for f in fields(AppConfig)}
+    # expected_round_trip_pct es de cada compra, no del .toml.
+    valid_keys = {f.name for f in fields(AppConfig)} - {"expected_round_trip_pct"}
     merged: dict = {}
     for section_name in ("general", "trade", "strategy", "pumpportal", "jupiter", "onchain", "web"):
         section = raw.get(section_name, {})

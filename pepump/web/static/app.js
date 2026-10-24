@@ -763,7 +763,12 @@ async function doSubmitNewPosition() {
   const submit = document.getElementById("open-submit");
   submit.disabled = true;
   try {
-    const res = await api("/api/positions", { method: "POST", body: { mint, settings } });
+    const body = { mint, settings };
+    // Si la orden real por Jupiter sale bastante peor que esto, no se compra.
+    if (p && p.round_trip_pct !== null && p.round_trip_pct !== undefined && p.buy_sol === buySol) {
+      body.expected_round_trip_pct = p.round_trip_pct;
+    }
+    const res = await api("/api/positions", { method: "POST", body });
     document.getElementById("open-dialog").close();
     toast(`Posición #${res.id} abierta. Comprará en cuanto haya precio.`);
   } catch (err) {

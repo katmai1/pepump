@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from pepump.history import append_closed_trade
-from pepump.jupiter import JUPITER_POOL, PRIORITY_TRADE
+from pepump.jupiter import JUPITER_POOL, PRIORITY_TRADE, OrderWorseThanQuote
 from pepump.pumpportal import TradeOutcomeUnknown
 
 logger = logging.getLogger(__name__)
@@ -315,16 +315,25 @@ class TradeExecutor:
                 sol_amount, token_amount, entry_price = simulated_buy(self.cfg, price)
 
         if self.live:
+            pool = pool_override or self.cfg.pool
+            # Por Jupiter, la orden no se firma si sale bastante peor que la
+            # vista previa (ver JupiterClient._check_round_trip).
+            guard = ({"expected_round_trip_pct": self.cfg.expected_round_trip_pct, "reference_price": price}
+                     if pool == JUPITER_POOL else {})
             try:
                 result = await self._execute(
-                    pool_override or self.cfg.pool,
+                    pool,
                     action="buy", mint=mint, amount=sol_amount, denominated_in_sol=True,
                     slippage=self.cfg.slippage, priority_fee=self.cfg.priority_fee,
                     solana_rpc_url=self.cfg.solana_rpc_url,
                     tx_confirm_timeout_seconds=self.cfg.tx_confirm_timeout_seconds,
                     tx_confirm_poll_interval_seconds=self.cfg.tx_confirm_poll_interval_seconds,
+                    **guard,
                 )
                 logger.info(f"[REAL] Compra CONFIRMADA on-chain. Respuesta: {result}")
+            except OrderWorseThanQuote as e:
+                logger.error(f"[REAL] {e}")
+                raise
             except TradeOutcomeUnknown as e:
                 # La orden pudo haber entrado (timeout de la API, tx sin
                 # confirmar a tiempo). Antes se daba por fallida sin más: la

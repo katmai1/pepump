@@ -32,6 +32,7 @@ from pepump.jupiter import (
     PRIORITY_TRADE,
     JupiterClient,
     JupiterError,
+    OrderWorseThanQuote,
     _PriorityLimiter,
     build_jupiter_client,
     load_keypair,
@@ -303,6 +304,88 @@ def test_compra_por_jupiter_firma_ejecuta_y_lee_el_fill(monkeypatch):
     assert result["actual_sol_delta"] == -0.0503 and result["actual_token_delta"] == 1234.5
 
 
+# Caso real CARD...xYjp: la vista previa (cotización sin taker, todo por un
+# orderbook de Manifest) daba −0.2%; la orden con taker salió en un 76% por
+# un CLMM un 7.6% más caro: 15.0 tokens en vez de 15.8 por 0.05 SOL.
+CARDS_ORDER = {"outAmount": "15000019", "inAmount": "50000000", "router": "metis",
+               "routePlan": [{"percent": 76, "swapInfo": {"label": "Raydium CLMM", "ammKey": "CcNQgWvQzRZc"}},
+                             {"percent": 24, "swapInfo": {"label": "Manifest", "ammKey": "Enc6rB84ZwGx"}}]}
+CARDS_PRICE = 0.0031489  # cotización de venta de los tokens justo antes de comprar
+
+
+def _fake_order(monkeypatch, kp, order):
+    seen = {}
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        seen["order"] = params
+        return FakeResponse(body={"transaction": _unsigned_tx_b64(kp), "requestId": "req-1", **order})
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        seen["execute"] = json
+        return FakeResponse(body={"status": "Success", "code": 0, "signature": "SIG"})
+
+    async def fake_fill(signature, rpc_url, mint, wallet=None):
+        return None
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    monkeypatch.setattr(requests, "post", fake_post)
+    monkeypatch.setattr(jupiter_module, "fetch_actual_fill", fake_fill)
+    return seen
+
+
+def test_compra_que_sale_peor_que_la_vista_previa_no_se_firma(monkeypatch, caplog):
+    kp = Keypair()
+    seen = _fake_order(monkeypatch, kp, CARDS_ORDER)
+
+    with caplog.at_level("INFO"), pytest.raises(OrderWorseThanQuote) as info:
+        asyncio.run(_client(kp).execute_trade(
+            action="buy", mint=MINT, amount=0.05, slippage=15, priority_fee=0.0, solana_rpc_url="http://rpc",
+            expected_round_trip_pct=-0.2, reference_price=CARDS_PRICE))
+
+    assert "execute" not in seen
+    assert "-5.53%" in str(info.value) and "-0.20%" in str(info.value)
+    assert "76% Raydium CLMM CcNQgW" in str(info.value)
+    # La orden queda en el log aunque no se firme.
+    assert "router metis" in caplog.text and "15000019" in caplog.text
+
+
+def test_compra_dentro_del_margen_de_la_vista_previa_se_firma(monkeypatch):
+    kp = Keypair()
+    seen = _fake_order(monkeypatch, kp, CARDS_ORDER)
+
+    asyncio.run(_client(kp).execute_trade(
+        action="buy", mint=MINT, amount=0.05, slippage=15, priority_fee=0.0, solana_rpc_url="http://rpc",
+        expected_round_trip_pct=-4.0, reference_price=CARDS_PRICE))
+
+    assert seen["execute"]["requestId"] == "req-1"
+
+
+def test_comprobacion_de_la_orden_descuenta_el_impuesto_de_transferencia(monkeypatch):
+    """El outAmount de la orden no descuenta el impuesto de Token-2022: sin
+    descontarlo, 1000 tokens a 0.00005 por 0.05 SOL darían 0%, dentro del
+    margen contra el +0.5% de la vista previa; con el 3% quedan 970 tokens,
+    −3%, 3.5 puntos por debajo."""
+    kp = Keypair()
+    seen = _fake_order(monkeypatch, kp, {"outAmount": "1000000000"})  # 1000 tokens (6 decimales)
+
+    with pytest.raises(OrderWorseThanQuote):
+        asyncio.run(_client(kp, transfer_fee=(300, 10**18)).execute_trade(
+            action="buy", mint=MINT, amount=0.05, slippage=15, priority_fee=0.0, solana_rpc_url="http://rpc",
+            expected_round_trip_pct=0.5, reference_price=0.00005))
+    assert "execute" not in seen
+
+
+def test_compra_sin_vista_previa_no_se_comprueba(monkeypatch):
+    kp = Keypair()
+    seen = _fake_order(monkeypatch, kp, CARDS_ORDER)
+
+    asyncio.run(_client(kp).execute_trade(
+        action="buy", mint=MINT, amount=0.05, slippage=15, priority_fee=0.0, solana_rpc_url="http://rpc",
+        reference_price=CARDS_PRICE))
+
+    assert "execute" in seen
+
+
 def test_venta_por_jupiter_vende_todo_el_saldo(monkeypatch):
     kp = Keypair()
     seen = _fake_trade(monkeypatch, kp)
@@ -425,6 +508,29 @@ def test_executor_real_manda_la_orden_por_jupiter(tmp_path):
     assert [t["action"] for t in jupiter.trades] == ["buy", "sell"]
     assert pos.entry_is_real_fill and pos.token_amount == 1200.0
     assert pos.realized_pnl_sol == pytest.approx(0.06 - 0.0503)
+
+
+def test_executor_pasa_a_jupiter_el_coste_de_la_vista_previa(tmp_path):
+    jupiter = FakeJupiter()
+    cfg = make_config(live=True, trade_history_csv=str(tmp_path / "h.csv"), expected_round_trip_pct=-0.2)
+    executor = TradeExecutor(client=LightningQueNoSeUsa(), live=True, config=cfg, jupiter=jupiter)
+
+    asyncio.run(executor.buy(MINT, 0.00004, pool_override=JUPITER_POOL))
+
+    assert jupiter.trades[0]["expected_round_trip_pct"] == -0.2
+    assert jupiter.trades[0]["reference_price"] == 0.00004
+
+
+def test_executor_compra_rechazada_por_jupiter_no_abre_posicion(tmp_path):
+    class JupiterQueRechaza(FakeJupiter):
+        async def execute_trade(self, **kwargs):
+            raise OrderWorseThanQuote("la orden real de Jupiter sale peor que la vista previa")
+
+    cfg = make_config(live=True, trade_history_csv=str(tmp_path / "h.csv"), expected_round_trip_pct=-0.2)
+    executor = TradeExecutor(client=LightningQueNoSeUsa(), live=True, config=cfg, jupiter=JupiterQueRechaza())
+
+    with pytest.raises(OrderWorseThanQuote):
+        asyncio.run(executor.buy(MINT, 0.00004, pool_override=JUPITER_POOL))
 
 
 def test_executor_simulado_compra_con_la_cotizacion_de_jupiter():

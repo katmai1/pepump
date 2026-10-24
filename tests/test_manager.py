@@ -96,6 +96,17 @@ async def test_mint_ocupado_si_termino_con_la_posicion_abierta():
     await manager.aclose()
 
 
+async def test_open_guarda_el_coste_de_la_vista_previa_para_la_compra():
+    manager, conns, _ = make_manager()
+    managed = manager.open(A, expected_round_trip_pct=-0.2)
+    assert managed.config.expected_round_trip_pct == -0.2
+    assert manager.base_config.expected_round_trip_pct is None
+    assert "expected_round_trip_pct" not in managed.bot.snapshot()["settings"]
+
+    manager.close_all("fin")
+    await asyncio.wait_for(manager.wait_all(), 5)
+
+
 async def test_ajustes_por_posicion():
     manager, conns, _ = make_manager()
     managed = manager.open(A, buy_sol=0.2, trailing_pct=7.5)

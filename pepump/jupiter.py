@@ -61,6 +61,11 @@ _EXT_TRANSFER_FEE_CONFIG = 1
 # Códigos de /execute con los que la tx seguro que NO entró: Jupiter dejó
 # de intentarlo (blockhash vencido) o ni siquiera la aceptó.
 _EXECUTE_NOT_LANDED = {-1, -2, -3, -1000, -1002, -1003, -1004, -1005, -2000, -2002, -2003, -2004}
+# Puntos de % que el coste de entrar y salir de la orden real puede quedar
+# por debajo del que enseñó la vista previa antes de no firmarla (ver
+# execute_trade). La cotización sin taker y la orden con taker no siempre
+# salen por la misma ruta.
+ROUND_TRIP_MARGIN_PCT = 3.0
 
 
 class JupiterError(RuntimeError):
@@ -70,6 +75,11 @@ class JupiterError(RuntimeError):
 
 class NoRouteError(JupiterError):
     """Jupiter contestó bien, pero no hay ruta para esa cantidad."""
+
+
+class OrderWorseThanQuote(JupiterError):
+    """La orden de compra que armó Jupiter sale bastante peor que la vista
+    previa: no se firmó ni se mandó."""
 
 
 def load_keypair(secret: str) -> Keypair:
@@ -221,11 +231,7 @@ class JupiterClient:
         llegaron 68.8k): se descuenta aquí."""
         decimals, fee = await self.mint_info(mint, rpc_url)
         data = await self.quote(WSOL_MINT, mint, round(sol * _LAMPORTS_PER_SOL), priority)
-        raw = _as_int(data["outAmount"])
-        if fee:
-            bps, maximum = fee
-            raw -= min(-(-raw * bps // 10_000), maximum)
-        return raw / 10 ** decimals
+        return _minus_transfer_fee(_as_int(data["outAmount"]), fee) / 10 ** decimals
 
     async def sell_price(self, mint: str, token_amount: float, rpc_url: str,
                          priority: int = PRIORITY_PRICE) -> float:
@@ -290,12 +296,16 @@ class JupiterClient:
         return base64.b64encode(bytes(VersionedTransaction.populate(message, signatures))).decode()
 
     async def execute_trade(self, action: str, mint: str, amount, slippage: float, priority_fee: float,
-                            solana_rpc_url: str, tx_confirm_timeout_seconds: float = 30.0, **_ignored) -> dict:
+                            solana_rpc_url: str, tx_confirm_timeout_seconds: float = 30.0,
+                            expected_round_trip_pct: Optional[float] = None,
+                            reference_price: Optional[float] = None, **_ignored) -> dict:
         """Compra (`amount` en SOL) o vende TODO el saldo de `mint` de la
         wallet por Jupiter. Misma forma de respuesta y mismos errores que
         PumpPortalClient.execute_lightning_trade, para que el executor las
         trate igual:
-          - RuntimeError: seguro que no se ejecutó nada.
+          - RuntimeError: seguro que no se ejecutó nada (OrderWorseThanQuote
+            si la compra no se firmó por salir peor que la vista previa, ver
+            _check_round_trip).
           - TradeOutcomeUnknown: puede haber entrado; hay que mirar la wallet.
           - dict con "signature" y, si se pudo leer la tx, "actual_sol_delta"
             / "actual_token_delta" (fill real, comisiones incluidas)."""
@@ -331,6 +341,14 @@ class JupiterClient:
             motivo = order.get("errorMessage") or order.get("error") or "sin transacción"
             raise RuntimeError(f"Jupiter no pudo armar la orden de {action}: {motivo} "
                                f"(código {order.get('errorCode')}, router {order.get('router')})")
+        # Lo que prometía la orden, para poder compararlo luego con el fill
+        # (caso real CARD...xYjp: la vista previa iba por un orderbook de
+        # Manifest y la orden salió en un 76% por un CLMM un 7.6% más caro).
+        logger.info(f"[Jupiter] Orden de {action}: {order.get('inAmount')} -> {order.get('outAmount')} "
+                    f"(unidades crudas), router {order.get('router')}, ruta: {_route_summary(order)}")
+        if action == "buy" and expected_round_trip_pct is not None and reference_price:
+            await self._check_round_trip(order, mint, float(amount), reference_price, expected_round_trip_pct,
+                                         solana_rpc_url)
         signed = self._sign(tx_b64)
 
         # /execute tiene su propio cupo (no pasa por el limitador) y espera
@@ -385,6 +403,46 @@ class JupiterClient:
             logger.warning(f"[Jupiter] No se pudieron leer los datos reales de fill de {signature}; "
                            f"se usa el estimado.")
         return result
+
+    async def _check_round_trip(self, order: dict, mint: str, sol: float, reference_price: float,
+                                expected_pct: float, rpc_url: str) -> None:
+        """No deja firmar una compra cuyo coste de entrar y salir (los tokens
+        que promete la orden, vendidos a `reference_price`, contra los `sol`
+        que cuesta) quede más de ROUND_TRIP_MARGIN_PCT puntos por debajo del
+        que enseñó la vista previa. El slippage no protege de esto: solo
+        limita lo que se mueva el precio DESPUÉS de armar la orden. Caso real
+        CARD...xYjp: la vista previa daba −0.2% (cotización sin taker, todo
+        por un orderbook de Manifest), la orden con taker salió por otra ruta
+        y la posición arrancó en −5.5%."""
+        decimals, fee = await self.mint_info(mint, rpc_url)
+        tokens = _minus_transfer_fee(_as_int(order.get("outAmount")), fee) / 10 ** decimals
+        round_trip = (tokens * reference_price / sol - 1.0) * 100.0
+        if round_trip < expected_pct - ROUND_TRIP_MARGIN_PCT:
+            raise OrderWorseThanQuote(
+                f"la orden real de Jupiter sale peor que la vista previa: comprar y vender ya daría "
+                f"{round_trip:+.2f}% y la vista previa decía {expected_pct:+.2f}% (se admiten "
+                f"{ROUND_TRIP_MARGIN_PCT:g} puntos menos). No se ha comprado nada; ruta de la orden: "
+                f"{_route_summary(order)}")
+
+
+def _route_summary(order: dict) -> str:
+    """Ruta de una orden de /order en una línea: "76% Raydium CLMM CcNQgW…,
+    24% Manifest Enc6rB…" (los pasos de una ruta en serie van al 100%)."""
+    partes = []
+    for step in order.get("routePlan") or []:
+        info = step.get("swapInfo") or {}
+        amm = str(info.get("ammKey") or "")
+        partes.append(f"{step.get('percent')}% {info.get('label') or '?'} {amm[:6]}…")
+    return ", ".join(partes) or "sin detalle"
+
+
+def _minus_transfer_fee(raw: int, fee: Optional[tuple]) -> int:
+    """`raw` unidades menos el impuesto de transferencia de Token-2022 (ver
+    _transfer_fee), que el outAmount de Jupiter no descuenta."""
+    if not fee:
+        return raw
+    bps, maximum = fee
+    return raw - min(-(-raw * bps // 10_000), maximum)
 
 
 def build_jupiter_client(config) -> Optional[JupiterClient]:

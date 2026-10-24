@@ -16,3 +16,9 @@ def test_coste_pequeno_se_ensena_sin_aviso():
 
 def test_sin_cotizacion_de_jupiter_no_se_ensena_nada():
     assert ctl.round_trip_lines({"round_trip_pct": None}) == []
+
+
+def test_abrir_manda_el_coste_de_la_vista_previa():
+    body = ctl.open_body({"mint": "M", "round_trip_pct": -0.2}, {"live": True})
+    assert body == {"mint": "M", "settings": {"live": True}, "expected_round_trip_pct": -0.2}
+    assert "expected_round_trip_pct" not in ctl.open_body({"mint": "M", "round_trip_pct": None}, {})
