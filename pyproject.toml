@@ -1,0 +1,43 @@
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+# E/W: pycodestyle, F: pyflakes, I: orden de imports, B: bugbear,
+# UP: sintaxis moderna, RUF: reglas propias de ruff (tareas de asyncio
+# sin referencia, Optional implícito, etc.), ASYNC: llamadas bloqueantes
+# dentro de corrutinas.
+select = ["E", "W", "F", "I", "B", "UP", "RUF", "ASYNC"]
+ignore = [
+    # Se mantiene Optional[...] / List[...]: es el estilo de todo el código.
+    "UP006", "UP007", "UP035", "UP045",
+    # Los logs y mensajes van en español: tildes y comillas tipográficas
+    # en strings y comentarios son a propósito.
+    "RUF001", "RUF002", "RUF003",
+    # `timeout` como parámetro es a propósito: se compite contra el
+    # cierre del bot, no solo contra el reloj (ver bot._next_trade_event).
+    "ASYNC109",
+    # Esperar un contador con sleep en un bucle corto es más simple que un
+    # Event cuando el valor no lo controla quien espera.
+    "ASYNC110",
+]
+
+[tool.ruff.lint.flake8-bugbear]
+# Idioma de FastAPI: Body(...)/Depends(...) en los argumentos por defecto.
+extend-immutable-calls = ["fastapi.Body", "fastapi.Depends", "fastapi.Query"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests: desempaquetan tuplas para comprobar solo una parte, lanzan tareas
+# que terminan antes que el propio test y leen archivos temporales sin
+# preocuparse de bloquear el loop.
+"tests/*" = ["RUF059", "RUF006", "ASYNC230", "ASYNC240", "UP031"]
+# Tablas de errores copiadas tal cual de los IDL de los programas.
+"pepump/onchain/errors.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["pepump", "run.py", "ctl.py"]
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
