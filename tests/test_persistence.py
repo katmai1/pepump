@@ -271,6 +271,17 @@ async def test_retomar_con_mas_tokens_en_la_wallet_avisa(store, caplog):
     assert store.get(pos_id)["status"] == "open"
 
 
+async def test_al_retomar_el_nombre_guardado_sale_limpio(store):
+    pos_id = _abierta(store, A, live=False, token_name="Pepe\x1b[2J", token_symbol="PE\nPE")
+    manager, _, _ = make_manager(store)
+    (managed,) = await manager.recover()
+    assert (managed.bot.token_name, managed.bot.token_symbol) == ("Pepe[2J", "PEPE")
+    manager.stop_all("fin")
+    await asyncio.wait_for(manager.wait_all(), 5)
+    await manager.aclose()
+    assert pos_id == managed.id
+
+
 async def test_ids_persistentes_e_historial(store):
     manager, conns, _ = make_manager(store)
     primera = manager.open(A)

@@ -10,6 +10,22 @@ from pepump.onchain.rpc import rpc_value
 
 logger = logging.getLogger(__name__)
 
+# Más que esto no aporta nada en un panel y descuadra las columnas.
+_MAX_LABEL_LEN = 64
+
+
+def clean_label(text: Optional[str]) -> Optional[str]:
+    """Nombre/símbolo de un token sin caracteres de control. Los pone quien
+    crea el token: un símbolo con secuencias de escape ANSI o saltos de
+    línea salía tal cual en la terminal (rompía el panel o manipulaba la
+    terminal). str.isprintable() deja fuera también los de formato, como
+    los que invierten el sentido del texto. El relleno \\0 de Metaplex se va
+    con ellos."""
+    if text is None:
+        return None
+    limpio = "".join(c for c in text if c.isprintable()).strip()
+    return limpio[:_MAX_LABEL_LEN]
+
 
 class TokenMetadataOnChainClient:
     """Nombre y símbolo del token, leídos on-chain. Solo se usan para
@@ -51,7 +67,7 @@ class TokenMetadataOnChainClient:
         start = offset + 4
         if start + n > len(data):
             raise ValueError("string fuera de la cuenta")
-        return data[start:start + n].decode("utf-8", errors="replace").rstrip("\x00").strip(), start + n
+        return clean_label(data[start:start + n].decode("utf-8", errors="replace")) or "", start + n
 
     @classmethod
     def _parse_metaplex(cls, data: bytes) -> Optional[tuple[str, str]]:

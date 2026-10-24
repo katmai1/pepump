@@ -31,6 +31,7 @@ from pepump.executor import Position, TradeExecutor
 from pepump.feed import SharedTradeFeed
 from pepump.jupiter import PRIORITY_BACKGROUND
 from pepump.log_context import enable_tags
+from pepump.onchain.metadata import clean_label
 from pepump.onchain.pump_curve import PumpCurveOnChainClient
 from pepump.onchain.pumpswap import PumpSwapOnChainClient
 from pepump.store import PositionStore
@@ -401,7 +402,10 @@ class PositionManager:
                 position.highest_price = row["highest_price"]
             managed = self._start(pos_id, mint, cfg, resume_position=position,
                                   resume_onchain_source=row["onchain_source"])
-            managed.bot.token_name, managed.bot.token_symbol = row["token_name"], row["token_symbol"]
+            # Limpios también aquí: una fila guardada antes de clean_label
+            # puede traerlos con caracteres de control.
+            managed.bot.token_name = clean_label(row["token_name"])
+            managed.bot.token_symbol = clean_label(row["token_symbol"])
             retomadas.append(managed)
             logger.info(f"♻️  Posición #{pos_id} ({mint}) retomada.")
         return retomadas

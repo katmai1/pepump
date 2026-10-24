@@ -24,3 +24,17 @@ def test_token2022_salta_otras_extensiones():
 def test_token2022_sin_extension_de_metadata():
     data = b"\x00" * 165 + b"\x01" + (1).to_bytes(2, "little") + (8).to_bytes(2, "little") + b"\x00" * 8
     assert C._parse_token2022(data) is None
+
+
+def test_nombre_con_secuencias_de_escape_sale_limpio():
+    """Los pone quien crea el token: un símbolo con ANSI o saltos de línea
+    salía tal cual en la terminal (rompía el panel o la manipulaba)."""
+    nombre = "Pepe\x1b[2J\x1b]0;hola\x07 Coin\n\r"
+    simbolo = "PE\u202ePE"  # invierte el sentido del texto
+    data = b"\x04" + b"\x01" * 64 + _borsh(nombre) + _borsh(simbolo) + _borsh("https://x")
+    assert C._parse_metaplex(data) == ("Pepe[2J]0;hola Coin", "PEPE")
+
+
+def test_nombre_larguisimo_se_recorta():
+    data = b"\x04" + b"\x01" * 64 + _borsh("x" * 500) + _borsh("S") + _borsh("https://x")
+    assert len(C._parse_metaplex(data)[0]) == 64
