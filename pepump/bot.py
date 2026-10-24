@@ -857,6 +857,7 @@ class TrailingTakeProfitBot:
         last_log = time.monotonic()
 
         if self.onchain.source is not None:
+            await self._leave_feed()
             while True:
                 if self._shutdown_requested.is_set():
                     logger.info("Cancelado por el usuario mientras se esperaba la baja de entrada.")
@@ -1031,6 +1032,7 @@ class TrailingTakeProfitBot:
         el bug que tenía _consume_trade_stream-, así que cada iteración
         atrapa sus propios errores y sigue reintentando en el próximo
         ciclo."""
+        await self._leave_feed()
         while self.position is not None and not self.position.closed:
             try:
                 price = await self.onchain.fetch_price()
@@ -1043,6 +1045,16 @@ class TrailingTakeProfitBot:
                 logger.warning(f"[Polling on-chain] error puntual, reintento en el "
                                f"próximo ciclo: {e}")
             await asyncio.sleep(self.cfg.onchain_poll_interval_seconds)
+
+    async def _leave_feed(self) -> None:
+        """El precio sale ya de on-chain hasta el final: baja de
+        subscribeTokenTrade para este mint. Antes la suscripción seguía
+        hasta que terminaba la posición: nadie leía su cola (que no tiene
+        límite) y cada evento que llegara se pagaba igual (el stream es
+        medido)."""
+        if self._stream.ws is not None and not self._stream.closed:
+            logger.debug("[Feed en vivo] el precio sale de on-chain: me doy de baja del feed de trades.")
+            await self._stream.close()
 
     async def _consume_trade_stream(self) -> None:
         """Sigue escuchando trades en tiempo real por la conexión

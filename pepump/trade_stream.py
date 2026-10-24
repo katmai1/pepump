@@ -33,12 +33,15 @@ class TradeStream:
         # evento en la próxima llamada en vez de cortar el generador async
         # subyacente.
         self._pending: Optional[asyncio.Task] = None
+        # True tras close() (hasta el próximo connect()).
+        self.closed = False
 
     async def connect(self) -> None:
         """Conecta y deja el subscribe ya mandado (ver
         PumpPortalClient.connect_trade_stream). Propaga cualquier error."""
         self.ws = await self.client.connect_trade_stream(self.mint)
         self.events = self.client.iter_trade_events(self.ws)
+        self.closed = False
 
     async def reconnect(self) -> None:
         """Cierra la conexión vieja (sin quejarse si ya estaba rota) y abre
@@ -54,6 +57,11 @@ class TradeStream:
         self._drop_pending()
 
     async def close(self) -> None:
+        # Se puede cerrar antes de terminar el bot (ver bot._leave_feed):
+        # el close() del final ya no tiene nada que hacer.
+        if self.closed:
+            return
+        self.closed = True
         self._drop_pending()
         if self.ws is not None:
             # Un fallo al cerrar (socket ya roto del otro lado) no puede

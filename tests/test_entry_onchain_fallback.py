@@ -413,3 +413,35 @@ def test_mint_sin_bonding_curve_ni_pool_aborta_sin_esperar_live_feed_timeout(mon
     assert elapsed < 1.0  # mucho antes de los 5s de live_feed_timeout_seconds
     assert fake_onchain.calls == 1
     assert fake_curve.calls == 1
+
+
+def test_con_el_precio_on_chain_se_da_de_baja_del_feed(monkeypatch):
+    """Antes la suscripción a subscribeTokenTrade seguía abierta toda la
+    posición aunque el precio saliera de on-chain: nadie leía su cola (sin
+    límite) y cada evento que llegara se pagaba igual."""
+    from pepump.executor import Position
+
+    class PumpSwapFijo:
+        def __init__(self, rpc_url):
+            pass
+
+        async def fetch_price_for_migrated_mint(self, mint):
+            return 1.0
+
+    monkeypatch.setattr(fallback_module, "PumpSwapOnChainClient", PumpSwapFijo)
+    client = FakeTradeStreamClient()
+    pos = Position(mint="M", entry_price=1.0, sol_amount=0.05, token_amount=0.05)
+    bot = TrailingTakeProfitBot(client=client, executor=SpyExecutor(),
+                                config=make_config(onchain_poll_interval_seconds=0.01),
+                                resume_position=pos, resume_onchain_source="pumpswap")
+
+    async def _escenario():
+        task = asyncio.create_task(bot.run())
+        while not (client.sockets and client.sockets[0].closed):
+            await asyncio.sleep(0.005)
+        assert not pos.closed and bot.running  # la posición sigue vigilada
+        bot.stop("fin")
+        await task
+
+    asyncio.run(asyncio.wait_for(_escenario(), timeout=5))
+    assert client.sockets[0].close_calls == 1  # el close() del final no repite
