@@ -370,6 +370,16 @@ def test_max_open_positions_tiene_que_ser_entero_positivo(valor):
         validate_config(AppConfig(max_open_positions=valor))
 
 
+@pytest.mark.parametrize("campo", ["buy_sol", "slippage", "activation_pct", "trailing_pct",
+                                   "initial_stop_pct", "entry_dip_pct", "priority_fee"])
+@pytest.mark.parametrize("valor", [float("nan"), float("inf")])
+def test_config_rechaza_valores_no_finitos(campo, valor):
+    """NaN pasaba todas las comparaciones: `ctl.py open ... --trailing nan`
+    abría una posición que no vendía nunca."""
+    with pytest.raises(ValueError, match=campo):
+        validate_config(dataclasses.replace(AppConfig(), **{campo: valor}))
+
+
 def test_limites_por_defecto():
     cfg = AppConfig()
     assert cfg.max_buy_sol == 0.5 and cfg.max_open_positions == 10

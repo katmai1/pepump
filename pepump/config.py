@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import stat
 import tomllib
@@ -228,14 +229,22 @@ def validate_config(config: AppConfig) -> None:
     el bot arranca de todos modos."""
     errores = []
 
+    def no_finito(valor) -> bool:
+        # NaN pasa cualquier comparación (todas dan False) e inf no es un
+        # importe ni un % con sentido. Caso: `ctl.py open ... --trailing nan`
+        # (float() y json.loads aceptan "nan") abría una posición cuyo
+        # trailing y stop nunca se cumplían: no vendía nunca.
+        return isinstance(valor, float) and not math.isfinite(valor)
+
     def positivo(nombre, valor, incluir_cero=False):
-        if valor is None or (valor < 0 if incluir_cero else valor <= 0):
+        if valor is None or no_finito(valor) or (valor < 0 if incluir_cero else valor <= 0):
             limite = ">= 0" if incluir_cero else "> 0"
             errores.append(f"{nombre} tiene que ser {limite} (está en {valor})")
 
     def porcentaje_abierto(nombre, valor, minimo_incluido=False):
         """Porcentaje en (0, 100) -o [0, 100) si minimo_incluido."""
-        if valor is None or valor < 0 or valor >= 100 or (valor == 0 and not minimo_incluido):
+        if (valor is None or no_finito(valor) or valor < 0 or valor >= 100
+                or (valor == 0 and not minimo_incluido)):
             rango = "[0, 100)" if minimo_incluido else "(0, 100)"
             errores.append(f"{nombre} tiene que estar en el rango {rango} (está en {valor})")
 
