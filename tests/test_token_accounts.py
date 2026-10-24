@@ -347,6 +347,22 @@ def test_saldo_que_vale_algo_o_que_no_se_puede_valorar_no_se_toca(rpc, closer_fa
     assert fake.instrucciones == [1]
 
 
+def test_no_se_quema_ni_se_cierra_una_intermedia_con_posicion_activa(rpc):
+    """Un token recién lanzado que Jupiter aún no cotiza da "sin ruta", que
+    cuenta como resto sin valor: si era a la vez intermedio de esta venta y
+    una posición abierta, se quemaba entero."""
+    otro = str(Pubkey.new_unique())
+    token = _acc()
+    fake = rpc([token, _acc(mint=otro, amount="5000000000", lamports=2_039_280)])
+    closer = _closer_con_valor(None)
+    closer.protected_mints = lambda: {MINT, otro}
+
+    _, cerradas, _, _ = asyncio.run(closer.close_after_sale(MINT, [otro]))
+
+    assert cerradas == 1  # solo la del token vendido
+    assert fake.sent == [{token.pubkey}] and fake.instrucciones == [1]
+
+
 def test_no_se_quema_nada_del_token_vendido_ni_en_el_barrido(rpc):
     """El resto se quema solo en intermedias de la ruta de la operación:
     ni en el token vendido (si tiene saldo, la venta aún no se ve) ni en el

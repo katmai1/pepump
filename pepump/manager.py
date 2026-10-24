@@ -23,7 +23,7 @@ import functools
 import logging
 import time
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Union
+from typing import Callable, Dict, List, Optional, Set, Union
 
 from pepump.bot import TrailingTakeProfitBot
 from pepump.config import AppConfig, validate_config, validate_mint
@@ -474,6 +474,9 @@ class PositionManager:
 
     def positions(self) -> List[ManagedPosition]:
         return list(self._positions.values())
+
+    def active_mints(self) -> Set[str]:
+        return {m.mint for m in self._positions.values() if m.active}
 
     def active_count(self) -> int:
         return sum(1 for m in self._positions.values() if m.active)

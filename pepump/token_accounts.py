@@ -12,7 +12,7 @@ el rent vuelve a la propia wallet.
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Optional, Set
 
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.commitment import Confirmed
@@ -65,6 +65,11 @@ class TokenAccountCloser:
         # async (mint, amount_crudo) -> SOL que vale, o None si no hay ruta
         # (no vale nada). Lo pone run.py con Jupiter; sin él no se quema nada.
         self.dust_valuer = dust_valuer
+        # () -> mints con una posición activa (lo pone run.py con el gestor).
+        # Como intermedios de la ruta de OTRA operación no se tocan: un
+        # token recién lanzado que Jupiter aún no cotiza ("sin ruta") pasaba
+        # por resto sin valor y se quemaba entero, posición incluida.
+        self.protected_mints: Optional[Callable[[], Set[str]]] = None
 
     async def find_empty(self, mint: Optional[str] = None) -> list[EmptyTokenAccount]:
         """Cuentas de token de la wallet con saldo 0 (de `mint`, o todas) que
@@ -127,7 +132,8 @@ class TokenAccountCloser:
         True si la cuenta de `mint` todavía tiene saldo para el nodo (aún no
         ve la venta), y entonces conviene reintentar."""
         vacias, con_saldo = await self._scan(mint)
-        for otro in sorted(set(route_mints) - {mint}):
+        protegidos = self.protected_mints() if self.protected_mints is not None else set()
+        for otro in sorted(set(route_mints) - {mint} - protegidos):
             otras_vacias, otras_con_saldo = await self._scan(otro)
             vacias.extend(otras_vacias)
             # La ruta puede dejar un resto (caso real: 0.000167 USDC) que

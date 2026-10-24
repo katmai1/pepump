@@ -202,6 +202,8 @@ if __name__ == "__main__":
         manager = PositionManager(base_config=config, client=client, store=store,
                                   metadata_client=TokenMetadataOnChainClient(config.solana_rpc_url),
                                   jupiter=jupiter, closer=closer)
+        if closer is not None:
+            closer.protected_mints = manager.active_mints
         if panel is not None:
             multi = MultiPositionPanel(panel, manager.snapshot, live=config.live)
             if args.sell_on_exit:

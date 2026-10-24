@@ -249,6 +249,16 @@ async def test_compra_sin_resultado_conocido_queda_para_revisar(store, exc, espe
     await manager.aclose()
 
 
+async def test_active_mints_son_los_de_posiciones_activas(store):
+    manager, conns, _ = make_manager(store)
+    managed = manager.open(A)
+    assert manager.active_mints() == {A}
+    manager.stop_all("fin")
+    await asyncio.wait_for(managed.task, 5)
+    assert manager.active_mints() == set()
+    await manager.aclose()
+
+
 async def test_ids_persistentes_e_historial(store):
     manager, conns, _ = make_manager(store)
     primera = manager.open(A)
