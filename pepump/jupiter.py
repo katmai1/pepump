@@ -353,7 +353,13 @@ class JupiterClient:
         if resp.status_code != 200:
             raise RuntimeError(f"Jupiter rechazó la orden de {action} ({resp.status_code}): {resp.text[:300]}")
 
-        data = resp.json()
+        try:
+            data = resp.json()
+        except ValueError as e:
+            raise TradeOutcomeUnknown(f"Jupiter contestó 200 a la orden de {action} con una respuesta "
+                                      f"ilegible; no se sabe si la tx entró") from e
+        if not isinstance(data, dict):
+            raise TradeOutcomeUnknown(f"Respuesta inesperada de Jupiter a la orden de {action}: {data!r}")
         signature = data.get("signature")
         if data.get("status") != "Success":
             code = data.get("code")

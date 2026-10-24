@@ -351,6 +351,22 @@ def test_execute_fallido(monkeypatch, body, exc):
         assert not isinstance(info.value, TradeOutcomeUnknown)
 
 
+def test_execute_con_200_ilegible_es_resultado_desconocido(monkeypatch):
+    """Un 200 de /execute que no se puede leer no dice que la tx no entrara:
+    antes salía un ValueError que el executor tomaba como compra fallida."""
+    kp = Keypair()
+    _fake_trade(monkeypatch, kp)
+
+    class Ilegible(FakeResponse):
+        def json(self):
+            raise ValueError("Expecting value")
+
+    monkeypatch.setattr(requests, "post", lambda *a, **k: Ilegible(body="<html>"))
+    with pytest.raises(TradeOutcomeUnknown):
+        asyncio.run(_client(kp).execute_trade(action="buy", mint=MINT, amount=0.05, slippage=15,
+                                              priority_fee=0.0, solana_rpc_url="http://rpc"))
+
+
 def test_execute_sin_respuesta_es_resultado_desconocido(monkeypatch):
     kp = Keypair()
     _fake_trade(monkeypatch, kp, execute_exc=requests.exceptions.ReadTimeout("timeout"))

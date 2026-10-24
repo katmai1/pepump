@@ -251,7 +251,14 @@ class PumpPortalClient:
         if resp.status_code != 200:
             raise RuntimeError(f"Lightning API devolvió {resp.status_code}: {resp.text}")
 
-        data = resp.json()
+        try:
+            data = resp.json()
+        except ValueError as e:
+            # 200 con un cuerpo que no es JSON: no se sabe si firmó y envió.
+            raise TradeOutcomeUnknown(
+                f"La Lightning API contestó 200 a la orden de {action} con una respuesta ilegible "
+                f"({resp.text[:200]!r}); no se sabe si la tx se envió"
+            ) from e
         signature = data.get("signature") if isinstance(data, dict) else None
         if not signature:
             raise RuntimeError(f"PumpPortal rechazó la orden de {action}: {data}")
@@ -328,11 +335,23 @@ class PumpPortalClient:
         RuntimeError en cualquier otro caso."""
         sig = Signature.from_string(signature)
         deadline = time.monotonic() + timeout_seconds
+        ultimo_error: Optional[Exception] = None
         async with AsyncClient(rpc_url) as client:
             while True:
-                resp = await client.get_signature_statuses([sig], search_transaction_history=True)
-                value = resp.value
-                info = value[0] if value else None
+                # Un fallo del RPC (timeout, 429) no dice nada de la tx, que ya
+                # está enviada: se sigue mirando hasta el plazo. Antes la
+                # excepción subía tal cual y el executor la tomaba como "seguro
+                # que no entró": una compra que sí entraba quedaba sin posición
+                # (tokens sin vigilar) y una venta que sí entraba se reintentaba
+                # sin fin contra una wallet ya vacía.
+                try:
+                    resp = await client.get_signature_statuses([sig], search_transaction_history=True)
+                except Exception as e:
+                    logger.debug(f"[Confirmación on-chain] falló la consulta del estado de {signature}: {e}")
+                    ultimo_error, info = e, None
+                else:
+                    value = resp.value
+                    info = value[0] if value else None
                 if info is not None:
                     if info.err is not None:
                         short_reason, debug_detail = await describe_onchain_error(signature, rpc_url, info.err)
@@ -346,8 +365,9 @@ class PumpPortalClient:
                         return  # processed/confirmed/finalized: ya sabemos que NO falló
 
                 if time.monotonic() >= deadline:
+                    motivo = f" (el RPC falló: {ultimo_error})" if ultimo_error is not None else ""
                     raise TradeOutcomeUnknown(
-                        f"La transacción {signature} no confirmó en {timeout_seconds:.1f}s "
+                        f"La transacción {signature} no confirmó en {timeout_seconds:.1f}s{motivo} "
                         f"(puede seguir pendiente) — revisa https://solscan.io/tx/{signature}"
                     )
                 await asyncio.sleep(poll_interval_seconds)
