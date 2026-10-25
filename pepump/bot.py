@@ -109,6 +109,9 @@ class TrailingTakeProfitBot:
         # Stalls SEGUIDOS del feed en vivo con la bonding curve todavía
         # activa (ver _handle_feed_stall y _MAX_CURVE_STALLS_BEFORE_POLLING).
         self._curve_stalls = 0
+        # No se pudo conectar al feed de PumpPortal al arrancar: el precio de
+        # entrada sale solo de on-chain/Jupiter (ver _onchain_reference_price).
+        self._feed_down = False
         # Se activa con close() -que llaman Ctrl+C (SIGINT), SIGTERM o
         # SIGBREAK vía shutdown.py, o quien controle el bot desde fuera-.
         # NO se usa el try/except
@@ -363,16 +366,17 @@ class TrailingTakeProfitBot:
             # excepción se escapaba sin capturar hasta fuera de run() ->
             # run.py solo atrapa KeyboardInterrupt, así que el bot moría
             # con un traceback crudo en vez de un mensaje claro. Ahora se
-            # loguea el error y se sale ordenadamente (todavía no hay
-            # posición abierta, así que no hay nada que vender).
+            # captura aquí.
             #
-            # BUGFIX (posición retomada abandonada): con una posición ya
-            # comprada, el feed no es imprescindible. Caso real #73
-            # (H7VZ...pump, en PumpSwap): PumpPortal devolvió HTTP 502 al
+            # BUGFIX (feed caído): el feed no es imprescindible. Caso real
+            # #73 (H7VZ...pump, en PumpSwap): PumpPortal devolvió HTTP 502 al
             # retomar y el bot terminaba dejando los tokens en la wallet sin
             # vigilar, cuando el precio salía on-chain y el feed ni se usaba.
-            # Ahora una posición retomada con fuente on-chain no se suscribe,
-            # y si el feed falla con la posición abierta se vigila on-chain.
+            # Y con el mismo 502, #74 y #75 (3SVj...pump, también en
+            # PumpSwap) se cancelaban sin comprar. Ahora una posición
+            # retomada con fuente on-chain no se suscribe; si el feed falla
+            # sin posición, el precio de entrada sale de on-chain/Jupiter, y
+            # con la posición abierta se vigila on-chain.
             if self.position is None or self.onchain.source is None:
                 try:
                     await self._stream.connect()
@@ -380,17 +384,18 @@ class TrailingTakeProfitBot:
                     raise
                 except Exception as e:
                     if self.position is None:
-                        logger.error(f"No se pudo conectar/suscribir al feed de trades de PumpPortal "
-                                     f"({self.client.DATA_WS_URL}): {e}")
-                        self.end_reason = f"no se pudo conectar al feed de PumpPortal: {e}"
-                        return
-                    # Sin fuente on-chain venía del feed, o sea, de la curva de
-                    # pump.fun; fetch_price pasa solo a PumpSwap si ya migró.
-                    logger.warning(f"No se pudo conectar al feed de trades de PumpPortal "
-                                   f"({self.client.DATA_WS_URL}): {e}. La posición sigue abierta: "
-                                   f"vigilo el precio on-chain (bonding curve) cada "
-                                   f"{self.cfg.onchain_poll_interval_seconds:.0f}s.")
-                    self.onchain.source = "bondingcurve"
+                        logger.warning(f"No se pudo conectar al feed de trades de PumpPortal "
+                                       f"({self.client.DATA_WS_URL}): {e}. Busco el precio de entrada "
+                                       f"solo on-chain (y Jupiter).")
+                        self._feed_down = True
+                    else:
+                        # Sin fuente on-chain venía del feed, o sea, de la curva
+                        # de pump.fun; fetch_price pasa solo a PumpSwap si ya migró.
+                        logger.warning(f"No se pudo conectar al feed de trades de PumpPortal "
+                                       f"({self.client.DATA_WS_URL}): {e}. La posición sigue abierta: "
+                                       f"vigilo el precio on-chain (bonding curve) cada "
+                                       f"{self.cfg.onchain_poll_interval_seconds:.0f}s.")
+                        self.onchain.source = "bondingcurve"
             if self.position is None:
                 if not await self._enter():
                     return
@@ -674,6 +679,8 @@ class TrailingTakeProfitBot:
         inmediato y devuelve None (todavía no hay posición abierta, así que no
         hay nada que vender).
         """
+        if self._feed_down:
+            return await self._onchain_reference_price()
         logger.info("Buscando el precio de entrada: feed en vivo de PumpPortal (solo para el precio) y, "
                     "en paralelo, pools on-chain. En la curva de pump.fun puede tardar si el token tiene "
                     "poco volumen.")
@@ -823,6 +830,49 @@ class TrailingTakeProfitBot:
                 existence_check_task.cancel()
                 with contextlib.suppress(BaseException):
                     await existence_check_task
+
+    async def _onchain_reference_price(self) -> Optional[float]:
+        """Precio de referencia sin feed en vivo (no se pudo conectar): las
+        mismas fuentes que _get_reference_price consulta en paralelo, más la
+        curva de pump.fun leída on-chain, que es lo que normalmente da el
+        feed. Deja `self.onchain.source` puesto, así que la posición se
+        vigila por polling on-chain. Ctrl+C/close() corta la espera."""
+        async def _resolver() -> Optional[float]:
+            price, status = await self.onchain.early_resolve()
+            if price is not None:
+                return price
+            if status in ("no_sol_pool", "not_listed"):
+                price = await self._jupiter_reference()
+                if price is None and status == "not_listed":
+                    self._log_mint_not_pumpfun_abort()
+                    self._initial_price_failure_reason_logged = True
+                return price
+            curve_price, complete, _exists = await self.onchain.curve_status()
+            if curve_price is not None and curve_price > 0 and not complete:
+                logger.info(f"Precio de referencia (on-chain bonding curve): {curve_price:.10f} SOL/token")
+                self.onchain.source = "bondingcurve"
+                return curve_price
+            return None
+
+        resolver = asyncio.ensure_future(_resolver())
+        shutdown = asyncio.ensure_future(self._shutdown_requested.wait())
+        try:
+            await asyncio.wait({resolver, shutdown}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in (resolver, shutdown):
+                if not t.done():
+                    t.cancel()
+                    with contextlib.suppress(BaseException):
+                        await t
+        if not resolver.done() or resolver.cancelled():
+            logger.info("Cancelado por el usuario mientras se esperaba el precio de entrada.")
+            return None
+        price = resolver.result()
+        if price is None and not self._initial_price_failure_reason_logged:
+            logger.error("Sin feed de PumpPortal y sin precio on-chain para este mint (ni por Jupiter): "
+                         "abortando esta entrada. Vuelve a intentarlo cuando PumpPortal responda.")
+            self._initial_price_failure_reason_logged = True
+        return price
 
     async def _jupiter_reference(self) -> Optional[float]:
         """Mint que no está en ninguna fuente on-chain: si hay Jupiter, se

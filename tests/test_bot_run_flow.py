@@ -2,37 +2,83 @@
 Tests de TrailingTakeProfitBot.run():
   - manejo correcto del error cuando connect_trade_stream() falla (segundo
     bug pedido a arreglar: antes se escapaba un traceback crudo, ahora
-    se loguea y se sale ordenadamente).
+    se loguea y el precio de entrada sale de on-chain).
   - que run() cancele monitor_task/status_printer ANTES de vender por
     shutdown (para no repetir la carrera de doble venta -ver
     test_bot_sell_race.py- también en el flujo real end-to-end).
 """
 import asyncio
 
+import pytest
+
 from pepump.bot import TrailingTakeProfitBot
+from pepump.onchain.fallback import OnchainFallback
 
 from .conftest import FakeTradeStreamClient, SpyExecutor, make_config
 
 
-async def test_run_handles_connect_stream_failure_without_raising(caplog):
+def _onchain_fijo(monkeypatch, early=(None, None), curva=(None, False, None)):
+    """Fuentes on-chain falsas: (precio, status) de early_resolve y
+    (precio, complete, exists) de la curva de pump.fun."""
+    async def early_resolve(self):
+        if early[0] is not None:
+            self.source = "pumpswap"
+        return early
+
+    async def curve_status(self):
+        return curva
+
+    async def fetch_price(self):
+        return 0.5  # -50 %: cruza el stop inicial
+
+    monkeypatch.setattr(OnchainFallback, "early_resolve", early_resolve)
+    monkeypatch.setattr(OnchainFallback, "curve_status", curve_status)
+    monkeypatch.setattr(OnchainFallback, "fetch_price", fetch_price)
+
+
+async def test_run_handles_connect_stream_failure_without_raising(caplog, monkeypatch):
     """
     Antes del fix, una excepción en connect_trade_stream() (red caída,
     DNS, api_key rechazada en el handshake, etc.) se escapaba de run()
     sin capturar -run.py solo atrapa KeyboardInterrupt- y el proceso
     terminaba con un traceback crudo. Ahora debe quedar contenida.
     """
+    _onchain_fijo(monkeypatch)  # tampoco hay precio on-chain
     cfg = make_config()
     client = FakeTradeStreamClient(fail_connect_times=999,
                                     connect_exc=ConnectionRefusedError("no conecta (fake)"))
     executor = SpyExecutor()
     bot = TrailingTakeProfitBot(client=client, executor=executor, config=cfg)
 
-    with caplog.at_level("ERROR"):
+    with caplog.at_level("WARNING"):
         await bot.run()  # no debe lanzar
 
     assert bot.position is None
     assert executor.buy_calls == 0
     assert any("No se pudo conectar" in rec.message for rec in caplog.records)
+    assert any("Sin feed de PumpPortal" in rec.message for rec in caplog.records)
+
+
+@pytest.mark.parametrize("early, curva, fuente", [
+    ((2.0, None), (None, True, True), "pumpswap"),
+    ((None, None), (2.0, False, True), "bondingcurve"),
+])
+async def test_sin_feed_el_precio_de_entrada_sale_on_chain(monkeypatch, early, curva, fuente):
+    """Caso real #74 y #75 (3SVj...pump, en PumpSwap): PumpPortal devolvía
+    HTTP 502 al conectar el websocket y la posición se cancelaba sin
+    comprar, aunque el precio se podía leer on-chain."""
+    _onchain_fijo(monkeypatch, early=early, curva=curva)
+    cfg = make_config(initial_stop_pct=25.0, onchain_poll_interval_seconds=0.01, status_interval_seconds=999)
+    client = FakeTradeStreamClient(fail_connect_times=999,
+                                    connect_exc=ConnectionRefusedError("HTTP 502 (fake)"))
+    executor = SpyExecutor()
+    bot = TrailingTakeProfitBot(client=client, executor=executor, config=cfg)
+
+    await asyncio.wait_for(bot.run(), 5)
+
+    assert executor.buy_calls == 1 and executor.sell_calls == 1
+    assert bot.onchain.source == fuente
+    assert bot.position is not None and bot.position.closed
 
 
 async def test_run_happy_path_buys_and_closes_when_stop_loss_hits():
