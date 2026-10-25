@@ -365,15 +365,32 @@ class TrailingTakeProfitBot:
             # con un traceback crudo en vez de un mensaje claro. Ahora se
             # loguea el error y se sale ordenadamente (todavía no hay
             # posición abierta, así que no hay nada que vender).
-            try:
-                await self._stream.connect()
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.error(f"No se pudo conectar/suscribir al feed de trades de PumpPortal "
-                             f"({self.client.DATA_WS_URL}): {e}")
-                self.end_reason = f"no se pudo conectar al feed de PumpPortal: {e}"
-                return
+            #
+            # BUGFIX (posición retomada abandonada): con una posición ya
+            # comprada, el feed no es imprescindible. Caso real #73
+            # (H7VZ...pump, en PumpSwap): PumpPortal devolvió HTTP 502 al
+            # retomar y el bot terminaba dejando los tokens en la wallet sin
+            # vigilar, cuando el precio salía on-chain y el feed ni se usaba.
+            # Ahora una posición retomada con fuente on-chain no se suscribe,
+            # y si el feed falla con la posición abierta se vigila on-chain.
+            if self.position is None or self.onchain.source is None:
+                try:
+                    await self._stream.connect()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    if self.position is None:
+                        logger.error(f"No se pudo conectar/suscribir al feed de trades de PumpPortal "
+                                     f"({self.client.DATA_WS_URL}): {e}")
+                        self.end_reason = f"no se pudo conectar al feed de PumpPortal: {e}"
+                        return
+                    # Sin fuente on-chain venía del feed, o sea, de la curva de
+                    # pump.fun; fetch_price pasa solo a PumpSwap si ya migró.
+                    logger.warning(f"No se pudo conectar al feed de trades de PumpPortal "
+                                   f"({self.client.DATA_WS_URL}): {e}. La posición sigue abierta: "
+                                   f"vigilo el precio on-chain (bonding curve) cada "
+                                   f"{self.cfg.onchain_poll_interval_seconds:.0f}s.")
+                    self.onchain.source = "bondingcurve"
             if self.position is None:
                 if not await self._enter():
                     return

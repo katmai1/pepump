@@ -415,10 +415,11 @@ def test_mint_sin_bonding_curve_ni_pool_aborta_sin_esperar_live_feed_timeout(mon
     assert fake_curve.calls == 1
 
 
-def test_con_el_precio_on_chain_se_da_de_baja_del_feed(monkeypatch):
+def test_retomada_con_precio_on_chain_no_se_suscribe_al_feed(monkeypatch):
     """Antes la suscripción a subscribeTokenTrade seguía abierta toda la
     posición aunque el precio saliera de on-chain: nadie leía su cola (sin
-    límite) y cada evento que llegara se pagaba igual."""
+    límite) y cada evento que llegara se pagaba igual. Una posición retomada
+    con fuente on-chain ya no se suscribe."""
     from pepump.executor import Position
 
     class PumpSwapFijo:
@@ -437,11 +438,12 @@ def test_con_el_precio_on_chain_se_da_de_baja_del_feed(monkeypatch):
 
     async def _escenario():
         task = asyncio.create_task(bot.run())
-        while not (client.sockets and client.sockets[0].closed):
+        while not bot.price_history:
             await asyncio.sleep(0.005)
         assert not pos.closed and bot.running  # la posición sigue vigilada
         bot.stop("fin")
         await task
 
     asyncio.run(asyncio.wait_for(_escenario(), timeout=5))
-    assert client.sockets[0].close_calls == 1  # el close() del final no repite
+    # Retomada con fuente on-chain: ni siquiera se suscribe (ver bot._run).
+    assert client.sockets == []

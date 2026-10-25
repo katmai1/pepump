@@ -418,3 +418,31 @@ async def test_manager_limpia_historial_y_sesion(store):
     assert manager.history() == []
     assert manager.get(managed.id) is None  # ya no cuenta en el PnL de la sesión
     await manager.aclose()
+
+
+@pytest.mark.parametrize("fuente", ["pumpswap", None])
+async def test_retomada_con_el_feed_caido_sigue_vigilando_onchain(store, monkeypatch, fuente):
+    """Caso real #73 (H7VZ...pump): PumpPortal devolvió HTTP 502 al retomar y
+    el bot terminaba dejando la posición abierta sin vigilar. Con la posición
+    ya comprada, el precio puede salir on-chain sin el feed."""
+    from pepump.onchain import fallback as fallback_module
+
+    consultas = []
+
+    async def precio(self):
+        consultas.append(self.source)
+        return 0.5  # por debajo del stop inicial (-25 %): vende
+
+    monkeypatch.setattr(fallback_module.OnchainFallback, "fetch_price", precio)
+    pos_id = _abierta(store, A, live=False, onchain_source=fuente)
+    manager, conns, executors = make_manager(store, onchain_poll_interval_seconds=0.01)
+    conns.fail_first = 99
+    (retomada,) = await manager.recover()
+    await asyncio.wait_for(retomada.task, 5)
+
+    assert consultas and consultas[0] == (fuente or "bondingcurve")
+    assert executors[0].sell_calls == 1
+    assert store.get(pos_id)["status"] == "closed"
+    # Con fuente on-chain ni se intenta el feed.
+    assert conns.fail_first == (99 if fuente else 98)
+    await manager.aclose()
