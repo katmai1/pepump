@@ -447,3 +447,34 @@ def test_retomada_con_precio_on_chain_no_se_suscribe_al_feed(monkeypatch):
     asyncio.run(asyncio.wait_for(_escenario(), timeout=5))
     # Retomada con fuente on-chain: ni siquiera se suscribe (ver bot._run).
     assert client.sockets == []
+
+
+def test_trade_de_token_migrado_no_es_el_precio_de_entrada(monkeypatch):
+    """Caso real #86 FdKd...pump (SIS): el primer trade del feed llegó antes
+    que la consulta on-chain y el bot entró con su marketCapSol (4.092e-6),
+    que ignora la reserva virtual del pool de PumpSwap, en vez de 4.355e-6.
+    El PnL neto salía en -8% nada más abrir. Ahora ese trade no da precio y
+    la referencia sale on-chain."""
+    from pepump.pumpportal import PumpPortalClient
+
+    async def ack_y_trade_migrado():
+        yield {"message": "Successfully subscribed to keys."}
+        yield {"txType": "buy", "pool": "pump-amm", "marketCapSol": 4092.24,
+               "solAmount": 0.049938, "tokenAmount": 11347.431215}
+        await asyncio.Future()
+
+    class OnChainLento(FakeOnChainClient):
+        async def fetch_price_or_confirm_absent(self, mint: str):
+            await asyncio.sleep(0.05)  # el trade del feed llega antes
+            return await super().fetch_price_or_confirm_absent(mint)
+
+    bot = TrailingTakeProfitBot(client=PumpPortalClient(), executor=SpyExecutor(),
+                                config=make_config(live_feed_timeout_seconds=5.0))
+    bot._stream.events = ack_y_trade_migrado()
+    fake_onchain = OnChainLento(bot.cfg.solana_rpc_url, [(4.355e-6, False)])
+    monkeypatch.setattr(fallback_module, "PumpSwapOnChainClient", lambda rpc_url: fake_onchain)
+
+    price = asyncio.run(asyncio.wait_for(bot._get_reference_price(), timeout=2))
+
+    assert price == pytest.approx(4.355e-6)
+    assert bot.onchain.source == "pumpswap"

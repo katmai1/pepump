@@ -230,3 +230,73 @@ def test_un_trade_real_reinicia_el_contador_de_stalls():
     asyncio.run(correr())
 
     assert bot._curve_stalls == 0
+
+
+# Trade de PumpPortal de un token ya en PumpSwap: sin reservas de la curva,
+# así que PumpPortalClient.extract_price no da precio.
+_TRADE_MIGRADO = {"txType": "sell", "pool": "pump-amm", "marketCapSol": 4092.24,
+                  "solAmount": 0.01, "tokenAmount": 2443.0}
+
+
+def test_trades_de_token_migrado_pasan_a_on_chain_sin_esperar_al_stall(monkeypatch):
+    """Caso real #86 FdKd...pump (SIS): el feed SÍ manda los trades de
+    PumpSwap, y antes cada uno reiniciaba el timeout del stall (y daba un
+    precio de marketCapSol ~6% por debajo del real), así que la posición
+    nunca pasaba a on-chain. Ahora el primer trade sin precio comprueba la
+    migración en el acto, aunque el stall_timeout sea largo."""
+    from pepump.pumpportal import PumpPortalClient
+
+    cfg = make_config(stall_timeout_seconds=60.0, onchain_poll_interval_seconds=0.01,
+                      activation_pct=10.0, initial_stop_pct=25.0)
+    executor = SpyExecutor()
+    bot = TrailingTakeProfitBot(client=PumpPortalClient(), executor=executor, config=cfg)
+    bot.position = Position(mint=cfg.mint, entry_price=1.0, sol_amount=0.05, token_amount=0.05)
+
+    async def trades_migrados():
+        while True:
+            yield dict(_TRADE_MIGRADO)
+            await asyncio.sleep(0.001)
+
+    bot._stream.events = trades_migrados()
+    # 1.0 de precio real; 0.70 cruza el stop inicial del 25% -> vende.
+    fake_onchain = FakeOnChainClient(cfg.solana_rpc_url, [1.0, 0.70])
+    monkeypatch.setattr(fallback_module, "PumpSwapOnChainClient", lambda rpc_url: fake_onchain)
+    monkeypatch.setattr(fallback_module, "PumpCurveOnChainClient",
+                        lambda rpc_url: FakeCurveOnChainClient(rpc_url))
+
+    asyncio.run(asyncio.wait_for(bot._consume_trade_stream(), timeout=2.0))
+
+    assert bot.onchain.source == "pumpswap"
+    assert executor.sell_calls == 1
+    assert bot.latest_price == pytest.approx(0.70)
+
+
+def test_trades_sin_precio_no_tapan_el_stall(monkeypatch):
+    """Si la comprobación del primer trade migrado no encuentra pool (RPC
+    caído), los trades siguientes no reinician el timeout: el stall salta
+    a los stall_timeout_seconds desde el último evento CON precio y se
+    vuelve a comprobar."""
+    from pepump.pumpportal import PumpPortalClient
+
+    cfg = make_config(stall_timeout_seconds=0.05, onchain_poll_interval_seconds=0.01,
+                      activation_pct=10.0, initial_stop_pct=25.0)
+    executor = SpyExecutor()
+    bot = TrailingTakeProfitBot(client=PumpPortalClient(), executor=executor, config=cfg)
+    bot.position = Position(mint=cfg.mint, entry_price=1.0, sol_amount=0.05, token_amount=0.05)
+
+    async def trades_migrados():
+        while True:
+            yield dict(_TRADE_MIGRADO)
+            await asyncio.sleep(0.001)
+
+    bot._stream.events = trades_migrados()
+    # Primera comprobación sin pool; la siguiente (por stall) ya lo encuentra.
+    fake_onchain = FakeOnChainClient(cfg.solana_rpc_url, [None, 0.70])
+    monkeypatch.setattr(fallback_module, "PumpSwapOnChainClient", lambda rpc_url: fake_onchain)
+    monkeypatch.setattr(fallback_module, "PumpCurveOnChainClient",
+                        lambda rpc_url: FakeCurveOnChainClient(rpc_url, complete=True, exists=True))
+
+    asyncio.run(asyncio.wait_for(bot._consume_trade_stream(), timeout=2.0))
+
+    assert bot.onchain.source == "pumpswap"
+    assert executor.sell_calls == 1

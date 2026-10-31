@@ -60,8 +60,7 @@ class PumpCurveOnChainClient:
 
     PROGRAM_ID = PUMPFUN_PROGRAM_ID
     # pump.fun: SOL tiene 9 decimales (lamports), los tokens de pump.fun
-    # siempre tienen 6 decimales (ver TOTAL_SUPPLY_TOKENS en
-    # PumpPortalClient) -hace falta este ajuste porque virtualSolReserves
+    # siempre tienen 6 decimales -hace falta este ajuste porque virtualSolReserves
     # y virtualTokenReserves NO están en la misma escala entre sí (a
     # diferencia de vSolInBondingCurve/vTokensInBondingCurve, que
     # PumpPortal ya entrega convertidos a unidades humanas).

@@ -58,12 +58,6 @@ class PumpPortalClient:
     DATA_WS_URL = "wss://pumpportal.fun/api/data"
     LIGHTNING_TRADE_URL = "https://pumpportal.fun/api/trade"
 
-    # Supply estándar de un token creado en pump.fun (1.000.000.000 tokens),
-    # usado para derivar el precio a partir de `marketCapSol` en los trades
-    # que ya no traen las reservas de la bonding curve (token migrado a
-    # PumpSwap). Ver extract_price.
-    TOTAL_SUPPLY_TOKENS = 1_000_000_000
-
     def __init__(self, api_key: str = ""):
         self.api_key = api_key
         # Dirección de la wallet asociada a la api_key. La Lightning API
@@ -125,40 +119,30 @@ class PumpPortalClient:
     @classmethod
     def extract_price(cls, event: dict) -> Optional[float]:
         """
-        Precio en SOL/token a partir de un evento de subscribeTokenTrade.
-        Tres niveles, todos con datos que PumpPortal ya manda en el propio
-        evento — sin recurrir a ninguna fuente externa (DexScreener, etc.)
-        que podría desalinearse del precio real de ejecución y meter
-        slippage entre lo que el bot "ve" y lo que realmente paga:
+        Precio en SOL/token a partir de un evento de subscribeTokenTrade,
+        SOLO mientras el token sigue en la bonding curve de pump.fun: el
+        evento trae las reservas virtuales (`vSolInBondingCurve`/
+        `vTokensInBondingCurve`) y el precio sale de ahí, exacto. None para
+        cualquier otro evento (el ack, o un trade de un token ya migrado).
 
-        1. Mientras el token sigue en la bonding curve de pump.fun, el
-           evento trae las reservas virtuales (`vSolInBondingCurve`/
-           `vTokensInBondingCurve`) y el precio sale de ahí, exacto.
+        BUGFIX (precio ~6% por debajo del real en PumpSwap): antes, sin las
+        reservas de la curva (token migrado), se derivaba el precio de
+        `marketCapSol` / 1.000.000.000 o, sin eso, de `solAmount /
+        tokenAmount` del trade. PumpPortal calcula `marketCapSol` con
+        `quote_vault / base_vault` y se deja la reserva VIRTUAL de quote de
+        los pools nuevos de PumpSwap (ver PumpSwapOnChainClient). Caso real
+        #86 FdKd...pump (SIS): vaults 271,44 SOL / 66,33M tokens -> 4.092e-6,
+        con los 17,43 SOL virtuales -> 4.355e-6, que es a lo que se compró
+        (4.407e-6 con comisiones). Como el feed sí mandaba trades, el bot se
+        quedaba con 4.092e-6 en vez de pasar a on-chain: el PnL neto salía
+        en -8% nada más abrir (el real era ~-2%) y el stop del 15% saltaba
+        con una caída real de ~9%. Ahora un trade migrado no da precio y el
+        bot lo saca on-chain (ver bot._get_reference_price y
+        bot._consume_trade_stream).
 
-        2. Si el token ya migró a PumpSwap/Raydium, esas reservas dejan de
-           venir; en ese caso se usa `marketCapSol` -que sí viene en todos
-           los trades, migrados o no- junto con el supply estándar de
-           pump.fun (1.000.000.000 tokens) para derivar el precio.
-
-        3. Si tampoco viene `marketCapSol` (algunos trades de pools ya
-           migrados no lo incluyen), se cae al precio efectivo de ESE
-           trade puntual: `solAmount / tokenAmount`, los importes reales que
-           se intercambiaron en esa operación. Es el nivel menos preciso
-           de los tres (es el precio de UN trade, no una cotización
-           instantánea de reservas), pero sigue siendo 100% PumpPortal,
-           en vivo, sin fuentes externas.
-
-        BUGFIX: el nivel 1 no tenía ninguna de las guardas que sí tenían
-        el 2 y el 3. Un evento con esos campos como string reventaba con
-        TypeError, y esa excepción subía hasta el `except Exception` de
-        _consume_trade_stream, que la logueaba como "conexión
-        interrumpida" y disparaba una reconexión con backoff que no
-        hacía falta. Y un `vSolInBondingCurve` en 0 devolvía 0.0, que el
-        llamador descarta como "sin precio" -en vez de seguir al nivel 2
-        (marketCapSol), que probablemente sí tenía el dato. Ahora los
-        tres niveles convierten y validan del mismo modo, y un nivel que
-        no da un precio positivo cae al siguiente en lugar de cortar la
-        cadena.
+        BUGFIX: las reservas sin guardas (como string, en 0) reventaban con
+        TypeError o devolvían 0.0; se convierten y validan con
+        as_positive_float.
         """
         v_sol = as_positive_float(event.get("vSolInBondingCurve"))
         v_tok = as_positive_float(event.get("vTokensInBondingCurve"))
@@ -166,20 +150,6 @@ class PumpPortalClient:
             price = v_sol / v_tok
             if price > 0:
                 return price
-
-        market_cap_sol = as_positive_float(event.get("marketCapSol"))
-        if market_cap_sol is not None:
-            price = market_cap_sol / cls.TOTAL_SUPPLY_TOKENS
-            if price > 0:
-                return price
-
-        sol_amount = as_positive_float(event.get("solAmount"))
-        token_amount = as_positive_float(event.get("tokenAmount"))
-        if sol_amount is not None and token_amount is not None:
-            price = sol_amount / token_amount
-            if price > 0:
-                return price
-
         return None
 
     # ---- Trading real (Lightning Transaction API) ------------------------- #

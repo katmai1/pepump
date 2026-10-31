@@ -805,6 +805,15 @@ class TrailingTakeProfitBot:
                     logger.debug(f"[Feed en vivo] confirmación de suscripción recibida ({event['message']!r}). "
                                  f"Esperando hasta {self.cfg.live_feed_timeout_seconds:.0f}s más por un trade "
                                  f"real antes de recurrir al fallback on-chain...")
+                elif "txType" in event:
+                    # Trade de un token ya migrado: sin reservas de la curva no
+                    # da precio (ver PumpPortalClient.extract_price). El precio
+                    # sale de early_resolve, o del fallback on-chain al
+                    # cumplirse live_feed_timeout_seconds.
+                    sin_precio += 1
+                    if sin_precio == 1:
+                        logger.debug("[Feed en vivo] llegan trades sin reservas de la bonding curve (token "
+                                     "ya migrado): el precio de entrada sale on-chain.")
                 else:
                     # Llegó un evento (que no es el ack) pero no se pudo
                     # calcular el precio. Lo avisamos, con las claves del
@@ -1163,23 +1172,42 @@ class TrailingTakeProfitBot:
         -igual que se hace para el precio de ENTRADA en
         _get_reference_price- y, si hay un pool de PumpSwap con precio
         válido, pasa a polling on-chain para el resto de la posición en
-        vez de seguir esperando trades que ya no van a llegar."""
+        vez de seguir esperando trades que ya no van a llegar.
+
+        BUGFIX (trades de un token migrado): PumpPortal SÍ manda los trades
+        de PumpSwap, pero sin las reservas de la curva, así que no dan
+        precio (ver PumpPortalClient.extract_price). El stall se cuenta
+        desde el último evento CON precio -antes cada evento reiniciaba el
+        timeout y esos trades lo tapaban para siempre- y el primer trade
+        sin precio comprueba la migración en el acto (caso real #86
+        FdKd...pump, retomada con el feed de un token ya en PumpSwap)."""
         backoff = 2.0
         max_backoff = 30.0
+        migrated_trade_checked = False
         while self.position is not None and not self.position.closed:
             try:
+                deadline = time.monotonic() + self.cfg.stall_timeout_seconds
                 while True:
                     if self.position is None or self.position.closed:
                         return
                     try:
-                        event = await self._stream.next_event(timeout=self.cfg.stall_timeout_seconds)
+                        event: Optional[dict] = await self._stream.next_event(
+                            timeout=max(0.0, deadline - time.monotonic()))
                     except TimeoutError:
+                        event = None
+                    price = self.client.extract_price(event) if event is not None else None
+                    if price is None or price <= 0:
+                        trade_sin_precio = event is not None and "txType" in event
+                        if event is not None and time.monotonic() < deadline \
+                                and not (trade_sin_precio and not migrated_trade_checked):
+                            continue
+                        migrated_trade_checked = migrated_trade_checked or trade_sin_precio
                         if await self._handle_feed_stall():
                             return  # migró: _handle_feed_stall ya corrió el polling on-chain hasta el cierre
-                        continue  # solo poco volumen: seguimos esperando el feed en vivo
-                    price = self.client.extract_price(event)
-                    if price is None or price <= 0:
+                        # solo poco volumen: seguimos esperando el feed en vivo
+                        deadline = time.monotonic() + self.cfg.stall_timeout_seconds
                         continue
+                    deadline = time.monotonic() + self.cfg.stall_timeout_seconds
                     self.latest_price = price
                     await self._on_price_update(price)
                     backoff = 2.0  # se recibió un evento bueno: reseteamos el backoff
@@ -1247,10 +1275,10 @@ class TrailingTakeProfitBot:
             return True
         price = await self.onchain.migrated_price()
         if price is not None and price > 0:
-            logger.warning(f"[Feed de trades de PumpPortal] sin trades nuevos hace "
-                           f"{self.cfg.stall_timeout_seconds:.0f}s y se confirmó un pool de PumpSwap "
-                           f"con precio válido -> el mint migró a mitad de la posición "
-                           f"(subscribeTokenTrade no lo va a cubrir más). Paso a polling on-chain cada "
+            logger.warning(f"[Feed de trades de PumpPortal] no da precio (sin trades, o trades sin las "
+                           f"reservas de la bonding curve) y se confirmó un pool de PumpSwap con precio "
+                           f"válido -> el mint ya migró (el precio del feed para PumpSwap ignora la "
+                           f"reserva virtual del pool). Paso a polling on-chain cada "
                            f"{self.cfg.onchain_poll_interval_seconds:.0f}s para no perder el precio.")
             self.onchain.source = "pumpswap"
             self.latest_price = price
