@@ -544,6 +544,19 @@ class PositionManager:
             except Exception:
                 return None
 
+        async def jupiter_price() -> Optional[float]:
+            if self.jupiter is None:
+                return None
+            try:
+                tokens = await self.jupiter.buy_tokens(mint, buy_sol, rpc, priority=PRIORITY_BACKGROUND)
+                price = await self.jupiter.sell_price(mint, tokens, rpc, priority=PRIORITY_BACKGROUND)
+                out["round_trip_pct"] = (price * tokens / buy_sol - 1.0) * 100.0
+                out["transfer_fee_pct"] = await self.jupiter.transfer_fee_pct(mint, rpc)
+                return price
+            except Exception as e:
+                logger.debug(f"[Vista previa] Jupiter no cotiza {mint}: {e}")
+                return None
+
         async def mercado():
             price, complete, exists = await PumpCurveOnChainClient(rpc).fetch_price_or_status(mint)
             if exists and not complete and price:
@@ -551,21 +564,24 @@ class PositionManager:
             price, absent = await PumpSwapOnChainClient(rpc).fetch_price_or_confirm_absent(mint)
             if price:
                 return "pumpswap", price
-            if exists is False and absent:
+            if not absent:
+                return "unknown", None
+            if exists is False:
                 # Ni curva de pump.fun ni pool de PumpSwap: el bot todavía
                 # puede intentar Raydium CPMM / Meteora DLMM al entrar, y si
                 # no, Jupiter (la cotización es orientativa: al entrar se
                 # mira primero lo demás).
-                if self.jupiter is not None:
-                    try:
-                        tokens = await self.jupiter.buy_tokens(mint, buy_sol, rpc, priority=PRIORITY_BACKGROUND)
-                        price = await self.jupiter.sell_price(mint, tokens, rpc, priority=PRIORITY_BACKGROUND)
-                        out["round_trip_pct"] = (price * tokens / buy_sol - 1.0) * 100.0
-                        out["transfer_fee_pct"] = await self.jupiter.transfer_fee_pct(mint, rpc)
-                        return "jupiter", price
-                    except Exception as e:
-                        logger.debug(f"[Vista previa] Jupiter no cotiza {mint}: {e}")
-                return "other", None
+                price = await jupiter_price()
+                return ("jupiter", price) if price else ("other", None)
+            if exists and complete:
+                # Migró, pero sin pool oficial contra SOL: el pool de
+                # PumpSwap cotiza contra otro token y la liquidez contra SOL
+                # está en Meteora, o lo encuentra Jupiter. La entrada ya lo
+                # resuelve así (OnchainFallback.early_resolve, "no_sol_pool");
+                # la vista previa se quedaba en "unknown" como si fallara el
+                # RPC (caso real ExxzYB...pump, PumpSwap contra PUMP).
+                price = await jupiter_price()
+                return ("migrated_jupiter", price) if price else ("migrated_other", None)
             return "unknown", None
 
         found, (market, price) = await asyncio.gather(nombre(), mercado())

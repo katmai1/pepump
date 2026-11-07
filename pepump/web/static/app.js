@@ -574,6 +574,9 @@ const MARKETS = {
   pumpswap: "Migrado a PumpSwap",
   other: "No está en pump.fun ni en PumpSwap: se intentará Raydium CPMM / Meteora (DLMM o DAMM v2)",
   jupiter: "No está en pump.fun ni en PumpSwap: si tampoco está en Raydium CPMM / Meteora, irá por Jupiter (precio = lo que darían al vender)",
+  migrated_jupiter: "Migrado, pero su pool de PumpSwap no cotiza contra SOL: irá por Meteora si tiene pool contra SOL, "
+    + "y si no por Jupiter (precio = lo que darían al vender)",
+  migrated_other: "Migrado, pero su pool de PumpSwap no cotiza contra SOL: se intentará Meteora (DLMM o DAMM v2)",
   unknown: "No se pudo comprobar dónde cotiza (¿RPC?)",
 };
 
@@ -634,7 +637,7 @@ function renderPreview(p, error) {
   if (p.active_position) {
     box.classList.add("bad");
     parts.push(el("span", {}, `Ya hay una posición activa de este token (#${p.active_position}).`));
-  } else if (p.market === "other" || p.market === "unknown" || bigRoundTrip(p)) {
+  } else if (["other", "migrated_other", "unknown"].includes(p.market) || bigRoundTrip(p)) {
     box.classList.add("warn");
   }
   box.replaceChildren(...parts);

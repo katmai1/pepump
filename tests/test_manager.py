@@ -304,6 +304,68 @@ async def test_preview_avisa_del_coste_de_entrar_y_salir(monkeypatch):
     assert manager.jupiter.sol == 0.2 and p["buy_sol"] == 0.2
 
 
+async def test_preview_migrado_sin_pool_contra_sol_cotiza_por_jupiter(monkeypatch):
+    """Caso real ExxzYB...pump: la curva de pump.fun completó, pero el pool
+    oficial de PumpSwap cotiza contra PUMP, no contra SOL. La entrada lo
+    resuelve por Meteora/Jupiter; la vista previa decía "No se pudo
+    comprobar dónde cotiza (¿RPC?)"."""
+    import pepump.manager as manager_module
+
+    class Curva:
+        def __init__(self, rpc): pass
+        async def fetch_price_or_status(self, mint):
+            return None, True, True  # completada, reservas a 0
+
+    class Swap:
+        def __init__(self, rpc): pass
+        async def fetch_price_or_confirm_absent(self, mint):
+            return None, True  # no hay pool oficial contra SOL
+
+    class Jupiter:
+        async def buy_tokens(self, mint, sol, rpc_url, priority=None):
+            return 1000.0
+        async def sell_price(self, mint, tokens, rpc_url, priority=None):
+            return 0.99 * 0.05 / tokens
+        async def transfer_fee_pct(self, mint, rpc_url):
+            return None
+
+    monkeypatch.setattr(manager_module, "PumpCurveOnChainClient", Curva)
+    monkeypatch.setattr(manager_module, "PumpSwapOnChainClient", Swap)
+    manager, _, _ = make_manager(buy_sol=0.05)
+
+    # Sin Jupiter: migrado, a probar Meteora al entrar (no "unknown").
+    p = await manager.preview(A)
+    assert (p["market"], p["price"]) == ("migrated_other", None)
+
+    manager.jupiter = Jupiter()
+    p = await manager.preview(A)
+    assert p["market"] == "migrated_jupiter"
+    assert p["price"] == pytest.approx(0.99 * 0.05 / 1000.0)
+    assert p["round_trip_pct"] == pytest.approx(-1.0)
+
+
+async def test_preview_sin_confirmacion_de_pumpswap_sigue_en_unknown(monkeypatch):
+    """Si la consulta de PumpSwap no confirma nada (fallo de RPC), no se
+    saca ninguna conclusión aunque la curva esté completada."""
+    import pepump.manager as manager_module
+
+    class Curva:
+        def __init__(self, rpc): pass
+        async def fetch_price_or_status(self, mint):
+            return None, True, True
+
+    class Swap:
+        def __init__(self, rpc): pass
+        async def fetch_price_or_confirm_absent(self, mint):
+            return None, False
+
+    monkeypatch.setattr(manager_module, "PumpCurveOnChainClient", Curva)
+    monkeypatch.setattr(manager_module, "PumpSwapOnChainClient", Swap)
+    manager, _, _ = make_manager()
+    p = await manager.preview(A)
+    assert p["market"] == "unknown"
+
+
 
 async def test_modo_por_posicion():
     """Real o simulada se elige al abrir; el executor de cada posición
