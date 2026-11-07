@@ -34,8 +34,9 @@ posiciones desde ahí.
 
 ## Git
 
-- Se trabaja y se hace commit en `dev`. El merge a `main` lo hace el usuario:
-  ni push ni PR salvo que lo pida.
+- Se trabaja en `dev`. **No hacer commit sin preguntar antes**: terminar el
+  cambio, pasar los checks y proponer el mensaje. El merge a `main` lo hace el
+  usuario: ni push ni PR salvo que lo pida.
 - Mensajes en español, `feat:` / `fix:` / `refactor:` + descripción en
   minúscula, y un cuerpo que explique el porqué (con el caso real si lo hay).
 
