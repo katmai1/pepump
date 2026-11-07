@@ -307,7 +307,11 @@ function renderTable(now) {
   if (focusedId !== undefined) {
     const row = tbody.querySelector(`tr[data-id="${focusedId}"]`);
     const target = focusedAction ? row?.querySelector(`[data-action="${focusedAction}"]`) : row;
-    (target || row)?.focus();
+    // preventScroll: focus() desplaza la página hasta el elemento. Tras tocar
+    // una fila para ver su detalle, la fila se queda con el foco y cada
+    // refresco devolvía la página a la tabla: imposible leer el detalle,
+    // sobre todo en el móvil, donde no caben los dos a la vez.
+    (target || row)?.focus({ preventScroll: true });
   }
   document.getElementById("empty").hidden = visibles.length > 0;
   document.getElementById("positions").hidden = visibles.length === 0;
