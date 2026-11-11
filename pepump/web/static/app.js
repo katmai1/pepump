@@ -301,7 +301,7 @@ function renderTable(now) {
       el("td", { class: `num ${toneClass(pnlMarket)}`, dataset: { label: "PnL mercado" } }, fmtPct(pnlMarket)),
       el("td", { class: `num ${toneClass(pnlNet)}`, dataset: { label: pos && pos.closed ? "PnL realizado" : "PnL neto" } }, fmtPct(pnlNet)),
       el("td", { class: "num", dataset: { label: "Tiempo" } }, since ? fmtDuration(until - since) : "—"),
-      el("td", { class: "actions" }, actionButton(snap, "btn-sm")),
+      el("td", { class: "actions" }, ...actionButtons(snap, "btn-sm")),
     );
     rows.push(tr);
   }
@@ -330,19 +330,28 @@ function renderTable(now) {
 // está parando sin vender y todavía se le puede pedir que venda.
 const closable = (snap) => snap.running && (!snap.close_requested || snap.stopping_without_selling);
 
-function actionButton(snap, extraClass = "") {
+// Botones de la fila / del detalle: "Cerrar" o "Cancelar" y, mientras se
+// espera la baja de entrada, "Entrar ya" al lado.
+function actionButtons(snap, extraClass = "") {
+  const buttons = [];
+  if (snap.can_enter_now) {
+    buttons.push(el("button", { type: "button", class: `btn btn-primary ${extraClass}`,
+                                dataset: { action: "enter-now", id: snap.id },
+                                "aria-label": `Entrar ya en la posición ${snap.id} (${tokenTitle(snap)})` }, "Entrar ya"));
+  } else if (snap.running && snap.enter_now_requested && !snap.position) {
+    buttons.push(el("button", { type: "button", class: `btn ${extraClass}`, disabled: "" }, "Comprando…"));
+  }
   if (closable(snap)) {
     // Sin posición todavía (esperando entrada) no hay nada que vender:
     // cerrar es cancelar la entrada.
     const label = snap.position ? "Cerrar" : "Cancelar";
-    return el("button", { type: "button", class: `btn btn-danger-outline ${extraClass}`,
-                          dataset: { action: "close", id: snap.id },
-                          "aria-label": `${label} posición ${snap.id} (${tokenTitle(snap)})` }, label);
+    buttons.push(el("button", { type: "button", class: `btn btn-danger-outline ${extraClass}`,
+                                dataset: { action: "close", id: snap.id },
+                                "aria-label": `${label} posición ${snap.id} (${tokenTitle(snap)})` }, label));
+  } else if (snap.running && snap.close_requested) {
+    buttons.push(el("button", { type: "button", class: `btn ${extraClass}`, disabled: "" }, "Cerrando…"));
   }
-  if (snap.running && snap.close_requested) {
-    return el("button", { type: "button", class: `btn ${extraClass}`, disabled: "" }, "Cerrando…");
-  }
-  return null;
+  return buttons;
 }
 
 async function api(path, options = {}) {
@@ -423,6 +432,29 @@ async function closePosition(id) {
     toast(`Cierre pedido para #${id}. El resultado aparecerá en la tabla y en los logs.`);
   } catch (err) {
     toast(`No se pudo cerrar #${id}: ${err.message}`, "error");
+  }
+}
+
+async function enterNow(id) {
+  const snap = state.positions.find((p) => p.id === id);
+  if (!snap || !snap.can_enter_now) return;
+  const missing = dipMissingPct(snap);
+  const ok = await confirmDialog(`¿Entrar ya en #${snap.id} ${tokenTitle(snap)}?`, [
+    el("p", {}, `Se deja de esperar la baja del ${snap.settings.entry_dip_pct} % y se compra al precio de mercado actual.`),
+    facts([
+      ["Precio actual", fmtPrice(snap.latest_price)],
+      ["Objetivo de la baja", fmtPrice(snap.entry_target_price)],
+      ["Le falta bajar", missing === null ? "—" : `${missing.toFixed(2)} %`],
+      ["Se compran", `${fmtSol(snap.settings.buy_sol)} SOL`],
+    ]),
+    realWarning(snap.live, "se compra de verdad, con SOL real."),
+  ].filter(Boolean), "Comprar ahora", snap.live);
+  if (!ok) return;
+  try {
+    await api(`/api/positions/${id}/enter-now`, { method: "POST" });
+    toast(`Compra pedida para #${id}. El resultado aparecerá en la tabla y en los logs.`);
+  } catch (err) {
+    toast(`No se pudo entrar en #${id}: ${err.message}`, "error");
   }
 }
 
@@ -824,8 +856,7 @@ function renderDetail() {
   const name = snap.token_name && snap.token_symbol ? `${snap.token_name} ($${snap.token_symbol})` : tokenTitle(snap);
   document.getElementById("detail-title").textContent = `#${snap.id} · ${name}`;
   updateChart(snap);
-  const detailAction = actionButton(snap);
-  document.getElementById("detail-actions").replaceChildren(...(detailAction ? [detailAction] : []));
+  document.getElementById("detail-actions").replaceChildren(...actionButtons(snap));
 
   const link = el("a", { href: `https://pump.fun/${encodeURIComponent(snap.mint)}`, target: "_blank", rel: "noopener noreferrer" }, snap.mint);
   const items = [
@@ -1247,6 +1278,7 @@ function onActionClick(e) {
   if (!button) return false;
   e.stopPropagation();
   if (button.dataset.action === "close") closePosition(Number(button.dataset.id));
+  else if (button.dataset.action === "enter-now") enterNow(Number(button.dataset.id));
   return true;
 }
 

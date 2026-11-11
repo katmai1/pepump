@@ -144,6 +144,7 @@ python ctl.py open <MINT> --sol 0.1 --trailing 12   # ... o con otros
 python ctl.py open <MINT> --real   # con SOL real (sin --real, simulada)
 python ctl.py close 2              # cerrar la #2 (o: close <MINT>)
 python ctl.py close-all            # cerrar todas
+python ctl.py enter 2              # comprar ya la #2 sin esperar la baja de entrada
 python ctl.py --url http://192.168.1.50:9000 list
 ```
 
@@ -158,6 +159,8 @@ toma de `PEPUMP_WEB_PASSWORD` o la pregunta.
    espera a que el precio baje ese porcentaje antes de entrar. Si no baja en
    `entry_dip_timeout_minutes` (6 h por defecto; 0 = sin límite), cancela sin
    comprar: comprar a mercado al vencer sería entrar en el máximo otra vez.
+   Mientras espera, «Entrar ya» (web, al lado de «Cancelar») o
+   `ctl.py enter` compra en el momento al precio actual.
 3. Mientras el precio no suba `activation_pct` % desde la entrada, solo
    vigila un stop-loss duro (`initial_stop_pct`).
 4. Al superar `activation_pct`, el trailing-stop se arma: el nivel de venta

@@ -291,7 +291,8 @@ main {
 .btn-danger:hover:not(:disabled) { background: var(--critical); filter: brightness(1.08); }
 .btn-danger-outline { color: var(--down); border-color: currentColor; }
 .btn-sm { padding: 3px 10px; font-size: 12px; }
-.positions td.actions { text-align: right; width: 1%; }
+.positions td.actions { text-align: right; width: 1%; white-space: nowrap; }
+.positions td.actions .btn + .btn, #detail-actions .btn + .btn { margin-left: 6px; }
 
 /* --- login --------------------------------------------------------------- */
 .login { min-height: calc(100vh - 60px); display: grid; place-items: center; padding: 16px; }

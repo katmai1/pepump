@@ -8,6 +8,7 @@ Controla un PePump que ya está corriendo con --web, desde otra consola:
     python ctl.py close 2              # cerrar (vender) la #2
     python ctl.py close <MINT>         # ... o por mint
     python ctl.py close-all            # cerrar todas
+    python ctl.py enter 2              # comprar ya, sin esperar la baja de entrada
 
 Habla con la misma API que la página web (--url, default
 http://127.0.0.1:8080). Si el panel tiene contraseña, la toma de la
@@ -70,6 +71,8 @@ def parse_args():
     close = sub.add_parser("close", help="Cierra (vende) una posición")
     close.add_argument("ref", help="Número de la posición (#) o su mint")
     sub.add_parser("close-all", help="Cierra todas las posiciones activas")
+    enter = sub.add_parser("enter", help="Compra ya una posición que espera la baja de entrada")
+    enter.add_argument("ref", help="Número de la posición (#) o su mint")
     return p.parse_args()
 
 
@@ -225,6 +228,25 @@ def main():
         if r.status_code != 200:
             fail(r.json().get("detail", str(r.status_code)))
         print(f"Cierre pedido para #{snap['id']}.")
+        return
+
+    if args.cmd == "enter":
+        ref = args.ref.strip().lstrip("#")
+        matches = [x for x in snaps if str(x["id"]) == ref or x["mint"] == ref]
+        if not matches:
+            fail(f"no hay ninguna posición {args.ref!r}")
+        snap = matches[-1]
+        print(describe(snap))
+        if not snap.get("can_enter_now"):
+            fail(f"la #{snap['id']} no está esperando la baja de entrada")
+        print(f"  precio actual {fmt_price(snap['latest_price'])}  objetivo {fmt_price(snap['entry_target_price'])}")
+        if not confirm(f"¿Comprar ya #{snap['id']}{' con SOL REAL' if snap.get('live') else ' (simulado)'}?",
+                       args.yes):
+            return
+        r = s.post(f"{url}/api/positions/{snap['id']}/enter-now", timeout=5)
+        if r.status_code != 200:
+            fail(r.json().get("detail", str(r.status_code)))
+        print(f"Compra pedida para #{snap['id']}.")
         return
 
     if args.cmd == "close-all":

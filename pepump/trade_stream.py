@@ -77,13 +77,17 @@ class TradeStream:
             self._pending.cancel()
             self._pending = None
 
-    async def next_event(self, timeout: Optional[float] = None) -> dict:
+    async def next_event(self, timeout: Optional[float] = None, wake: Optional[asyncio.Event] = None) -> dict:
         """__anext__() de self.events, pero compitiendo contra
         `_shutdown_requested` (y, si se pasa `timeout`, contra un
         deadline). Lanza ShutdownRequested si gana el apagado,
         asyncio.TimeoutError si gana el timeout, o deja pasar cualquier
         excepción normal del feed (StopAsyncIteration, errores de red,
         etc.).
+
+        `wake` es otro evento que corta la espera como si fuera un timeout
+        (TimeoutError, sin tocar el __anext__() en vuelo): lo usa la espera
+        de la baja de entrada para "entrar ya" sin esperar al próximo trade.
 
         BUGFIX: antes, cuando ganaba el timeout, se cancelaba
         directamente la tarea que envolvía `self.events.__anext__()`.
@@ -129,10 +133,10 @@ class TradeStream:
         else:
             next_task = pending
         shutdown_task = asyncio.ensure_future(self._shutdown.wait())
+        wake_task = asyncio.ensure_future(wake.wait()) if wake is not None else None
+        waiters = {next_task, shutdown_task} | ({wake_task} if wake_task is not None else set())
         try:
-            done, _pending = await asyncio.wait(
-                {next_task, shutdown_task}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
-            )
+            done, _pending = await asyncio.wait(waiters, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
         except asyncio.CancelledError:
             # Cancelaron a quien esperaba (run() cancela el monitor de
             # precios al terminar): el feed ya no se va a leer más, así que
@@ -144,6 +148,9 @@ class TradeStream:
             shutdown_task.cancel()
             self._pending = None
             raise
+        finally:
+            if wake_task is not None and not wake_task.done():
+                wake_task.cancel()
 
         if shutdown_task in done:
             next_task.cancel()
@@ -156,7 +163,7 @@ class TradeStream:
             self._pending = None
             return next_task.result()  # puede propagar StopAsyncIteration u otra excepción
 
-        # Ganó el timeout: dejamos next_task VIVA (sin cancelar) para
+        # Ganó el timeout (o `wake`): dejamos next_task VIVA (sin cancelar) para
         # retomarla en la próxima llamada en vez de cerrar el generador.
         self._pending = next_task
         raise TimeoutError()

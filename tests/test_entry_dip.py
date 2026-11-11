@@ -309,3 +309,100 @@ def test_fmt_minutes():
     assert _fmt_minutes(90) == "1 h 30 min"
     assert _fmt_minutes(20) == "20 min"
     assert _fmt_minutes(0.5) == "0.5 min"
+
+
+# ---- Entrar ya (enter_now) ------------------------------------------------ #
+# Mientras se espera la baja, el botón "Entrar ya" de la web compra al precio
+# actual sin esperar más.
+
+
+def _bot_esperando_por_feed(events):
+    client = _FeedQueSeCalla(events_by_connection=[events])
+    cfg = make_config(entry_dip_pct=5.0, entry_dip_timeout_minutes=0.0)
+    bot = TrailingTakeProfitBot(client, SpyExecutor(), cfg)
+    bot.running = True
+    return bot, client
+
+
+async def _esperar_baja(bot):
+    for _ in range(200):
+        if bot.can_enter_now:
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError("el bot no llegó a esperar la baja")
+
+
+def test_enter_now_compra_al_ultimo_precio_del_feed_sin_romper_el_generador():
+    bot, client = _bot_esperando_por_feed([{"price": 1.0}, {"price": 0.97}])
+
+    async def scenario():
+        await bot._stream.connect()
+        bot.phase = "waiting_entry"
+        tarea = asyncio.create_task(bot._get_initial_price())
+        await _esperar_baja(bot)
+        await asyncio.sleep(0.02)  # que llegue el 0.97
+        bot.enter_now("prueba")
+        return await asyncio.wait_for(tarea, timeout=5)
+
+    assert asyncio.run(scenario()) == 0.97
+    assert client.connect_calls == 1
+    assert not bot.can_enter_now
+    assert bot.snapshot()["enter_now_requested"] is True
+
+
+def test_enter_now_compra_de_verdad_por_enter():
+    bot, _ = _bot_esperando_por_feed([{"price": 1.0}])
+    executor = bot.executor
+
+    async def scenario():
+        await bot._stream.connect()
+        tarea = asyncio.create_task(bot._enter())
+        await _esperar_baja(bot)
+        bot.enter_now()
+        return await asyncio.wait_for(tarea, timeout=5)
+
+    assert asyncio.run(scenario()) is True
+    assert executor.buy_calls == 1
+    assert bot.phase == "open"
+
+
+def test_enter_now_con_precio_on_chain_no_espera_al_siguiente_ciclo():
+    """Rama on-chain: el polling cada 30 s se corta y se consulta un precio
+    fresco para comprar."""
+    cfg = make_config(entry_dip_pct=5.0, entry_dip_timeout_minutes=0.0, onchain_poll_interval_seconds=30.0)
+    bot = TrailingTakeProfitBot(None, SpyExecutor(), cfg)
+    bot.running = True
+    bot.phase = "waiting_entry"
+    bot.onchain.source = "pumpswap"
+    precios = iter([0.99, 0.98])
+
+    async def fetch_price():
+        return next(precios)
+
+    bot.onchain.fetch_price = fetch_price
+
+    async def scenario():
+        bot._dip_target = 0.95
+        tarea = asyncio.create_task(bot._wait_for_dip_entry(1.0, 0.95))
+        await asyncio.sleep(0.05)
+        bot.enter_now()
+        return await asyncio.wait_for(tarea, timeout=2)
+
+    assert asyncio.run(scenario()) == 0.98
+
+
+def test_enter_now_solo_mientras_se_espera_la_baja():
+    import pytest
+    cfg = make_config(entry_dip_pct=5.0)
+    bot = TrailingTakeProfitBot(FakeTradeStreamClient(), SpyExecutor(), cfg)
+    bot.running = True
+    bot.phase = "waiting_entry"
+    # Sin objetivo todavía (buscando la referencia): no se puede.
+    with pytest.raises(ValueError):
+        bot.enter_now()
+    bot._dip_target = 0.95
+    assert bot.can_enter_now
+    bot.close("cancelado")
+    assert not bot.can_enter_now
+    with pytest.raises(ValueError):
+        bot.enter_now()

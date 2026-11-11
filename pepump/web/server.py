@@ -17,6 +17,7 @@ intermedia.
   POST /api/positions                 abrir (comprar) una posición
   POST /api/positions/{id}/close      cerrar (vender) una posición
   POST /api/positions/close-all       cerrar todas
+  POST /api/positions/{id}/enter-now  comprar ya sin esperar la baja de entrada
   GET  /api/logs                      últimos logs (?mint=...&after=<seq>&limit=...)
   GET  /api/history                   posiciones terminadas + resumen de PnL
   POST /api/history/clear             borrar el historial ({"mode": "all"|"real"|"sim"})
@@ -359,6 +360,17 @@ def create_app(manager: PositionManager, logs: LogBuffer, *, live: bool,
         if not managed.closable:
             raise HTTPException(status_code=409, detail="Esa posición ya terminó o ya se está cerrando")
         manager.close(pos_id, f"cerrada desde la web, {client_ip(request)}")
+        return {"id": managed.id, **managed.bot.snapshot()}
+
+    @app.post("/api/positions/{pos_id}/enter-now", dependencies=orden)
+    async def enter_now(pos_id: int, request: Request):
+        managed = manager.get(pos_id)
+        if managed is None:
+            raise HTTPException(status_code=404, detail="No existe esa posición")
+        try:
+            manager.enter_now(pos_id, f"entrada inmediata pedida desde la web, {client_ip(request)}")
+        except ValueError as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
         return {"id": managed.id, **managed.bot.snapshot()}
 
     # --- en vivo ---------------------------------------------------------- #

@@ -57,6 +57,14 @@ class FakeManager:
             if snap["id"] == ref:
                 snap["close_requested"] = True
 
+    def enter_now(self, ref, reason="entrada inmediata"):
+        for snap in self.snaps:
+            if snap["id"] == ref:
+                if not snap.get("can_enter_now"):
+                    raise ValueError("Esa posición no está esperando la baja de entrada")
+                snap["can_enter_now"] = False
+                self.entered = [*getattr(self, "entered", []), (ref, reason)]
+
     def history(self, limit=100):
         return [{"id": 99, "mint": A, "status": "closed", "realized_pnl_pct": 12.5}][:limit]
 
@@ -208,6 +216,27 @@ def test_cerrar_una_posicion_que_no_existe_o_ya_termino():
     assert client.post("/api/positions/9/close", headers=PAGE).status_code == 404
     assert client.post("/api/positions/2/close", headers=PAGE).status_code == 409
     assert client.manager.closed == []
+
+
+def test_entrar_ya_en_una_posicion_que_espera_la_baja():
+    esperando = dict(SNAP, id=3, phase="waiting_entry", can_enter_now=True)
+    client, _ = make_client(snaps=(SNAP, esperando))
+    r = client.post("/api/positions/3/enter-now", headers=PAGE)
+    assert r.status_code == 200
+    ((pos_id, reason),) = client.manager.entered
+    assert pos_id == 3
+    assert "desde la web" in reason
+    # Ya pedido (o una posición que no espera la baja): 409; inexistente: 404.
+    assert client.post("/api/positions/3/enter-now", headers=PAGE).status_code == 409
+    assert client.post("/api/positions/1/enter-now", headers=PAGE).status_code == 409
+    assert client.post("/api/positions/9/enter-now", headers=PAGE).status_code == 404
+
+
+def test_entrar_ya_exige_la_cabecera_de_la_pagina():
+    esperando = dict(SNAP, id=3, phase="waiting_entry", can_enter_now=True)
+    client, _ = make_client(snaps=(esperando,))
+    assert client.post("/api/positions/3/enter-now").status_code in (401, 403)
+    assert not hasattr(client.manager, "entered")
 
 
 def test_cerrar_todas_no_bloquea_abrir_despues():

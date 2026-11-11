@@ -208,6 +208,16 @@ class PositionManager:
         self._notify()
         return managed
 
+    def enter_now(self, ref: PositionRef, reason: str = "entrada inmediata") -> ManagedPosition:
+        """Una posición que espera la baja de entrada compra ya, al precio
+        actual. ValueError si no existe o no está esperando la baja."""
+        managed = self.get(ref)
+        if managed is None:
+            raise ValueError(f"No existe la posición {ref!r}.")
+        managed.bot.enter_now(reason)
+        self._notify()
+        return managed
+
     def close_all(self, reason: str = "cierre de todas las posiciones", block_new: bool = True) -> int:
         """Pide el cierre de todas las posiciones que siguen corriendo y
         devuelve cuántas eran. `block_new` impide abrir posiciones nuevas

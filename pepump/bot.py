@@ -166,6 +166,10 @@ class TrailingTakeProfitBot:
         # Hasta cuándo (time.time(), para la web) se espera la baja; None
         # sin límite (entry_dip_timeout_minutes = 0) o si no aplica.
         self._dip_deadline: Optional[float] = None
+        # "Entrar ya" (enter_now(), botón de la web): corta la espera de la
+        # baja y compra al último precio visto.
+        self._enter_now_requested = asyncio.Event()
+        self._enter_now_reason: Optional[str] = None
         # Motivo concreto de no haber comprado, si lo hay (p. ej. venció la
         # espera de la baja): sustituye al genérico en _enter.
         self._entry_abort_reason: Optional[str] = None
@@ -259,6 +263,36 @@ class TrailingTakeProfitBot:
         self._close_reason = reason
         self._close_mode = "keep"
         self._shutdown_requested.set()
+
+    @property
+    def can_enter_now(self) -> bool:
+        """Se está esperando la baja de entrada (ya hay precio objetivo y
+        todavía no se compró) y nadie pidió cerrar ni entrar ya."""
+        return (self.running and self.phase == "waiting_entry" and self._dip_target is not None
+                and self.position is None and not self._shutdown_requested.is_set()
+                and not self._enter_now_requested.is_set())
+
+    def enter_now(self, reason: str = "entrada inmediata") -> None:
+        """Deja de esperar la baja de entrada y compra al precio actual. Como
+        close(), solo marca el pedido; lo atiende _wait_for_dip_entry.
+        ValueError si no se está esperando la baja (ver can_enter_now)."""
+        if not self.can_enter_now:
+            raise ValueError("Esa posición no está esperando la baja de entrada")
+        ctx = current_mint.set(self.mint)
+        try:
+            logger.warning(f"⏩ {reason}: se deja de esperar la baja y se compra al precio actual.")
+        finally:
+            current_mint.reset(ctx)
+        self._enter_now_reason = reason
+        self._enter_now_requested.set()
+
+    def _entered_now(self, price: Optional[float], via: str) -> Optional[float]:
+        """Respuesta de _wait_for_dip_entry a enter_now(): el último precio
+        visto, que es lo que hay (la orden va a mercado igual)."""
+        if price is None or price <= 0:
+            price = self.latest_price
+        logger.info(f"Precio de entrada (entrada inmediata sin esperar la baja, {via}): {price:.10f} SOL/token")
+        return price
 
     @property
     def end_reason(self) -> Optional[str]:
@@ -975,7 +1009,7 @@ class TrailingTakeProfitBot:
                     logger.info("Cancelado por el usuario mientras se esperaba la baja de entrada.")
                     return None
                 left = remaining()
-                if left is not None and left <= 0:
+                if left is not None and left <= 0 and not self._enter_now_requested.is_set():
                     self._dip_timed_out(target_price)
                     return None
                 try:
@@ -986,6 +1020,9 @@ class TrailingTakeProfitBot:
                     price = None
                 if price is not None and price > 0:
                     self.latest_price = price
+                if self._enter_now_requested.is_set():
+                    return self._entered_now(price, "fallback on-chain")
+                if price is not None and price > 0:
                     if price <= target_price:
                         logger.info(f"Precio de entrada (baja de {self.cfg.entry_dip_pct}% desde "
                                     f"{reference_price:.10f}, fallback on-chain): {price:.10f} SOL/token")
@@ -997,12 +1034,10 @@ class TrailingTakeProfitBot:
                 left = remaining()
                 if left is not None:
                     pausa = max(0.0, min(pausa, left))
-                try:
-                    await asyncio.wait_for(self._shutdown_requested.wait(), timeout=pausa)
-                    logger.info("Cancelado por el usuario mientras se esperaba la baja de entrada.")
-                    return None
-                except TimeoutError:
-                    continue  # se cumplió el intervalo de polling sin pedido de shutdown; seguimos
+                # Despierta antes de tiempo si piden cerrar o entrar ya: el
+                # bucle vuelve arriba y lo atiende (entrar ya consulta antes
+                # un precio fresco).
+                await self._wait_dip_poll_pause(pausa)
 
         # Feed en vivo: reusamos la misma conexión/suscripción ya abierta.
         # Si se corta, reconectamos igual que hace _consume_trade_stream,
@@ -1023,6 +1058,8 @@ class TrailingTakeProfitBot:
         progress_task = asyncio.create_task(self._dip_progress_logger(target_price))
         try:
             while True:
+                if self._enter_now_requested.is_set():
+                    return self._entered_now(None, "feed en vivo")
                 left = remaining()
                 if left is not None and left <= 0:
                     self._dip_timed_out(target_price)
@@ -1030,12 +1067,13 @@ class TrailingTakeProfitBot:
                 try:
                     # Con timeout, next_event NO cancela el __anext__() en
                     # vuelo (ver su docstring): el generador sigue sano.
-                    event = await self._stream.next_event(timeout=left)
+                    # Tampoco al despertar por enter_now().
+                    event = await self._stream.next_event(timeout=left, wake=self._enter_now_requested)
                 except ShutdownRequested:
                     logger.info("Cancelado por el usuario mientras se esperaba la baja de entrada.")
                     return None
                 except TimeoutError:
-                    continue  # venció el plazo sin trades: lo corta la comprobación de arriba
+                    continue  # venció el plazo sin trades, o entrar ya: lo atiende el principio del bucle
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
@@ -1069,6 +1107,17 @@ class TrailingTakeProfitBot:
                 await progress_task
             except asyncio.CancelledError:
                 pass
+
+    async def _wait_dip_poll_pause(self, pausa: float) -> None:
+        """Pausa entre consultas on-chain de la baja de entrada, que se corta
+        en cuanto se pide cerrar o entrar ya."""
+        waiters = [asyncio.ensure_future(self._shutdown_requested.wait()),
+                   asyncio.ensure_future(self._enter_now_requested.wait())]
+        try:
+            await asyncio.wait(waiters, timeout=pausa, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in waiters:
+                t.cancel()
 
     def _dip_timed_out(self, target_price: float) -> None:
         """Venció entry_dip_timeout_minutes sin que el precio tocara el
@@ -1428,6 +1477,9 @@ class TrailingTakeProfitBot:
             "sell_failures": self.sell_failures,
             "entry_reference_price": self._dip_reference,
             "entry_dip_deadline": self._dip_deadline,
+            # Se puede pedir "entrar ya" (ver enter_now()).
+            "can_enter_now": self.can_enter_now,
+            "enter_now_requested": self._enter_now_requested.is_set(),
             "settings": {
                 "buy_sol": cfg.buy_sol,
                 "slippage": cfg.slippage,
