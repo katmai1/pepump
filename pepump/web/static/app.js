@@ -290,7 +290,8 @@ function renderTable(now) {
             snap.live ? el("span", { class: "tag-pill real", title: "Posición con SOL real" }, "REAL") : null,
             snap.recovered ? el("span", { class: "tag-pill", title: "Retomada de una ejecución anterior del bot" }, "retomada") : null),
           // Sin símbolo todavía, el título ya ES el mint acortado.
-          tokenTitle(snap) === shortMint(snap.mint) ? null : el("span", { class: "token-mint" }, shortMint(snap.mint)))),
+          el("span", { class: "token-mint" },
+            tokenTitle(snap) === shortMint(snap.mint) ? null : shortMint(snap.mint), copyMintButton(snap.mint)))),
       el("td", { dataset: { label: "Estado" } },
         el("span", { class: "status", dataset: { tone: st.tone } },
           el("span", { class: "ico", "aria-hidden": "true" }, st.icon), st.label)),
@@ -352,6 +353,39 @@ function actionButtons(snap, extraClass = "") {
     buttons.push(el("button", { type: "button", class: `btn ${extraClass}`, disabled: "" }, "Cerrando…"));
   }
   return buttons;
+}
+
+// Botón para copiar el mint al portapapeles (en la tabla y en el detalle).
+function copyMintButton(mint, label = "⧉") {
+  return el("button", { type: "button", class: "btn-copy", dataset: { action: "copy-mint", mint },
+                        title: "Copiar el mint", "aria-label": `Copiar el mint ${mint}` }, label);
+}
+
+async function copyText(text) {
+  // navigator.clipboard solo existe en contexto seguro (https o localhost):
+  // abriendo el panel por la IP de la red local hay que tirar del método viejo.
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const area = el("textarea", { readonly: "", style: "position:fixed;opacity:0" });
+  area.value = text;
+  document.body.append(area);
+  area.select();
+  try {
+    if (!document.execCommand("copy")) throw new Error("el navegador no dejó copiar");
+  } finally {
+    area.remove();
+  }
+}
+
+async function copyMint(mint) {
+  try {
+    await copyText(mint);
+    toast(`Mint copiado: ${shortMint(mint)}`);
+  } catch (err) {
+    toast(`No se pudo copiar el mint: ${err.message}`, "error");
+  }
 }
 
 async function api(path, options = {}) {
@@ -858,7 +892,9 @@ function renderDetail() {
   updateChart(snap);
   document.getElementById("detail-actions").replaceChildren(...actionButtons(snap));
 
-  const link = el("a", { href: `https://pump.fun/${encodeURIComponent(snap.mint)}`, target: "_blank", rel: "noopener noreferrer" }, snap.mint);
+  const link = el("span", { class: "mint-line" },
+    el("a", { href: `https://jup.ag/tokens/${encodeURIComponent(snap.mint)}`, target: "_blank", rel: "noopener noreferrer" }, snap.mint),
+    copyMintButton(snap.mint, "Copiar"));
   const items = [
     kv("Mint", link, { mono: true }),
     kv("Estado", `${st.icon} ${st.label}`),
@@ -1279,6 +1315,7 @@ function onActionClick(e) {
   e.stopPropagation();
   if (button.dataset.action === "close") closePosition(Number(button.dataset.id));
   else if (button.dataset.action === "enter-now") enterNow(Number(button.dataset.id));
+  else if (button.dataset.action === "copy-mint") copyMint(button.dataset.mint);
   return true;
 }
 
@@ -1286,6 +1323,7 @@ document.querySelector("#positions tbody").addEventListener("click", (e) => {
   if (!onActionClick(e)) selectRow(e.target);
 });
 document.getElementById("detail-actions").addEventListener("click", onActionClick);
+document.getElementById("detail-body").addEventListener("click", onActionClick);
 document.getElementById("close-all").addEventListener("click", closeAll);
 document.getElementById("history-clear").addEventListener("click", clearHistory);
 document.getElementById("history-mode").addEventListener("change", renderHistory);
