@@ -97,9 +97,15 @@ initial_stop_pct = 25.0
 # 0 (default)  = compra al instante al precio de referencia (normal).
 # > 0 (ej. 5)  = NO compra en la referencia; espera a que el precio baje ese
 #                %% desde ahí (referencia * (1 - entry_dip_pct/100)) y solo
-#                entonces entra. Sin timeout: si el precio nunca baja tanto, el
-#                bot queda esperando indefinidamente (cancela con Ctrl+C).
+#                entonces entra. Si no baja en entry_dip_timeout_minutes, se
+#                cancela sin comprar.
 entry_dip_pct = 0.0
+
+# Minutos que se espera la baja de entrada (entry_dip_pct > 0) antes de
+# cancelar SIN comprar. 0 = sin límite. Una baja del 8 % tarda a menudo más
+# de 1 h y esas compras no salen peores que las rápidas; más allá de 6-12 h
+# ya no se gana nada y la espera ocupa un hueco de max_open_positions.
+entry_dip_timeout_minutes = 360
 
 # Contra qué precio de entrada se miden activation_pct e initial_stop_pct:
 # "real"   = el precio que pagaste DE VERDAD (incluye las comisiones del pool

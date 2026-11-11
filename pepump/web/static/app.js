@@ -140,6 +140,13 @@ function dipMissingPct(snap) {
   return Math.max(0, (1 - snap.entry_target_price / snap.latest_price) * 100);
 }
 
+// Cuánto se espera la baja de entrada antes de cancelar sin comprar. Las
+// posiciones de antes de existir el ajuste no lo traen: esperaban sin límite.
+function dipWaitText(s) {
+  const min = s.entry_dip_timeout_minutes;
+  return min > 0 ? `espera máx. ${fmtDuration(min * 60)}` : "sin límite de espera";
+}
+
 // Valor de la posición si se vendiera ahora al precio actual, menos lo que
 // costó entrar. No descuenta las comisiones de la venta.
 function openPnlSol(snap) {
@@ -447,7 +454,7 @@ async function closeAll() {
 // --------------------------------------------------------- nueva posición
 
 const NUMERIC_FIELDS = ["buy_sol", "activation_pct", "trailing_pct", "initial_stop_pct",
-                        "entry_dip_pct", "slippage", "priority_fee"];
+                        "entry_dip_pct", "entry_dip_timeout_minutes", "slippage", "priority_fee"];
 const TEXT_FIELDS = ["pool", "strategy_price_basis"];
 let defaults = null;
 let previewSeq = 0;
@@ -759,7 +766,7 @@ async function doSubmitNewPosition() {
         ? [["Comprar y vender ya", `${fmtPct(p.round_trip_pct)} (${p.buy_sol} SOL)`, bigRoundTrip(p) ? "down" : ""]] : []),
       ["Modo", isReal ? "REAL (SOL de verdad)" : "simulado (no se compra nada)", isReal ? "down" : ""],
       ["Compra", `${buySol} SOL`],
-      ["Entrada", s.entry_dip_pct > 0 ? `cuando baje un ${s.entry_dip_pct} %` : "al primer precio"],
+      ["Entrada", s.entry_dip_pct > 0 ? `cuando baje un ${s.entry_dip_pct} % (${dipWaitText(s)})` : "al primer precio"],
       ["Estrategia", `activa +${s.activation_pct} % · trailing ${s.trailing_pct} % · stop −${s.initial_stop_pct} %`],
     ]),
     roundTripWarning(p, s),
@@ -838,6 +845,8 @@ function renderDetail() {
       kv(`Referencia (baja de ${snap.settings.entry_dip_pct} %)`, fmtPrice(snap.entry_reference_price)),
       kv("Compra cuando el precio llegue a", fmtPrice(snap.entry_target_price)),
       kv("Le falta bajar", missing === null ? "—" : `${missing.toFixed(2)} %`),
+      kv("Si no llega, se cancela en", snap.entry_dip_deadline
+        ? fmtDuration(Math.max(0, snap.entry_dip_deadline - Date.now() / 1000)) : "sin límite"),
     );
   }
   if (snap.end_reason) items.push(kv("Motivo de fin", snap.end_reason));
@@ -879,7 +888,7 @@ function renderDetail() {
     kv("Slippage", `${s.slippage} %`),
     kv("Priority fee", `${s.priority_fee} SOL`),
     kv("Pool", s.pool),
-    kv("Baja de entrada", s.entry_dip_pct > 0 ? `−${s.entry_dip_pct} %` : "no"),
+    kv("Baja de entrada", s.entry_dip_pct > 0 ? `−${s.entry_dip_pct} % (${dipWaitText(s)})` : "no"),
     kv("Base de la estrategia", s.strategy_price_basis === "real" ? "coste real" : "precio de mercado"),
   );
   document.getElementById("detail-body").replaceChildren(...items);

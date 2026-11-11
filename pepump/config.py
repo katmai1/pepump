@@ -75,10 +75,18 @@ class AppConfig:
     # una al precio de referencia, exactamente como antes. Si es > 0
     # (ej. 5), el bot NO compra en la referencia: sigue mirando el precio
     # y no entra hasta que toca `referencia * (1 - entry_dip_pct/100)` o
-    # menos (ver _wait_for_dip_entry en bot.py). Si el precio nunca baja
-    # tanto, el bot se queda esperando indefinidamente -cancela con
-    # Ctrl+C/SIGTERM si hace falta, no hay timeout para esto.
+    # menos (ver _wait_for_dip_entry en bot.py). Si en
+    # `entry_dip_timeout_minutes` no baja tanto, se cancela sin comprar.
     entry_dip_pct: float = 0.0
+    # Minutos que se espera la baja de entrada antes de cancelar SIN
+    # comprar. 0 = sin límite. Comprar a mercado al vencer sería volver a
+    # entrar en el máximo, justo lo que la baja quiere evitar. Por qué 6 h:
+    # en las 49 posiciones reales del 31/10 al 11/11/2026, con una baja del
+    # 8 % la mitad de las compras llegaban después de 1,5 h y no eran
+    # peores que las rápidas (una tardó 3,7 h y sacó +36 %); con menos de
+    # 1 h el resultado quedaba en cero, y más allá de 6-12 h ya no mejoraba.
+    # Además una espera sin fin ocupa un hueco de max_open_positions.
+    entry_dip_timeout_minutes: float = 360.0
     # Contra qué precio de entrada se miden activation_pct e
     # initial_stop_pct (ver ESTRATEGIA_BASES):
     #   "real"   -> el precio EFECTIVO pagado (con comisiones y priority
@@ -277,6 +285,7 @@ def validate_config(config: AppConfig) -> None:
     porcentaje_abierto("strategy.trailing_pct", config.trailing_pct)
     porcentaje_abierto("strategy.initial_stop_pct", config.initial_stop_pct)
     porcentaje_abierto("strategy.entry_dip_pct", config.entry_dip_pct, minimo_incluido=True)
+    positivo("strategy.entry_dip_timeout_minutes", config.entry_dip_timeout_minutes, incluir_cero=True)
     if config.strategy_price_basis not in ESTRATEGIA_BASES:
         errores.append(f"strategy.strategy_price_basis tiene que ser uno de {list(ESTRATEGIA_BASES)} "
                        f"(está en {config.strategy_price_basis!r})")

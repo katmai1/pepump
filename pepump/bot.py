@@ -61,6 +61,15 @@ _SELL_FAILURES_ALERT = 3
 _FOLLOW_JUPITER_INTERVAL_SECONDS = 30.0
 
 
+def _fmt_minutes(minutes: float) -> str:
+    """360 -> "6 h", 90 -> "1 h 30 min", 20 -> "20 min" (para logs y end_reason)."""
+    total = round(minutes)
+    if total < 60:
+        return f"{minutes:g} min"
+    horas, mins = divmod(total, 60)
+    return f"{horas} h" + (f" {mins} min" if mins else "")
+
+
 class TrailingTakeProfitBot:
     """
     Orquesta todo: escucha el feed de precios vía PumpPortalClient y decide,
@@ -154,6 +163,12 @@ class TrailingTakeProfitBot:
         self._dip_target: Optional[float] = None
         # Precio de referencia contra el que se calculó ese objetivo.
         self._dip_reference: Optional[float] = None
+        # Hasta cuándo (time.time(), para la web) se espera la baja; None
+        # sin límite (entry_dip_timeout_minutes = 0) o si no aplica.
+        self._dip_deadline: Optional[float] = None
+        # Motivo concreto de no haber comprado, si lo hay (p. ej. venció la
+        # espera de la baja): sustituye al genérico en _enter.
+        self._entry_abort_reason: Optional[str] = None
         # BUGFIX (doble venta): serializa CUALQUIER intento de venta de la
         # posición (ya sea por trailing-stop/stop-loss vía _try_sell, o por
         # cierre manual vía _sell_on_shutdown). No alcanza con solo
@@ -471,7 +486,7 @@ class TrailingTakeProfitBot:
                 logger.info("Cancelado antes de abrir posición; no hay nada que vender.")
                 self.end_reason = f"cancelado antes de abrir posición ({self._close_reason})"
                 return False
-            self.end_reason = "no se consiguió precio de entrada (ver logs)"
+            self.end_reason = self._entry_abort_reason or "no se consiguió precio de entrada (ver logs)"
             if not self._initial_price_failure_reason_logged:
                 # Solo llegamos aquí si no se logueó ningún motivo
                 # específico arriba (ver _initial_price_failure_reason_logged):
@@ -650,9 +665,11 @@ class TrailingTakeProfitBot:
         target_price = reference_price * (1 - self.cfg.entry_dip_pct / 100.0)
         self._dip_target = target_price
         self._dip_reference = reference_price
+        limite = (f"si en {_fmt_minutes(self.cfg.entry_dip_timeout_minutes)} no llega, se cancela sin comprar"
+                  if self.cfg.entry_dip_timeout_minutes > 0 else "sin límite de tiempo")
         logger.info(f"Precio de referencia: {reference_price:.10f} SOL/token. Esperando una baja "
                     f"de {self.cfg.entry_dip_pct}% -> entra si el precio toca {target_price:.10f} "
-                    f"SOL/token o menos (sin timeout, cancela con Ctrl+C si hace falta)...")
+                    f"SOL/token o menos ({limite})...")
         return await self._wait_for_dip_entry(reference_price, target_price)
 
     async def _get_reference_price(self) -> Optional[float]:
@@ -931,23 +948,35 @@ class TrailingTakeProfitBot:
         aunque no haya llegado ningún trade nuevo (feed en vivo) o
         porque simplemente le toca su ciclo (polling on-chain).
 
-        No hay timeout para la espera en sí: si el precio nunca baja lo
-        suficiente, esto espera para siempre (igual que
-        _get_reference_price esperando el ack). Ctrl+C/SIGTERM corta la
-        espera en cualquier momento y devuelve None -todavía no hay
-        posición abierta, no hay nada que vender.
+        Si en `entry_dip_timeout_minutes` (0 = sin límite) el precio no
+        llega al objetivo, devuelve None sin comprar, con el motivo en
+        self._entry_abort_reason (ver _dip_timed_out). Ctrl+C/SIGTERM
+        corta la espera en cualquier momento y devuelve None -todavía no
+        hay posición abierta, no hay nada que vender.
 
         Actualiza self.latest_price en el camino (aunque todavía no haya
         posición, así el status printer/lo que consulte ese campo no se
         queda con el valor viejo de la referencia)."""
         self.latest_price = reference_price
         last_log = time.monotonic()
+        deadline: Optional[float] = None
+        if self.cfg.entry_dip_timeout_minutes > 0:
+            espera = self.cfg.entry_dip_timeout_minutes * 60.0
+            deadline = time.monotonic() + espera
+            self._dip_deadline = time.time() + espera
+
+        def remaining() -> Optional[float]:
+            return None if deadline is None else deadline - time.monotonic()
 
         if self.onchain.source is not None:
             await self._leave_feed()
             while True:
                 if self._shutdown_requested.is_set():
                     logger.info("Cancelado por el usuario mientras se esperaba la baja de entrada.")
+                    return None
+                left = remaining()
+                if left is not None and left <= 0:
+                    self._dip_timed_out(target_price)
                     return None
                 try:
                     price = await self.onchain.fetch_price()
@@ -964,11 +993,12 @@ class TrailingTakeProfitBot:
                     if time.monotonic() - last_log >= self.cfg.status_interval_seconds:
                         last_log = time.monotonic()
                         self._log_dip_wait_progress(target_price)
+                pausa = self.cfg.onchain_poll_interval_seconds
+                left = remaining()
+                if left is not None:
+                    pausa = max(0.0, min(pausa, left))
                 try:
-                    await asyncio.wait_for(
-                        self._shutdown_requested.wait(),
-                        timeout=self.cfg.onchain_poll_interval_seconds,
-                    )
+                    await asyncio.wait_for(self._shutdown_requested.wait(), timeout=pausa)
                     logger.info("Cancelado por el usuario mientras se esperaba la baja de entrada.")
                     return None
                 except TimeoutError:
@@ -993,11 +1023,19 @@ class TrailingTakeProfitBot:
         progress_task = asyncio.create_task(self._dip_progress_logger(target_price))
         try:
             while True:
+                left = remaining()
+                if left is not None and left <= 0:
+                    self._dip_timed_out(target_price)
+                    return None
                 try:
-                    event = await self._stream.next_event()
+                    # Con timeout, next_event NO cancela el __anext__() en
+                    # vuelo (ver su docstring): el generador sigue sano.
+                    event = await self._stream.next_event(timeout=left)
                 except ShutdownRequested:
                     logger.info("Cancelado por el usuario mientras se esperaba la baja de entrada.")
                     return None
+                except TimeoutError:
+                    continue  # venció el plazo sin trades: lo corta la comprobación de arriba
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
@@ -1031,6 +1069,17 @@ class TrailingTakeProfitBot:
                 await progress_task
             except asyncio.CancelledError:
                 pass
+
+    def _dip_timed_out(self, target_price: float) -> None:
+        """Venció entry_dip_timeout_minutes sin que el precio tocara el
+        objetivo: no se compra (ver el porqué en config.py)."""
+        espera = _fmt_minutes(self.cfg.entry_dip_timeout_minutes)
+        ahora = f"; precio actual {self.latest_price:.10f}" if self.latest_price else ""
+        logger.info(f"⌛ En {espera} el precio no bajó un {self.cfg.entry_dip_pct}% hasta "
+                    f"{target_price:.10f}{ahora}. Se cancela sin comprar.")
+        self._entry_abort_reason = (f"la baja de entrada del {self.cfg.entry_dip_pct}% no llegó en {espera}; "
+                                    f"no se compró")
+        self._initial_price_failure_reason_logged = True
 
     async def _dip_progress_logger(self, target_price: float) -> None:
         """Tarea de fondo (ver _wait_for_dip_entry, rama feed en vivo):
@@ -1378,12 +1427,14 @@ class TrailingTakeProfitBot:
             "entry_target_price": self._dip_target,
             "sell_failures": self.sell_failures,
             "entry_reference_price": self._dip_reference,
+            "entry_dip_deadline": self._dip_deadline,
             "settings": {
                 "buy_sol": cfg.buy_sol,
                 "slippage": cfg.slippage,
                 "priority_fee": cfg.priority_fee,
                 "pool": cfg.pool,
                 "entry_dip_pct": cfg.entry_dip_pct,
+                "entry_dip_timeout_minutes": cfg.entry_dip_timeout_minutes,
                 "activation_pct": cfg.activation_pct,
                 "trailing_pct": cfg.trailing_pct,
                 "initial_stop_pct": cfg.initial_stop_pct,

@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 # api_key, timeouts, límites) es del proceso y sale siempre del .toml.
 OVERRIDABLE_FIELDS = (
     "live", "buy_sol", "slippage", "priority_fee", "pool",
-    "entry_dip_pct", "activation_pct", "trailing_pct", "initial_stop_pct",
+    "entry_dip_pct", "entry_dip_timeout_minutes", "activation_pct", "trailing_pct", "initial_stop_pct",
     "strategy_price_basis",
 )
 

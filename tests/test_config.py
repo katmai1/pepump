@@ -269,6 +269,7 @@ activation_pct = {activation_pct}
 trailing_pct = {trailing_pct}
 initial_stop_pct = {initial_stop_pct}
 entry_dip_pct = {entry_dip_pct}
+entry_dip_timeout_minutes = {entry_dip_timeout_minutes}
 strategy_price_basis = "{strategy_price_basis}"
 
 [pumpportal]
@@ -281,7 +282,8 @@ solana_rpc_url = "{solana_rpc_url}"
 """
 
 DEFAULTS = dict(buy_sol=0.05, slippage=15.0, pool="auto", activation_pct=10.0,
-                trailing_pct=15.0, initial_stop_pct=25.0, entry_dip_pct=0.0, strategy_price_basis="real",
+                trailing_pct=15.0, initial_stop_pct=25.0, entry_dip_pct=0.0, entry_dip_timeout_minutes=360.0,
+                strategy_price_basis="real",
                 live_feed_timeout_seconds=5.0, entry_wait_timeout_seconds=60.0,
                 solana_rpc_url="https://rpc.test")
 
@@ -295,6 +297,7 @@ def test_config_valida_carga_sin_quejarse(tmp_path):
     cfg = load_config(write_scenario(tmp_path))
     assert cfg.buy_sol == 0.05
     assert cfg.entry_dip_pct == 0.0  # 0 es válido: significa "comprar en la referencia"
+    assert cfg.entry_dip_timeout_minutes == 360.0
     assert cfg.strategy_price_basis == "real"
 
 
@@ -316,6 +319,7 @@ def test_strategy_price_basis_market_es_valido(tmp_path):
     # 100% de dip deja el precio objetivo en 0: nunca se llega a comprar.
     ({"entry_dip_pct": 100.0}, "entry_dip_pct"),
     ({"entry_dip_pct": -5.0}, "entry_dip_pct"),
+    ({"entry_dip_timeout_minutes": -1.0}, "entry_dip_timeout_minutes"),
     ({"solana_rpc_url": "rpc.test"}, "solana_rpc_url"),
     ({"strategy_price_basis": "estimado"}, "strategy_price_basis"),
     # El presupuesto total de espera no puede ser menor que un solo ciclo.

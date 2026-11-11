@@ -30,6 +30,7 @@ OPEN_FLAGS = (
     ("--trailing", "trailing_pct", "Trailing (%% desde el máximo)"),
     ("--stop", "initial_stop_pct", "Stop-loss inicial (-%%)"),
     ("--dip", "entry_dip_pct", "Baja de entrada (-%%)"),
+    ("--dip-timeout", "entry_dip_timeout_minutes", "Minutos máximos esperando la baja (0 = sin límite)"),
     ("--slippage", "slippage", "Slippage (%%)"),
     ("--priority-fee", "priority_fee", "Priority fee (SOL)"),
 )
@@ -43,6 +44,12 @@ MARKETS = {
 # Igual que en la web (ROUND_TRIP_WARN_PCT de app.js): a partir de cuánto se
 # pierde de entrada (comprar y vender al momento) se avisa antes de comprar.
 ROUND_TRIP_WARN_PCT = 5.0
+
+
+def dip_wait_text(cfg: dict) -> str:
+    """Igual que dipWaitText de app.js."""
+    minutos = cfg.get("entry_dip_timeout_minutes") or 0
+    return f"espera máx. {minutos:g} min" if minutos > 0 else "sin límite de espera"
 
 
 def parse_args():
@@ -194,7 +201,8 @@ def main():
         print(f"Modo:   {'REAL (SOL de verdad)' if live else 'simulado'}")
         print(f"Compra: {cfg['buy_sol']} SOL · activa +{cfg['activation_pct']}% · trailing "
               f"{cfg['trailing_pct']}% · stop -{cfg['initial_stop_pct']}%"
-              + (f" · entra con una baja de {cfg['entry_dip_pct']}%" if cfg["entry_dip_pct"] else ""))
+              + (f" · entra con una baja de {cfg['entry_dip_pct']}% ({dip_wait_text(cfg)})"
+                 if cfg["entry_dip_pct"] else ""))
         if not confirm(f"¿Comprar{' con SOL REAL' if live else ' (simulado)'}?", args.yes):
             return
         r = s.post(f"{url}/api/positions", json=open_body(p, settings), timeout=10)

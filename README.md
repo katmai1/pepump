@@ -155,7 +155,9 @@ toma de `PEPUMP_WEB_PASSWORD` o la pregunta.
 1. Se suscribe al feed de trades del mint **antes** de comprar y espera el
    primer trade real para fijar el precio de referencia.
 2. Con `entry_dip_pct = 0` compra en esa referencia. Con `entry_dip_pct > 0`
-   espera a que el precio baje ese porcentaje antes de entrar (sin timeout).
+   espera a que el precio baje ese porcentaje antes de entrar. Si no baja en
+   `entry_dip_timeout_minutes` (6 h por defecto; 0 = sin límite), cancela sin
+   comprar: comprar a mercado al vencer sería entrar en el máximo otra vez.
 3. Mientras el precio no suba `activation_pct` % desde la entrada, solo
    vigila un stop-loss duro (`initial_stop_pct`).
 4. Al superar `activation_pct`, el trailing-stop se arma: el nivel de venta

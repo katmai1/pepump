@@ -185,3 +185,127 @@ def test_entry_dip_pct_loguea_progreso_periodicamente_end_to_end(caplog):
     assert client.connect_calls == 1
     assert any("Esperando la baja de entrada" in r.message and "falta bajar" in r.message
                for r in caplog.records)
+
+
+# ---- Espera máxima de la baja (entry_dip_timeout_minutes) ---------------- #
+# Caso real: con entry_dip_pct sin límite de espera, una posición podía
+# quedarse días esperando una baja que no llegaba, ocupando un hueco de
+# max_open_positions. Con las 49 posiciones reales del 31/10 al 11/11/2026,
+# 6 h de espera daban el mejor resultado (ver config.py).
+
+
+class _FeedQueSeCalla(FakeTradeStreamClient):
+    """Entrega su tanda y luego no manda nada más, sin cerrar el socket:
+    un token sin trades mientras se espera la baja."""
+
+    async def iter_trade_events(self, ws):
+        async for event in super().iter_trade_events(ws):
+            yield event
+        await asyncio.Event().wait()
+
+
+def test_entry_dip_timeout_cancela_sin_comprar_si_el_feed_no_llega_a_la_baja():
+    client = _FeedQueSeCalla(events_by_connection=[[{"price": 1.0}, {"price": 0.97}]])
+    cfg = make_config(entry_dip_pct=5.0, entry_dip_timeout_minutes=0.002)  # 0,12 s
+    bot = TrailingTakeProfitBot(client, SpyExecutor(), cfg)
+
+    async def scenario():
+        await bot._stream.connect()
+        return await asyncio.wait_for(bot._get_initial_price(), timeout=5)
+
+    assert asyncio.run(scenario()) is None
+    assert "no llegó" in bot._entry_abort_reason
+    assert "no se compró" in bot._entry_abort_reason
+    assert bot.latest_price == 0.97
+
+
+def test_entry_dip_timeout_deja_el_motivo_en_end_reason_y_no_compra():
+    client = _FeedQueSeCalla(events_by_connection=[[{"price": 1.0}]])
+    executor = SpyExecutor()
+    cfg = make_config(entry_dip_pct=8.0, entry_dip_timeout_minutes=0.002)
+    bot = TrailingTakeProfitBot(client, executor, cfg)
+
+    async def scenario():
+        await bot._stream.connect()
+        return await asyncio.wait_for(bot._enter(), timeout=5)
+
+    assert asyncio.run(scenario()) is False
+    assert executor.buy_calls == 0
+    assert bot.end_reason == "la baja de entrada del 8.0% no llegó en 0.002 min; no se compró"
+
+
+def test_entry_dip_timeout_compra_si_la_baja_llega_antes_del_plazo():
+    client = _FeedQueSeCalla(events_by_connection=[[{"price": 1.0}, {"price": 0.94}]])
+    cfg = make_config(entry_dip_pct=5.0, entry_dip_timeout_minutes=0.002)
+    bot = TrailingTakeProfitBot(client, SpyExecutor(), cfg)
+
+    async def scenario():
+        await bot._stream.connect()
+        return await asyncio.wait_for(bot._get_initial_price(), timeout=5)
+
+    assert asyncio.run(scenario()) == 0.94
+    assert bot._entry_abort_reason is None
+
+
+def test_entry_dip_timeout_cero_espera_sin_limite():
+    """0 = sin límite: sigue esperando (lo corta el wait_for del test)."""
+    client = _FeedQueSeCalla(events_by_connection=[[{"price": 1.0}]])
+    cfg = make_config(entry_dip_pct=5.0, entry_dip_timeout_minutes=0.0)
+    bot = TrailingTakeProfitBot(client, SpyExecutor(), cfg)
+
+    async def scenario():
+        await bot._stream.connect()
+        await asyncio.wait_for(bot._get_initial_price(), timeout=0.3)
+
+    import pytest
+    with pytest.raises(TimeoutError):
+        asyncio.run(scenario())
+    assert bot._dip_deadline is None
+    assert bot._entry_abort_reason is None
+
+
+def test_entry_dip_timeout_cancela_tambien_con_precio_on_chain():
+    """Rama on-chain (mint migrado): el precio llega en cada consulta pero
+    nunca baja lo suficiente; el plazo corta aunque el polling sea más largo."""
+    cfg = make_config(entry_dip_pct=5.0, entry_dip_timeout_minutes=0.002, onchain_poll_interval_seconds=30.0)
+    bot = TrailingTakeProfitBot(None, SpyExecutor(), cfg)
+    bot.onchain.source = "pumpswap"
+    consultas = []
+
+    async def fetch_price():
+        consultas.append(1)
+        return 0.99
+
+    bot.onchain.fetch_price = fetch_price
+
+    async def scenario():
+        return await asyncio.wait_for(bot._wait_for_dip_entry(1.0, 0.95), timeout=5)
+
+    assert asyncio.run(scenario()) is None
+    assert "no llegó" in bot._entry_abort_reason
+    assert len(consultas) == 1  # no esperó los 30 s del siguiente ciclo
+
+
+def test_snapshot_expone_el_plazo_de_la_baja():
+    import time
+    client = _FeedQueSeCalla(events_by_connection=[[{"price": 1.0}, {"price": 0.94}]])
+    cfg = make_config(entry_dip_pct=5.0, entry_dip_timeout_minutes=360.0)
+    bot = TrailingTakeProfitBot(client, SpyExecutor(), cfg)
+
+    async def scenario():
+        await bot._stream.connect()
+        await bot._get_initial_price()
+
+    antes = time.time()
+    asyncio.run(scenario())
+    snap = bot.snapshot()
+    assert antes + 360 * 60 - 1 <= snap["entry_dip_deadline"] <= time.time() + 360 * 60
+    assert snap["settings"]["entry_dip_timeout_minutes"] == 360.0
+
+
+def test_fmt_minutes():
+    from pepump.bot import _fmt_minutes
+    assert _fmt_minutes(360) == "6 h"
+    assert _fmt_minutes(90) == "1 h 30 min"
+    assert _fmt_minutes(20) == "20 min"
+    assert _fmt_minutes(0.5) == "0.5 min"
